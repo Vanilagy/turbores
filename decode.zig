@@ -23,16 +23,8 @@ pub fn printValues(arguments: anytype) void {
 }
 
 const dc_code_params = [_]u8{ 0x04, 0x28, 0x28, 0x4D, 0x4D, 0x70, 0x70 };
-const dc_unique_params = [_]u8{ 0x04, 0x28, 0x4D, 0x70 };
-const dc_param_index = [_]u8{ 0, 1, 1, 2, 2, 3, 3 };
 const run_to_cb = [_]u8{ 0x06, 0x06, 0x05, 0x05, 0x04, 0x29, 0x29, 0x29, 0x29, 0x28, 0x28, 0x28, 0x28, 0x28, 0x28, 0x4C };
 const lev_to_cb = [_]u8{ 0x04, 0x0A, 0x05, 0x06, 0x04, 0x28, 0x28, 0x28, 0x28, 0x4C };
-
-// Same unique-codebook trick as DC, but for run and level separately.
-const ac_run_unique_params = [_]u8{ 0x06, 0x05, 0x04, 0x29, 0x28, 0x4C };
-const ac_run_index = [_]u8{ 0, 0, 1, 1, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 5 }; // run_to_cb collapsed to unique indices
-const ac_lev_unique_params = [_]u8{ 0x04, 0x0A, 0x05, 0x06, 0x28, 0x4C };
-const ac_lev_index = [_]u8{ 0, 1, 2, 3, 0, 4, 4, 4, 4, 5 }; // lev_to_cb collapsed to unique indices
 
 const scan_order = [_]u8{
     0,  1,  8,  9,  2,  3,  10, 11,
@@ -44,221 +36,6 @@ const scan_order = [_]u8{
     51, 58, 59, 52, 45, 38, 39, 46,
     53, 60, 61, 54, 47, 55, 62, 63,
 };
-
-const CachedDcParse = struct {
-    values: [4]u16,
-    num_values: u8,
-    bits_read: u8,
-};
-
-const dc_cache_bits = 12;
-var cached_dc_parses: [(1 << dc_cache_bits) * dc_unique_params.len]CachedDcParse = undefined;
-
-var dc_cache_initted = true;
-
-//fn initDcCache() void {
-//    std.debug.assert(dc_cache_initted == false);
-//
-//    var data: [16]u8 = undefined;
-//
-//    for (dc_unique_params, 0..) |start_param, i| {
-//        for (0..(1 << dc_cache_bits)) |j| {
-//            data = @splat(0);
-//            std.mem.writeInt(u32, data[0..4], j << (32 - dc_cache_bits), .big);
-//            var code_reader = CodeReader.fromData(&data);
-//
-//            var entry = CachedDcParse{
-//                .values = undefined,
-//                .num_values = 0,
-//                .bits_read = 0,
-//            };
-//
-//            var param = start_param;
-//
-//            //printValues(.{ i, j });
-//
-//            while (true) {
-//                const code = code_reader.getCode(param);
-//
-//                const bit_pos = code_reader.getBitPos();
-//                if (bit_pos >= dc_cache_bits) {
-//                    break;
-//                }
-//
-//                entry.values[entry.num_values] = @intCast(code);
-//                entry.num_values += 1;
-//
-//                param = dc_code_params[@min(@as(usize, @intCast(code)), 6)];
-//                entry.bits_read = @intCast(bit_pos);
-//
-//                if (entry.num_values == 4) {
-//                    break;
-//                }
-//            }
-//
-//            cached_dc_parses[(1 << dc_cache_bits) * i + j] = entry;
-//        }
-//    }
-//}
-
-const yoo = 2;
-const CachedAcParse = struct {
-    values: [2 * yoo]i16, // run, signed level alternating
-    num_values: u8, // number of (run, level) pairs
-    bits_read: u8,
-};
-
-const ac_cache_bits = 8;
-const ac_pair_count = ac_run_unique_params.len * ac_lev_unique_params.len;
-var cached_ac_parses: [(1 << ac_cache_bits) * ac_pair_count]CachedAcParse = undefined;
-
-//fn initAcCache() void {
-//    var data: [16]u8 = undefined;
-//
-//    for (ac_run_unique_params, 0..) |run_start, run_pi| {
-//        for (ac_lev_unique_params, 0..) |lev_start, lev_pi| {
-//            const pair = run_pi * ac_lev_unique_params.len + lev_pi;
-//
-//            for (0..(1 << ac_cache_bits)) |j| {
-//                data = @splat(0);
-//                std.mem.writeInt(u32, data[0..4], j << (32 - ac_cache_bits), .big);
-//                var code_reader = CodeReader.fromData(&data);
-//
-//                var entry = CachedAcParse{
-//                    .values = undefined,
-//                    .num_values = 0,
-//                    .bits_read = 0,
-//                };
-//
-//                var run_param = run_start;
-//                var lev_param = lev_start;
-//
-//                while (true) {
-//                    // One (run, level, sign) tuple, matching the reference AC step.
-//                    const run = code_reader.getCode(run_param);
-//                    const level_code = code_reader.getCode(lev_param);
-//                    const sign = -@as(i32, @intCast(code_reader.readBits(1)));
-//                    code_reader.consume(1);
-//
-//                    const bit_pos = code_reader.getBitPos();
-//                    if (bit_pos >= ac_cache_bits) {
-//                        break; // tuple crosses the window, discard it whole
-//                    }
-//
-//                    // Safe to interpret the values now: a kept tuple fits in the window, so the
-//                    // codes are real (not decoded out of the trailing zero padding) and small.
-//                    const level: i32 = @as(i32, @intCast(level_code)) + 1;
-//
-//                    entry.values[2 * entry.num_values] = @intCast(run);
-//                    entry.values[2 * entry.num_values + 1] = @intCast((level ^ sign) - sign);
-//                    entry.num_values += 1;
-//                    entry.bits_read = @intCast(bit_pos);
-//
-//                    run_param = run_to_cb[@min(run, 15)];
-//                    lev_param = lev_to_cb[@min(@as(u32, @intCast(level)), 9)];
-//
-//                    if (entry.num_values == yoo) {
-//                        break;
-//                    }
-//                }
-//
-//                cached_ac_parses[(pair << ac_cache_bits) + j] = entry;
-//            }
-//        }
-//    }
-//}
-
-fn printAcCacheStats() void {
-    var zero_count: usize = 0;
-    var sum_num_values: u64 = 0;
-    var sum_bits_read: u64 = 0;
-    var hist = [_]usize{0} ** 5; // num_values is 0..4
-
-    for (&cached_ac_parses) |entry| {
-        if (entry.num_values == 0) {
-            zero_count += 1;
-        }
-        sum_num_values += entry.num_values;
-        sum_bits_read += entry.bits_read;
-        hist[entry.num_values] += 1;
-    }
-
-    const total = cached_ac_parses.len;
-
-    var cumulative: usize = 0;
-    var median: u8 = 0;
-    for (0..hist.len) |v| {
-        cumulative += hist[v];
-        if (cumulative * 2 > total) {
-            median = @intCast(v);
-            break;
-        }
-    }
-
-    const avg_num_values = @as(f64, @floatFromInt(sum_num_values)) / @as(f64, @floatFromInt(total));
-    const avg_bits_read = @as(f64, @floatFromInt(sum_bits_read)) / @as(f64, @floatFromInt(total));
-
-    print("ac cache: total={} num_values==0={} avg_num_values={d:.3} median_num_values={} avg_skip_bits={d:.3}\n", .{
-        total, zero_count, avg_num_values, median, avg_bits_read,
-    });
-}
-
-// Tiny per-code cache: one decoded code per 8-bit window, for run and level separately.
-// bits_read == 0 is the sentinel for "didn't fit in 8 bits, decode it manually".
-const RunLevelEntry = packed struct {
-    bits_read: u3, // 1..7 when valid, 0 = sentinel
-    value: u13,
-};
-
-var cached_run_codes: [256 * ac_run_unique_params.len]RunLevelEntry = undefined;
-var cached_lev_codes: [256 * ac_lev_unique_params.len]RunLevelEntry = undefined;
-
-//fn initSimpleCache(params: []const u8, cache: []RunLevelEntry) void {
-//    var data: [16]u8 = undefined;
-//
-//    for (params, 0..) |param, pi| {
-//        for (0..256) |j| {
-//            data = @splat(0);
-//            data[0] = @intCast(j); // the 8-bit window
-//            var code_reader = CodeReader.fromData(&data);
-//
-//            const code = code_reader.getCode(param);
-//            const bit_pos = code_reader.getBitPos();
-//
-//            cache[pi * 256 + j] = if (bit_pos >= 8)
-//                .{ .bits_read = 0, .value = 0 } // code spills past the window, defer to manual
-//            else
-//                .{ .bits_read = @intCast(bit_pos), .value = @intCast(code) };
-//        }
-//    }
-//}
-
-// Byte-aligned codeword cache: (codebook, bit offset, byte) -> one codeword.
-// bits == 0 is the sentinel ("codeword spills past this byte, decode manually").
-const CwEntry = packed struct {
-    bits: u4, // 1..8 when valid, 0 = sentinel
-    value: u12,
-};
-
-var run_cw_table: [ac_run_unique_params.len * 8 * 256]CwEntry = undefined;
-var lev_cw_table: [ac_lev_unique_params.len * 8 * 256]CwEntry = undefined;
-
-fn initCwTable(params: []const u8, table: []CwEntry) void {
-    for (params, 0..) |param, ci| {
-        for (0..8) |o| {
-            for (0..256) |byte| {
-                // Place byte bits [o, 8) at the MSB of a u32, zero-padded after.
-                const word: u32 = @as(u32, @intCast(byte)) << @intCast(24 + o);
-                const parsed = parseCode(word, param);
-
-                table[(ci * 8 + o) * 256 + byte] = if (parsed.bits <= 8 - o)
-                    .{ .bits = @intCast(parsed.bits), .value = @intCast(parsed.value) }
-                else
-                    .{ .bits = 0, .value = 0 }; // spills past the byte
-            }
-        }
-    }
-}
 
 const Decoder = struct {
     packet: []u8,
@@ -321,7 +98,7 @@ export fn decodePacket(decoder: *Decoder) i32 {
 fn parseDc(decoder: *Decoder, bit_reader: *BitReader, num_luma_blocks: u32) void {
     bit_reader.maybeLoadData();
 
-    const first_code_result = parseCode2(bit_reader.current, 0xb8);
+    const first_code_result = parseCode(bit_reader.current, 0xb8);
     var code: i32 = @intCast(first_code_result.value);
 
     const first_dc = (code >> 1) ^ -(code & 1);
@@ -329,10 +106,8 @@ fn parseDc(decoder: *Decoder, bit_reader: *BitReader, num_luma_blocks: u32) void
     decoder.slice_data[0] = first_dc;
 
     var prev_dc = first_dc;
-    //code = 5;
-    //var sign: i32 = 0;
 
-    const second_code_result = parseCode2(
+    const second_code_result = parseCode(
         bit_reader.current << @as(u6, @intCast(first_code_result.bits)),
         0x70,
     );
@@ -349,7 +124,7 @@ fn parseDc(decoder: *Decoder, bit_reader: *BitReader, num_luma_blocks: u32) void
     while (j < num_luma_blocks) {
         bit_reader.maybeLoadData();
 
-        const code_result_1 = parseCode2(bit_reader.current, dc_code_params[@min(@as(usize, @intCast(code)), 6)]);
+        const code_result_1 = parseCode(bit_reader.current, dc_code_params[@min(@as(usize, @intCast(code)), 6)]);
 
         code = @intCast(code_result_1.value);
         sign = @intFromBool(code > 0) * (sign ^ -(code & 1)); // else 0
@@ -357,7 +132,7 @@ fn parseDc(decoder: *Decoder, bit_reader: *BitReader, num_luma_blocks: u32) void
         const result_1 = prev_dc + (((code + 1) >> 1) ^ sign) - sign;
         decoder.slice_data[64 * j] = result_1;
 
-        const code_result_2 = parseCode2(
+        const code_result_2 = parseCode(
             bit_reader.current << @as(u6, @intCast(code_result_1.bits)),
             dc_code_params[@min(code_result_1.value, 6)],
         );
@@ -393,12 +168,12 @@ fn parseAc(decoder: *Decoder, bit_reader: *BitReader, num_luma_blocks: u32) void
             break;
         }
 
-        const run_result = parseCode2(bit_reader.current, run_to_cb[@min(run, 15)]);
+        const run_result = parseCode(bit_reader.current, run_to_cb[@min(run, 15)]);
 
         run = run_result.value;
         pos += run + 1;
 
-        const level_result = parseCode2(bit_reader.current << @as(u6, @intCast(run_result.bits)), lev_to_cb[@min(@as(u32, @intCast(level)), 9)]);
+        const level_result = parseCode(bit_reader.current << @as(u6, @intCast(run_result.bits)), lev_to_cb[@min(@as(u32, @intCast(level)), 9)]);
         level = @intCast(level_result.value);
         level += 1;
 
@@ -493,415 +268,14 @@ fn decodePacketInternal(decoder: *Decoder) !void {
 
         _ = v_data_size;
 
-        //printValues(.{ slice_size, luma_data_size, u_data_size, v_data_size });
-
         @memset(decoder.slice_data, 0);
 
         const ac_data = reader.take(luma_data_size);
         var bit_reader = BitReader.fromData(ac_data);
 
-        if (true) {
-            parseDc(decoder, &bit_reader, num_luma_blocks);
+        parseDc(decoder, &bit_reader, num_luma_blocks);
 
-            //bit_reader.maybeLoadData();
-            //
-            //const first_code_result = parseCode2(bit_reader.current, 0xb8);
-            //var code: i32 = @intCast(first_code_result.value);
-            //
-            //const first_dc = (code >> 1) ^ -(code & 1);
-            //
-            //decoder.slice_data[0] = first_dc;
-            //
-            //var prev_dc = first_dc;
-            ////code = 5;
-            ////var sign: i32 = 0;
-            //
-            //const second_code_result = parseCode2(
-            //    bit_reader.current << @as(u6, @intCast(first_code_result.bits)),
-            //    0x70,
-            //);
-            //code = @intCast(second_code_result.value);
-            //var sign: i32 = if (code > 0) -(code & 1) else 0;
-            //
-            //const result = prev_dc + (((code + 1) >> 1) ^ sign) - sign;
-            //decoder.slice_data[64] = result;
-            //prev_dc = result;
-            //
-            //bit_reader.consume(@intCast(first_code_result.bits + second_code_result.bits));
-            //
-            //var j: usize = 2;
-            //while (j < num_luma_blocks) {
-            //    bit_reader.maybeLoadData();
-            //
-            //    const code_result_1 = parseCode2(bit_reader.current, dc_code_params[@min(@as(usize, @intCast(code)), 6)]);
-            //
-            //    code = @intCast(code_result_1.value);
-            //    sign = if (code > 0) sign ^ -(code & 1) else 0;
-            //
-            //    const result_1 = prev_dc + (((code + 1) >> 1) ^ sign) - sign;
-            //    decoder.slice_data[64 * j] = result_1;
-            //
-            //    const code_result_2 = parseCode2(
-            //        bit_reader.current << @as(u6, @intCast(code_result_1.bits)),
-            //        dc_code_params[@min(code_result_1.value, 6)],
-            //    );
-            //
-            //    code = @intCast(code_result_2.value);
-            //    sign = if (code > 0) sign ^ -(code & 1) else 0;
-            //
-            //    const result_2 = result_1 + (((code + 1) >> 1) ^ sign) - sign;
-            //
-            //    decoder.slice_data[64 * j + 64] = result_2;
-            //    prev_dc = result_2;
-            //
-            //    j += 2;
-            //    bit_reader.consume(@intCast(code_result_1.bits + code_result_2.bits));
-            //}
-        }
-
-        //if (false) {
-        //    var code: i32 = @intCast(code_reader.getCode(0xB8));
-        //
-        //    decoder.slice_data[0] = (code >> 1) ^ -(code & 1);
-        //
-        //    code = 5;
-        //    var sign: i32 = 0;
-        //
-        //    var j: usize = 1;
-        //    while (j < num_luma_blocks) {
-        //        const bits = code_reader.readBits(dc_cache_bits);
-        //        const param_index: usize = dc_param_index[@min(@as(usize, @intCast(code)), 6)];
-        //        const entry = &cached_dc_parses[(param_index << dc_cache_bits) + bits];
-        //
-        //        if (entry.num_values == 0) {
-        //            const start = code_reader.getBitPos();
-        //            code = @intCast(code_reader.getCode(dc_unique_params[param_index]));
-        //            sign = @intFromBool(code > 0) * (sign ^ -(code & 1));
-        //
-        //            decoder.slice_data[64 * j] = decoder.slice_data[64 * j - 64] + (((code + 1) >> 1) ^ sign) - sign;
-        //            j += 1;
-        //
-        //            _ = start;
-        //
-        //            //printValues(.{code_reader.getBitPos() - start});
-        //
-        //            dont += 1;
-        //        } else {
-        //            for (0..entry.num_values) |k| {
-        //                if (j == num_luma_blocks) {
-        //                    break;
-        //                }
-        //
-        //                code = @intCast(entry.values[k]);
-        //                sign = @intFromBool(code > 0) * (sign ^ -(code & 1));
-        //
-        //                decoder.slice_data[64 * j] = decoder.slice_data[64 * j - 64] + (((code + 1) >> 1) ^ sign) - sign;
-        //                j += 1;
-        //            }
-        //
-        //            fit_in_byte += entry.num_values;
-        //
-        //            code_reader.consume(entry.bits_read);
-        //        }
-        //    }
-        //}
-
-        //if (false) {
-        //    var run: u32 = 4;
-        //    var level: i32 = 2;
-        //    //let sign = 0;
-        //
-        //    //const scanOrderInverse = Array.from({ length: 64 }).fill(0);
-        //    //for (let i = 0; i < 64; i++) {
-        //    //    scanOrderInverse[scanOrder[i]] = i;
-        //    //}
-        //
-        //    const log2_block_count = std.math.log2_int(u32, num_luma_blocks); // Math.floor(Math.log2(numBlocks));
-        //    const max_coeffs = @as(u32, 64) << log2_block_count;
-        //    _ = max_coeffs;
-        //
-        //    const block_mask = num_luma_blocks - 1;
-        //    var pos = block_mask;
-        //
-        //    while (true) {
-        //        code_reader.maybeLoadData();
-        //
-        //        const bits_left = code_reader.getRemainingBits(); // gb->size_in_bits - re_index;
-        //        if (bits_left < 32) {
-        //            if (bits_left == 0) {
-        //                break;
-        //            }
-        //
-        //            if (code_reader.readBitsAssumingLoaded(@intCast(bits_left)) == 0) {
-        //                break;
-        //            }
-        //        }
-        //        //if (bits_left == 0 or (bits_left < 32 and code_reader.readBits(@intCast(bits_left)) == 0)) {
-        //        //    break;
-        //        //}
-        //
-        //        run = code_reader.getCode(run_to_cb[@min(run, 15)]); // getCode(run_to_cb[Math.min(run, 15)]);
-        //        //const run_eye = code_reader.getBitPos();
-        //        //const run_bits = code_reader.getBitPos() - run_eye;
-        //        //ac_cw_bits_sum += run_bits;
-        //        //ac_cw_count += 1;
-        //        //ac_cw_hist[@min(run_bits, 31)] += 1;
-        //        //DECODE_CODEWORD(run, run_to_cb[FFMIN(run,  15)], LAST_SKIP_BITS);
-        //        pos += run + 1;
-        //
-        //        //if (pos >= max_coeffs) {
-        //        //    std.debug.assert(false); // Proper error here
-        //        //    //throw new Error('ac text damaged');
-        //        //}
-        //
-        //        level = @intCast(code_reader.getCode(lev_to_cb[@min(@as(u32, @intCast(level)), 9)]));
-        //        //const lev_eye = code_reader.getBitPos();
-        //        //const lev_bits = code_reader.getBitPos() - lev_eye;
-        //        //ac_cw_bits_sum += lev_bits;
-        //        //ac_cw_count += 1;
-        //        //ac_cw_hist[@min(lev_bits, 31)] += 1;
-        //        //DECODE_CODEWORD(level, lev_to_cb[FFMIN(level, 9)], SKIP_BITS);
-        //        level += 1;
-        //
-        //        const j = pos >> log2_block_count;
-        //
-        //        const sign = -@as(i32, @intCast(code_reader.readBitsAssumingLoaded(1)));
-        //        code_reader.consume(1);
-        //
-        //        //_ = j;
-        //        //_ = sign;
-        //        //_ = scan_order;
-        //
-        //        //printValues(.{ run, level, sign });
-        //
-        //        //sign = SHOW_SBITS(re, gb, 1);
-        //        //SKIP_BITS(re, gb, 1);
-        //        decoder.slice_data[((pos & block_mask) << 6) + scan_order[j]] = (level ^ sign) - sign;
-        //
-        //        //out[((pos & block_mask) << 6) + ctx->scan[i]] = ((level ^ sign) - sign);
-        //    }
-        //}
-
-        if (true) {
-            parseAc(decoder, &bit_reader, num_luma_blocks);
-
-            //var run: u32 = 4;
-            //var level: i32 = 2;
-            //
-            //const log2_block_count = std.math.log2_int(u32, num_luma_blocks); // Math.floor(Math.log2(numBlocks));
-            //const max_coeffs = @as(u32, 64) << log2_block_count;
-            //_ = max_coeffs;
-            //
-            //const block_mask = num_luma_blocks - 1;
-            //var pos = block_mask;
-            //
-            //while (true) {
-            //    bit_reader.maybeLoadData();
-            //
-            //    if (bit_reader.current == 0) {
-            //        break;
-            //    }
-            //
-            //    const run_result = parseCode2(bit_reader.current, run_to_cb[@min(run, 15)]);
-            //
-            //    run = run_result.value;
-            //    pos += run + 1;
-            //
-            //    const level_result = parseCode2(bit_reader.current << @as(u6, @intCast(run_result.bits)), lev_to_cb[@min(@as(u32, @intCast(level)), 9)]);
-            //    level = @intCast(level_result.value);
-            //    level += 1;
-            //
-            //    const j = pos >> log2_block_count;
-            //    const thing = run_result.bits + level_result.bits + 1;
-            //
-            //    const sign = -@as(i32, @intCast((bit_reader.current >> @as(u6, @intCast(64 - thing))) & 1));
-            //
-            //    bit_reader.consume(@intCast(thing));
-            //
-            //    decoder.slice_data[((pos & block_mask) << 6) + scan_order[j]] = (level ^ sign) - sign;
-            //}
-        }
-
-        // Byte-aligned codeword tables, no CodeReader. Track a bit position into ac_data;
-        // each run/level is one table lookup (sentinel -> manual parse), sign read by hand.
-        //if (false) {
-        //    var run: u32 = 4;
-        //    var level: i32 = 2;
-        //
-        //    const log2_block_count = std.math.log2_int(u32, num_luma_blocks);
-        //    const block_mask = num_luma_blocks - 1;
-        //    var pos = block_mask;
-        //
-        //    const total_bits = ac_data.len * 8;
-        //    var bp = code_reader.getBitPos();
-        //
-        //    while (true) {
-        //        if (bp >= total_bits) {
-        //            break;
-        //        }
-        //        const bits_left = total_bits - bp;
-        //        if (bits_left < 32 and (buildWord(ac_data, bp) >> @as(u5, @intCast(32 - bits_left))) == 0) {
-        //            break;
-        //        }
-        //
-        //        // run
-        //        {
-        //            const cb = ac_run_index[@min(run, 15)];
-        //            const o = bp & 7;
-        //            const entry = run_cw_table[(@as(usize, cb) * 8 + o) * 256 + @as(usize, ac_data[bp >> 3])];
-        //            if (entry.bits != 0) {
-        //                run_cw_hits += 1;
-        //                run = entry.value;
-        //                bp += entry.bits;
-        //            } else {
-        //                run_cw_misses += 1;
-        //                const parsed = parseCode(buildWord(ac_data, bp), ac_run_unique_params[cb]);
-        //                run = parsed.value;
-        //                bp += parsed.bits;
-        //            }
-        //        }
-        //        pos += run + 1;
-        //
-        //        // level
-        //        {
-        //            const cb = ac_lev_index[@min(@as(u32, @intCast(level)), 9)];
-        //            const o = bp & 7;
-        //            const entry = lev_cw_table[(@as(usize, cb) * 8 + o) * 256 + @as(usize, ac_data[bp >> 3])];
-        //            if (entry.bits != 0) {
-        //                lev_cw_hits += 1;
-        //                level = @as(i32, entry.value) + 1;
-        //                bp += entry.bits;
-        //            } else {
-        //                lev_cw_misses += 1;
-        //                const parsed = parseCode(buildWord(ac_data, bp), ac_lev_unique_params[cb]);
-        //                level = @as(i32, @intCast(parsed.value)) + 1;
-        //                bp += parsed.bits;
-        //            }
-        //        }
-        //
-        //        // sign (1 bit, MSB-first within the byte)
-        //        const sign = -@as(i32, (ac_data[bp >> 3] >> @as(u3, @intCast(7 - (bp & 7)))) & 1);
-        //        bp += 1;
-        //
-        //        const j = pos >> log2_block_count;
-        //        decoder.slice_data[((pos & block_mask) << 6) + scan_order[j]] = (level ^ sign) - sign;
-        //    }
-        //}
-        //
-        //if (false) {
-        //    var run: u32 = 4;
-        //    var level: i32 = 2;
-        //
-        //    const log2_block_count = std.math.log2_int(u32, num_luma_blocks);
-        //    const block_mask = num_luma_blocks - 1;
-        //    var pos = block_mask;
-        //
-        //    while (true) {
-        //        const bits_left = code_reader.getRemainingBits();
-        //        if (bits_left <= 0 or (bits_left < 32 and code_reader.readBits(@intCast(bits_left)) == 0)) {
-        //            break;
-        //        }
-        //
-        //        // Only take the cache path with comfortable headroom. With >= 32 bits left
-        //        // the whole window is real stream data (trailing zero padding is < 8 bits and
-        //        // only ever shows up once bits_left drops below 32), so the cached tuples are
-        //        // exactly the ones the reference loop would decode. The tail goes slow-path,
-        //        // which keeps the original all-zero termination behaviour intact.
-        //        if (bits_left >= 32) {
-        //            const run_pi = ac_run_index[@min(run, 15)];
-        //            const lev_pi = ac_lev_index[@min(@as(u32, @intCast(level)), 9)];
-        //            const pair = @as(usize, run_pi) * ac_lev_unique_params.len + lev_pi;
-        //            const window: usize = code_reader.readBits(ac_cache_bits);
-        //            const entry = &cached_ac_parses[(pair << ac_cache_bits) + window];
-        //
-        //            if (entry.num_values != 0) {
-        //                for (0..entry.num_values) |k| {
-        //                    run = @intCast(entry.values[2 * k]);
-        //                    pos += run + 1;
-        //                    const j = pos >> log2_block_count;
-        //                    level = entry.values[2 * k + 1];
-        //                    decoder.slice_data[((pos & block_mask) << 6) + scan_order[j]] = level;
-        //                }
-        //
-        //                // level held the signed coefficient; the next codebook wants its magnitude.
-        //                level = @intCast(@abs(level));
-        //
-        //                fit_in_byte += 1;
-        //                mh2 += @floatFromInt(entry.num_values);
-        //                mh3 += @floatFromInt(entry.bits_read);
-        //
-        //                code_reader.consume(entry.bits_read);
-        //                continue;
-        //            }
-        //
-        //            dont += 1;
-        //        }
-        //
-        //        run = code_reader.getCode(run_to_cb[@min(run, 15)]);
-        //        pos += run + 1;
-        //        level = @intCast(code_reader.getCode(lev_to_cb[@min(@as(u32, @intCast(level)), 9)]));
-        //        level += 1;
-        //
-        //        const j = pos >> log2_block_count;
-        //        const sign = -@as(i32, @intCast(code_reader.readBits(1)));
-        //        code_reader.consume(1);
-        //        decoder.slice_data[((pos & block_mask) << 6) + scan_order[j]] = (level ^ sign) - sign;
-        //    }
-        //}
-        //
-        //// Tiny per-code cache: one run lookup, one level lookup, sign parsed manually. No
-        //// gate needed - each lookup is a faithful 1:1 replacement of a getCode (it never
-        //// greedily decodes past the window), so it matches the reference everywhere, tail
-        //// included (readBits zero-pads safely past the end of the buffer).
-        //if (false) {
-        //    var run: u32 = 4;
-        //    var level: i32 = 2;
-        //
-        //    const log2_block_count = std.math.log2_int(u32, num_luma_blocks);
-        //    const block_mask = num_luma_blocks - 1;
-        //    var pos = block_mask;
-        //
-        //    while (true) {
-        //        const bits_left = code_reader.getRemainingBits();
-        //        if (bits_left <= 0 or (bits_left < 32 and code_reader.readBits(@intCast(bits_left)) == 0)) {
-        //            break;
-        //        }
-        //
-        //        const run_pi = ac_run_index[@min(run, 15)];
-        //        const run_w: usize = code_reader.readBits(8);
-        //        const run_entry = cached_run_codes[@as(usize, run_pi) * 256 + run_w];
-        //        if (run_entry.bits_read != 0) {
-        //            run = run_entry.value;
-        //            code_reader.consume(run_entry.bits_read);
-        //            fit_in_byte += 1;
-        //        } else {
-        //            run = code_reader.getCode(ac_run_unique_params[run_pi]);
-        //            dont += 1;
-        //        }
-        //        pos += run + 1;
-        //
-        //        const lev_pi = ac_lev_index[@min(@as(u32, @intCast(level)), 9)];
-        //        const lev_w: usize = code_reader.readBits(8);
-        //        const lev_entry = cached_lev_codes[@as(usize, lev_pi) * 256 + lev_w];
-        //        if (lev_entry.bits_read != 0) {
-        //            level = @as(i32, lev_entry.value) + 1;
-        //            code_reader.consume(lev_entry.bits_read);
-        //            fit_in_byte += 1;
-        //        } else {
-        //            level = @as(i32, @intCast(code_reader.getCode(ac_lev_unique_params[lev_pi]))) + 1;
-        //            dont += 1;
-        //        }
-        //
-        //        const j = pos >> log2_block_count;
-        //        const sign = -@as(i32, @intCast(code_reader.readBits(1)));
-        //        code_reader.consume(1);
-        //        decoder.slice_data[((pos & block_mask) << 6) + scan_order[j]] = (level ^ sign) - sign;
-        //    }
-        //}
-
-        if (i == 6) {
-            //std.debug.assert(false);
-        }
+        parseAc(decoder, &bit_reader, num_luma_blocks);
 
         if (false) {
             for (0..num_luma_blocks) |j| {
@@ -920,10 +294,6 @@ fn decodePacketInternal(decoder: *Decoder) !void {
                         (block[k] * q_mat_luma[k] * scale_factor) >> 2;
 
                     mh[k] = @floatFromInt(value);
-
-                    //const mh: [64]f32 = undefined @floatFromInt(block.*);
-
-                    //decoder.frame_data[decoder.coded_width * (block_y + (k / 8)) + block_x + (k % 8)] = @floatFromInt(value);
                 }
 
                 idct8x8(&mh);
@@ -936,22 +306,6 @@ fn decodePacketInternal(decoder: *Decoder) !void {
             }
         }
 
-        //for (0..num_luma_blocks) |j| {
-        //    const block_offset_x = 16 * (j / 4) + 8 * (j % 2);
-        //    const block_offset_y: u32 = if (j % 4 < 2) 0 else 8;
-        //    const block_x = slice_x + block_offset_x;
-        //    const block_y = slice_y + block_offset_y;
-        //
-        //    const unquantized = 4096 + ((decoder.slice_data[64 * j] * q_mat_luma[0] * scale_factor) >> 2);
-        //    const normalized = @as(f32, @floatFromInt(unquantized)) / (2 * 4096);
-        //
-        //    for (0..8) |x| {
-        //        for (0..8) |y| {
-        //            decoder.frame_data[decoder.coded_width * (block_y + y) + block_x + x] = normalized;
-        //        }
-        //    }
-        //}
-
         reader.pos = slice_start_pos + slice_size;
 
         slice_x += 16 * slice_width;
@@ -960,27 +314,6 @@ fn decodePacketInternal(decoder: *Decoder) !void {
             slice_x = 0;
             slice_y += 16 * slice_height;
         }
-    }
-
-    printValues(.{ fit_in_byte, dont, mh2 / @as(f64, @floatFromInt(fit_in_byte)), mh3 / @as(f64, @floatFromInt(fit_in_byte)), mh4 / le_count });
-
-    if (false) {
-        print("ac codeword bits: avg={d:.4} n={} hist={any}\n", .{
-            @as(f64, @floatFromInt(ac_cw_bits_sum)) / @as(f64, @floatFromInt(ac_cw_count)),
-            ac_cw_count,
-            ac_cw_hist,
-        });
-
-        print("cw table run: hits={} misses={} hit_rate={d:.4}\n", .{
-            run_cw_hits,
-            run_cw_misses,
-            @as(f64, @floatFromInt(run_cw_hits)) / @as(f64, @floatFromInt(run_cw_hits + run_cw_misses)),
-        });
-        print("cw table lev: hits={} misses={} hit_rate={d:.4}\n", .{
-            lev_cw_hits,
-            lev_cw_misses,
-            @as(f64, @floatFromInt(lev_cw_hits)) / @as(f64, @floatFromInt(lev_cw_hits + lev_cw_misses)),
-        });
     }
 }
 
@@ -1095,12 +428,14 @@ const ByteReader = struct {
         if (T == u8) {
             const value = self.data[self.pos];
             self.pos += 1;
+
             return value;
         }
 
         const size = @divExact(@typeInfo(T).int.bits, 8);
         const value = std.mem.readInt(T, self.data[self.pos..][0..size], .big);
         self.pos += size;
+
         return value;
     }
 
@@ -1125,43 +460,12 @@ const ByteReader = struct {
     }
 };
 
-var fit_in_byte: u32 = 0;
-var mh2: f64 = 0;
-var mh3: f64 = 0;
-var mh4: f64 = 0;
-var le_count: f64 = 0;
-var dont: u32 = 0;
+const ParsedCode = struct {
+    value: u32,
+    bits: u32,
+};
 
-// AC codeword size intel (run + level codewords, excluding the sign bit).
-var ac_cw_bits_sum: u64 = 0;
-var ac_cw_count: u64 = 0;
-var ac_cw_hist: [32]u64 = [_]u64{0} ** 32;
-
-// Byte-aligned codeword table: cache hits vs manual parseCode fallbacks.
-var run_cw_hits: u64 = 0;
-var run_cw_misses: u64 = 0;
-var lev_cw_hits: u64 = 0;
-var lev_cw_misses: u64 = 0;
-
-const ParsedCode = struct { value: u32, bits: u32 };
-
-// Parse one exp-Golomb/Rice codeword from a u32 with the codeword left-aligned at the MSB.
-inline fn parseCode(word: u32, params: u8) ParsedCode {
-    const mp = params & 0b11;
-    const g: u3 = @intCast((params >> 2) & 0b111);
-    const r: u3 = @intCast(params >> 5);
-
-    const n = @clz(word);
-    const big: u32 = 0 -% @as(u32, @intFromBool(n > mp));
-    const base = std.math.shl(u32, @min(n, mp + 1), r);
-    const sub = @as(u32, 1) << @as(u5, @intCast(r ^ (big & (g ^ r))));
-    const bits = @min((n + 1 + r) +% (big & (n +% g -% mp -% 1 -% r)), 32);
-    const raw: u32 = word >> @as(u5, @intCast(32 - bits));
-
-    return .{ .value = base +% raw -% sub, .bits = @intCast(bits) };
-}
-
-inline fn parseCode2(word: u64, params: u8) ParsedCode {
+inline fn parseCode(word: u64, params: u8) ParsedCode {
     const mp: u32 = params & 0b11;
     const g: u32 = (params >> 2) & 0b111;
     const r: u32 = params >> 5;
@@ -1169,20 +473,13 @@ inline fn parseCode2(word: u64, params: u8) ParsedCode {
     const n: u32 = @clz(word);
     const is_big = n > mp;
 
-    const base = std.math.shl(u32, @min(n, mp + 1), r);
-    //const base = @min(n, mp + 1) << @as(u5, @intCast(r));
+    const base = @as(u32, @min(n, mp + 1)) << @as(u5, @intCast(r));
 
-    // Pre-compute both arms (wrapping so the unused arm can't trap), then let the
-    // compiler emit a wasm `select` instead of branchy masking.
     const bits_big = 2 *% n +% g -% mp;
     const bits_small = n + 1 + r;
     const bits = if (is_big) bits_big else bits_small;
     const sub = @as(u32, 1) << (if (is_big) @intCast(g) else @intCast(r));
-
     const raw: u32 = @intCast(word >> @as(u6, @intCast(64 - bits)));
-
-    //const raw = self.readBitsAssumingLoaded(@intCast(bits));
-    //self.consume(@intCast(bits));
 
     const result = base +% raw -% sub;
 
@@ -1190,24 +487,6 @@ inline fn parseCode2(word: u64, params: u8) ParsedCode {
         .value = result,
         .bits = bits,
     };
-}
-
-// Build a u32 with the bits starting at position `bp` left-aligned at the MSB. Reads a single
-// u32 and shifts by the sub-byte offset, so only the top 25 bits are valid - plenty for our codes.
-inline fn buildWord(data: []const u8, bp: usize) u32 {
-    const bi = bp >> 3;
-    const o: u5 = @intCast(bp & 7);
-
-    if (bi + 4 > data.len) {
-        // Within the last few bytes of the buffer: assemble what's left, zero-padded.
-        var w: u32 = 0;
-        for (bi..data.len, 0..) |k, idx| {
-            w |= @as(u32, data[k]) << @intCast(24 - idx * 8);
-        }
-        return w << o;
-    }
-
-    return std.mem.readInt(u32, data[bi..][0..4], .big) << o;
 }
 
 const BitReader = struct {
@@ -1269,49 +548,10 @@ const BitReader = struct {
         }
     }
 
-    //inline fn getCode(self: *CodeReader, params: u8) u32 {
-    //    const mp: u32 = params & 0b11;
-    //    const g: u32 = (params >> 2) & 0b111;
-    //    const r: u32 = params >> 5;
-    //
-    //    const n: u32 = @clz(self.current);
-    //    const is_big = n > mp;
-    //
-    //    const base = std.math.shl(u32, @min(n, mp + 1), r);
-    //
-    //    const bits_big = 2 *% n +% g -% mp;
-    //    const bits_small = n + 1 + r;
-    //    const bits = if (is_big) bits_big else bits_small;
-    //    const sub = @as(u32, 1) << (if (is_big) @intCast(g) else @intCast(r));
-    //
-    //    const raw = self.readBitsAssumingLoaded(@intCast(bits));
-    //    self.consume(@intCast(bits));
-    //
-    //    return base +% raw -% sub;
-    //}
-
-    //inline fn readBitsAssumingLoaded(self: *CodeReader, bits: u8) u32 {
-    //    //printValues(.{ "ay", bits });
-    //    return @intCast(self.current >> @as(u6, @intCast(64 - bits)));
-    //}
-    //
-    //inline fn readBits(self: *CodeReader, bits: u8) u32 {
-    //    self.maybeLoadData();
-    //    return self.readBitsAssumingLoaded(bits);
-    //}
-
     inline fn consume(self: *BitReader, bits: u8) void {
         self.current <<= @as(u6, @intCast(bits));
         self.current |= self.next >> @as(u6, @intCast(64 - bits));
         self.next <<= @as(u6, @intCast(bits));
         self.bit_health -= bits;
     }
-
-    //inline fn getRemainingBits(self: *CodeReader) u32 {
-    //    return (self.reader.remaining() << 3) + self.bit_health;
-    //}
-    //
-    //inline fn getBitPos(self: *CodeReader) usize {
-    //    return self.reader.pos * 8 - self.bit_health;
-    //}
 };
