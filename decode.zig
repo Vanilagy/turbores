@@ -114,7 +114,7 @@ export fn decodePacket(decoder: *Decoder) i32 {
 }
 
 const SliceHeader = struct {
-    scale_factor: u8,
+    scale_factor: u32,
     bit_reader: BitReader,
 };
 
@@ -122,7 +122,7 @@ inline fn parseSliceHeader(slice_sizes: []u16, reader: *ByteReader, i: usize) Sl
     const slice_size = slice_sizes[i];
     const slice_hdr_size = reader.takeInt(u8);
 
-    var scale_factor = reader.takeInt(u8);
+    var scale_factor: u32 = reader.takeInt(u8);
     if (scale_factor > 128) {
         scale_factor = (scale_factor - 96) << 2;
     }
@@ -298,43 +298,27 @@ fn parseAcPair(
 fn reconstructSlice(
     decoder: *Decoder,
     slice_data: []const i32,
-    q_mat_luma: [64]u8,
-    scale_factor: u8,
-    pos: SlicePos,
+    scaling_matrix: [64]f32,
+    scale_factor: u32,
+    slice_pos: SlicePos,
     num_luma_blocks: u32,
 ) void {
-    var q_mat_luma_vector: @Vector(64, i32) = q_mat_luma;
-    q_mat_luma_vector *= @splat(scale_factor);
+    var scaling_matrix_vec: @Vector(64, f32) = scaling_matrix;
+    scaling_matrix_vec *= @splat(@floatFromInt(scale_factor));
 
     var j: u32 = 0;
     while (j < num_luma_blocks) : (j += 2) {
         var block_a = slice_data[64 * j ..][0..64].*;
         var block_b = slice_data[64 * j + 64 ..][0..64].*;
 
-        var block_vec_a: @Vector(64, i32) = block_a;
-        var block_vec_b: @Vector(64, i32) = block_b;
+        idct_8x8(&block_a, scaling_matrix_vec);
+        idct_8x8(&block_b, scaling_matrix_vec);
 
-        block_vec_a *= q_mat_luma_vector;
-        block_vec_b *= q_mat_luma_vector;
+        const block_a_x = slice_pos.x + ((j >> 2) << 4);
+        const block_a_y = slice_pos.y + ((j & 2) << 2);
 
-        block_vec_a >>= @splat(2);
-        block_vec_b >>= @splat(2);
-
-        block_a = block_vec_a;
-        block_b = block_vec_b;
-
-        block_a[0] += 4096;
-        block_b[0] += 4096;
-
-        idct_8x8_int(&block_a);
-        idct_8x8_int(&block_b);
-
-        const block_a_x = pos.x + 16 * (j / 4) + 8 * (j % 2);
-        const block_a_y = pos.y + @as(u32, if (j % 4 < 2) 0 else 8);
-
-        const jb = j + 1;
-        const block_b_x = pos.x + 16 * (jb / 4) + 8 * (jb % 2);
-        const block_b_y = pos.y + @as(u32, if (jb % 4 < 2) 0 else 8);
+        const block_b_x = block_a_x + 8;
+        const block_b_y = block_a_y;
 
         // Copy into frame data
         inline for (0..8) |row| {
@@ -399,12 +383,21 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     reader.toss(1);
     const q_mat_flags = reader.takeInt(u8);
 
-    var q_mat_luma: [64]u8 = if (q_mat_flags & 0b10 != 0)
+    const q_mat_luma: [64]u8 = if (q_mat_flags & 0b10 != 0)
         reader.takeArray(64).*
     else
         @splat(4);
 
-    q_mat_luma = transpose_8x8(u8, q_mat_luma);
+    // Fold the dequantization and AAN scaling factors into a single matrix
+    var luma_scaling_matrix: [64]f32 = undefined;
+    inline for (0..8) |x| {
+        inline for (0..8) |y| {
+            const i = 8 * y + x;
+            luma_scaling_matrix[i] = @floatFromInt(q_mat_luma[8 * x + y]); // Read the matrix transposed-ly
+            luma_scaling_matrix[i] *= 0.25; // >> 2
+            luma_scaling_matrix[i] *= comptime 1 / (S[x] * S[y]);
+        }
+    }
 
     const q_mat_chroma: [64]u8 = if (q_mat_flags & 0b01 != 0)
         reader.takeArray(64).*
@@ -513,7 +506,7 @@ fn decodePacketInternal(decoder: *Decoder) !void {
         reconstructSlice(
             decoder,
             slice_1_data,
-            q_mat_luma,
+            luma_scaling_matrix,
             header_1.scale_factor,
             pos_1,
             num_luma_blocks,
@@ -521,7 +514,7 @@ fn decodePacketInternal(decoder: *Decoder) !void {
         reconstructSlice(
             decoder,
             slice_2_data,
-            q_mat_luma,
+            luma_scaling_matrix,
             header_2.scale_factor,
             pos_2,
             num_luma_blocks,
@@ -561,7 +554,7 @@ fn decodePacketInternal(decoder: *Decoder) !void {
         reconstructSlice(
             decoder,
             tail_slice_data,
-            q_mat_luma,
+            luma_scaling_matrix,
             header.scale_factor,
             pos,
             num_luma_blocks,
@@ -580,18 +573,6 @@ const S = [_]f32{
     8 * 1.281457723870753089398043,
 };
 
-const mult_bits = 12;
-
-const S_inv_int = blk: {
-    var res: [8]i32 = undefined;
-
-    for (S, 0..) |s, i| {
-        res[i] = @intFromFloat(@round((1 / s) * @as(f32, @floatFromInt(1 << mult_bits))));
-    }
-
-    break :blk res;
-};
-
 const A = [_]f32{
     std.math.nan(f32),
     0.707106781186547524400844,
@@ -601,103 +582,40 @@ const A = [_]f32{
     0.382683432365089771728460,
 };
 
-inline fn idct_8_int(values: *[8]f32) void {
-    const V = @Vector(8, f32);
-    const V_half = @Vector(4, f32);
+inline fn idct_8x8(block: *[64]i32, scaling_matrix: @Vector(64, f32)) void {
+    var float_block: [64]f32 = @as(
+        @Vector(64, f32),
+        @floatFromInt(@as(@Vector(64, i32), block.*)),
+    );
 
-    //var vector: V = @floatFromInt(@as(@Vector(8, i32), values.*));
-    var vector: V = values.*;
-    vector *= comptime @as(V, @splat(1)) / S;
+    const Vec = @Vector(64, f32);
+    var float_vec: Vec = float_block;
+    float_vec *= scaling_matrix;
 
-    //    //const v15 = vector[0] / S[0];
-    //    //const v26 = vector[1] / S[1];
-    //    //const v21 = vector[2] / S[2];
-    //    //const v28 = vector[3] / S[3];
-    //    //const v16 = vector[4] / S[4];
-    //    //const v25 = vector[5] / S[5];
-    //    //const v22 = vector[6] / S[6];
-    //    //const v27 = vector[7] / S[7];
+    float_block = float_vec;
+    float_block[0] += comptime 4096 / (S[0] * S[0]); // Add the DC dequant offset but pre-scaled
 
-    const first_mask = [_]i32{ 0, 1, 2, 5 };
-    const second_mask = [_]i32{ 4, 7, 6, 3 };
+    idct_columns(&float_block);
+    float_block = transpose_8x8(f32, float_block);
+    idct_columns(&float_block);
 
-    const first = @shuffle(f32, vector, undefined, first_mask);
-    const second = @shuffle(f32, vector, undefined, second_mask);
-
-    const out_1 = (first + second) * @as(V_half, @splat(0.5));
-    //    //const v8 = (v15 + v16) / 2;
-    //    //const v23 = (v26 + v27) / 2;
-    //    //const v11 = (v21 + v22) / 2;
-    //    //const v24 = (v25 + v28) / 2;
-
-    const out_2 = (first - second) * @as(V_half, @splat(0.5));
-    //    //const v9 = (v15 - v16) / 2;
-    //    //const v20 = (v26 - v27) / 2;
-    //    //const v17 = (v21 - v22) / 2;
-    //    //const v19 = (v25 - v28) / 2;
-
-    const v19 = out_2[3];
-    const v20 = out_2[1];
-    const v23 = out_1[1];
-    const v24 = out_1[3];
-    const v11 = out_1[2];
-    const v17 = out_2[2];
-    const v8 = out_1[0];
-    const v9 = out_2[0];
-
-    //const a1_inv: i32 = comptime @intFromFloat(@round((1 / A[1]) * @as(f32, @floatFromInt(1 << mult_bits))));
-
-    const v7 = (v23 + v24) / 2;
-    const v13 = (v23 - v24) / 2;
-    const v10 = v17 * (comptime 1 / A[1]) - v11;
-
-    //const a5: i32 = comptime @intFromFloat(@round(A[5] * @as(f32, @floatFromInt(1 << mult_bits))));
-
-    const v18 = (v19 - v20) * A[5]; // Different from original
-    const v12 = (v19 * A[4] - v18) * (comptime 1 / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]));
-    const v14 = (v18 - v20 * A[2]) * (comptime 1 / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]));
-
-    const v6 = v14 - v7;
-    const v5 = v13 * (comptime 1 / A[3]) - v6;
-
-    const yo: V = .{ -v5 * 2, v8, v9, v9, v8, 2 * v5, 2 * v6, 2 * v7 };
-    const yo_2: V = .{ -v12 * 2, v11, v10, -v10, -v11, 0, 0, 0 };
-
-    const yo_added = yo + yo_2;
-
-    const third_mask = [_]i32{ 1, 2, 3, 4 };
-    const fourth_mask = [_]i32{ 7, 6, 5, 0 };
-    //const fifth_mask = [_]i32{ 4, 3, 2, 1 };
-    //const sixth_mask = [_]i32{ 0, 5, 6, 7 };
-
-    const third = @shuffle(f32, yo_added, undefined, third_mask);
-    const fourth = @shuffle(f32, yo_added, undefined, fourth_mask);
-    //const fifth = @shuffle(i32, yo_added, undefined, fifth_mask);
-    //const sixth = @shuffle(i32, yo_added, undefined, sixth_mask);
-
-    const res_1 = (third + fourth) * @as(V_half, @splat(0.25));
-    const res_2_almost = (third - fourth) * @as(V_half, @splat(0.25));
-
-    const reverse_mask = [_]i32{ 3, 2, 1, 0 };
-    const res_2 = @shuffle(f32, res_2_almost, undefined, reverse_mask);
-
-    //values[0..4].* = @as(@Vector(4, i32), @intFromFloat(res_1));
-    //values[4..8].* = @as(@Vector(4, i32), @intFromFloat(res_2));
-    values[0..4].* = res_1;
-    values[4..8].* = res_2;
+    block.* = @as(
+        @Vector(64, i32),
+        @intFromFloat(@as(@Vector(64, f32), float_block)),
+    );
 }
 
-inline fn idct_8_int_2(block: *[64]f32) void {
+inline fn idct_columns(block: *[64]f32) void {
     const V = @Vector(8, f32);
 
-    const v15 = @as(V, block[0..8].*) * @as(V, @splat(comptime 1.0 / S[0]));
-    const v26 = @as(V, block[8..16].*) * @as(V, @splat(comptime 1.0 / S[1]));
-    const v21 = @as(V, block[16..24].*) * @as(V, @splat(comptime 1.0 / S[2]));
-    const v28 = @as(V, block[24..32].*) * @as(V, @splat(comptime 1.0 / S[3]));
-    const v16 = @as(V, block[32..40].*) * @as(V, @splat(comptime 1.0 / S[4]));
-    const v25 = @as(V, block[40..48].*) * @as(V, @splat(comptime 1.0 / S[5]));
-    const v22 = @as(V, block[48..56].*) * @as(V, @splat(comptime 1.0 / S[6]));
-    const v27 = @as(V, block[56..64].*) * @as(V, @splat(comptime 1.0 / S[7]));
+    const v15: V = block[0..8].*;
+    const v26: V = block[8..16].*;
+    const v21: V = block[16..24].*;
+    const v28: V = block[24..32].*;
+    const v16: V = block[32..40].*;
+    const v25: V = block[40..48].*;
+    const v22: V = block[48..56].*;
+    const v27: V = block[56..64].*;
 
     const v19 = v25 - v28;
     const v20 = v26 - v27;
@@ -739,268 +657,6 @@ inline fn idct_8_int_2(block: *[64]f32) void {
     block[40..48].* = v2 - v5;
     block[48..56].* = v1 - v6;
     block[56..64].* = v0 - v7;
-}
-
-//inline fn idct_8_int(values: *[8]i32) void {
-//    var vector: @Vector(8, i32) = values.*;
-//    vector *= S_inv_int;
-//
-//    //const v15 = vector[0] / S[0];
-//    //const v26 = vector[1] / S[1];
-//    //const v21 = vector[2] / S[2];
-//    //const v28 = vector[3] / S[3];
-//    //const v16 = vector[4] / S[4];
-//    //const v25 = vector[5] / S[5];
-//    //const v22 = vector[6] / S[6];
-//    //const v27 = vector[7] / S[7];
-//
-//    const first_mask = [_]i32{ 5, 1, 1, 5, 2, 2, 0, 0 };
-//    const second_mask = [_]i32{ 3, 7, 7, 3, 6, 6, 4, 4 };
-//    const mul = [_]i32{ -1, -1, 1, 1, 1, -1, 1, -1 };
-//
-//    const first = @shuffle(i32, vector, undefined, first_mask);
-//    const second = @shuffle(i32, vector, undefined, second_mask);
-//    const result = (first + mul * second) >> @splat(mult_bits + 1);
-//
-//    //const v19 = (v25 - v28) / 2;
-//    //const v20 = (v26 - v27) / 2;
-//    //const v23 = (v26 + v27) / 2;
-//    //const v24 = (v25 + v28) / 2;
-//    //const v11 = (v21 + v22) / 2;
-//    //const v17 = (v21 - v22) / 2;
-//    //const v8 = (v15 + v16) / 2;
-//    //const v9 = (v15 - v16) / 2;
-//
-//    const v19 = result[0];
-//    const v20 = result[1];
-//    const v23 = result[2];
-//    const v24 = result[3];
-//    const v11 = result[4];
-//    const v17 = result[5];
-//    const v8 = result[6];
-//    const v9 = result[7];
-//
-//    const a1_inv: i32 = comptime @intFromFloat(@round((1 / A[1]) * @as(f32, @floatFromInt(1 << mult_bits))));
-//
-//    const v7 = (v23 + v24) / 2;
-//    const v13 = (v23 - v24) / 2;
-//    const v10 = v17 * a1_inv - (v11 << mult_bits);
-//
-//    const a5: i32 = comptime @intFromFloat(@round(A[5] * @as(f32, @floatFromInt(1 << mult_bits))));
-//
-//    const v18 = (v19 - v20) * a5; // Different from original
-//    const v12 = (v19 * A[4] - v18) / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]);
-//    const v14 = (v18 - v20 * A[2]) / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]);
-//
-//    const v6 = v14 - v7;
-//    const v5 = v13 / A[3] - v6;
-//
-//    //
-//    //const v7 = (v23 + v24) / 2;
-//    //const v13 = (v23 - v24) / 2;
-//    //const v10 = v17 / A[1] - v11;
-//
-//    //const v18 = (v19 - v20) * A[5]; // Different from original
-//    //const v12 = (v19 * A[4] - v18) / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]);
-//    //const v14 = (v18 - v20 * A[2]) / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]);
-//    //
-//    //const v6 = v14 - v7;
-//    //const v5 = v13 / A[3] - v6;
-//
-//    const yo: @Vector(8, i32) = .{ -(v5 << 1), v8, v9, v9, v8, v5, v6, v7 };
-//    const yo_2: @Vector(8, i32) = .{ -(v12 << 1), v11, v10, v10, v11, 0, 0, 0 };
-//
-//    const yo_added = yo + yo_2;
-//
-//    const third_mask = [_]i32{ 1, 2, 3, 4 };
-//    const fourth_mask = [_]i32{ 7, 6, 5, 0 };
-//    //const fifth_mask = [_]i32{ 4, 3, 2, 1 };
-//    //const sixth_mask = [_]i32{ 0, 5, 6, 7 };
-//
-//    const third = @shuffle(i32, yo_added, undefined, third_mask);
-//    const fourth = @shuffle(i32, yo_added, undefined, fourth_mask);
-//    //const fifth = @shuffle(i32, yo_added, undefined, fifth_mask);
-//    //const sixth = @shuffle(i32, yo_added, undefined, sixth_mask);
-//
-//    const res_1 = (third + fourth) >> 2;
-//    const res_2_almost = (third - fourth) >> 2;
-//
-//    const reverse_mask = [_]i32{ 3, 2, 1, 0 };
-//    const res_2 = @shuffle(i32, res_2_almost, undefined, reverse_mask);
-//
-//    values[0..4].* = res_1;
-//    values[4..8].* = res_2;
-//
-//    //const v4 = -v5 - v12;
-//    //const v0 = (v8 + v11) / 2;
-//    //const v1 = (v9 + v10) / 2;
-//    //const v2 = (v9 - v10) / 2;
-//    //const v3 = (v8 - v11) / 2;
-//    //
-//    //vector[0] = (v0 + v7) / 2;
-//    //vector[1] = (v1 + v6) / 2;
-//    //vector[2] = (v2 + v5) / 2;
-//    //vector[3] = (v3 + v4) / 2;
-//    //vector[4] = (v3 - v4) / 2;
-//    //vector[5] = (v2 - v5) / 2;
-//    //vector[6] = (v1 - v6) / 2;
-//    //vector[7] = (v0 - v7) / 2;
-//
-//    // =================
-//
-//    //const v15 = vector[0] / S[0];
-//    //const v26 = vector[1] / S[1];
-//    //const v21 = vector[2] / S[2];
-//    //const v28 = vector[3] / S[3];
-//    //const v16 = vector[4] / S[4];
-//    //const v25 = vector[5] / S[5];
-//    //const v22 = vector[6] / S[6];
-//    //const v27 = vector[7] / S[7];
-//    //
-//    //const v19 = (v25 - v28) / 2;
-//    //const v20 = (v26 - v27) / 2;
-//    //const v23 = (v26 + v27) / 2;
-//    //const v24 = (v25 + v28) / 2;
-//    //
-//    //const v7 = (v23 + v24) / 2;
-//    //const v11 = (v21 + v22) / 2;
-//    //const v13 = (v23 - v24) / 2;
-//    //const v17 = (v21 - v22) / 2;
-//    //
-//    //const v8 = (v15 + v16) / 2;
-//    //const v9 = (v15 - v16) / 2;
-//    //
-//    //const v18 = (v19 - v20) * A[5]; // Different from original
-//    //const v12 = (v19 * A[4] - v18) / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]);
-//    //const v14 = (v18 - v20 * A[2]) / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]);
-//    //
-//    //const v6 = v14 - v7;
-//    //const v5 = v13 / A[3] - v6;
-//    //const v4 = -v5 - v12;
-//    //const v10 = v17 / A[1] - v11;
-//    //
-//    //const v0 = (v8 + v11) / 2;
-//    //const v1 = (v9 + v10) / 2;
-//    //const v2 = (v9 - v10) / 2;
-//    //const v3 = (v8 - v11) / 2;
-//    //
-//    //vector[0] = (v0 + v7) / 2;
-//    //vector[1] = (v1 + v6) / 2;
-//    //vector[2] = (v2 + v5) / 2;
-//    //vector[3] = (v3 + v4) / 2;
-//    //vector[4] = (v3 - v4) / 2;
-//    //vector[5] = (v2 - v5) / 2;
-//    //vector[6] = (v1 - v6) / 2;
-//    //vector[7] = (v0 - v7) / 2;
-//}
-
-inline fn idct_8x8_int(block: *[64]i32) void {
-    var float_block: [64]f32 = @as(
-        @Vector(64, f32),
-        @floatFromInt(@as(@Vector(64, i32), block.*)),
-    );
-
-    idct_8_int_2(&float_block);
-    float_block = transpose_8x8(f32, float_block);
-    idct_8_int_2(&float_block);
-
-    block.* = @as(
-        @Vector(64, i32),
-        @intFromFloat(@as(@Vector(64, f32), float_block)),
-    );
-}
-
-inline fn idct8(vector: *[8]f32) void {
-    const v15 = vector[0] / S[0];
-    const v26 = vector[1] / S[1];
-    const v21 = vector[2] / S[2];
-    const v28 = vector[3] / S[3];
-    const v16 = vector[4] / S[4];
-    const v25 = vector[5] / S[5];
-    const v22 = vector[6] / S[6];
-    const v27 = vector[7] / S[7];
-
-    const v19 = (v25 - v28) / 2;
-    const v20 = (v26 - v27) / 2;
-    const v23 = (v26 + v27) / 2;
-    const v24 = (v25 + v28) / 2;
-
-    const v7 = (v23 + v24) / 2;
-    const v11 = (v21 + v22) / 2;
-    const v13 = (v23 - v24) / 2;
-    const v17 = (v21 - v22) / 2;
-
-    const v8 = (v15 + v16) / 2;
-    const v9 = (v15 - v16) / 2;
-
-    const v18 = (v19 - v20) * A[5]; // Different from original
-    const v12 = (v19 * A[4] - v18) / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]);
-    const v14 = (v18 - v20 * A[2]) / (A[2] * A[5] - A[2] * A[4] - A[4] * A[5]);
-
-    const v6 = v14 - v7;
-    const v5 = v13 / A[3] - v6;
-    const v4 = -v5 - v12;
-    const v10 = v17 / A[1] - v11;
-
-    const v0 = (v8 + v11) / 2;
-    const v1 = (v9 + v10) / 2;
-    const v2 = (v9 - v10) / 2;
-    const v3 = (v8 - v11) / 2;
-
-    vector[0] = (v0 + v7) / 2;
-    vector[1] = (v1 + v6) / 2;
-    vector[2] = (v2 + v5) / 2;
-    vector[3] = (v3 + v4) / 2;
-    vector[4] = (v3 - v4) / 2;
-    vector[5] = (v2 - v5) / 2;
-    vector[6] = (v1 - v6) / 2;
-    vector[7] = (v0 - v7) / 2;
-}
-
-fn idct8x8(block: *[64]f32) void {
-    inline for (0..8) |column| {
-        idct8(block[8 * column ..][0..8]);
-    }
-
-    const vec: @Vector(64, f32) = block.*;
-
-    comptime var mask: @Vector(64, i32) = undefined;
-    inline for (0..8) |x| {
-        inline for (0..8) |y| {
-            mask[8 * y + x] = 8 * x + y;
-        }
-    }
-
-    const transposed = @shuffle(f32, vec, undefined, mask);
-
-    block.* = transposed;
-
-    inline for (0..8) |row| {
-        idct8(block[8 * row ..][0..8]);
-    }
-
-    //inline for (0..8) |column| {
-    //    var temp: [8]f32 = undefined;
-    //    temp[0] = block[0 * 8 + column];
-    //    temp[1] = block[1 * 8 + column];
-    //    temp[2] = block[2 * 8 + column];
-    //    temp[3] = block[3 * 8 + column];
-    //    temp[4] = block[4 * 8 + column];
-    //    temp[5] = block[5 * 8 + column];
-    //    temp[6] = block[6 * 8 + column];
-    //    temp[7] = block[7 * 8 + column];
-    //
-    //    idct8(&temp);
-    //
-    //    block[0 * 8 + column] = temp[0];
-    //    block[1 * 8 + column] = temp[1];
-    //    block[2 * 8 + column] = temp[2];
-    //    block[3 * 8 + column] = temp[3];
-    //    block[4 * 8 + column] = temp[4];
-    //    block[5 * 8 + column] = temp[5];
-    //    block[6 * 8 + column] = temp[6];
-    //    block[7 * 8 + column] = temp[7];
-    //}
 }
 
 const ByteReader = struct {
