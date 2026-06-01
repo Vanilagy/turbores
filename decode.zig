@@ -188,30 +188,30 @@ const DcState = struct {
         return s;
     }
 
-    inline fn step(s: *DcState, j: usize) void {
-        s.bit_reader.maybeLoadData();
+    inline fn step(self: *DcState, j: usize) void {
+        self.bit_reader.maybeLoadData();
 
-        const code_result_1 = parseCode(s.bit_reader.current, dc_code_params[@min(@as(usize, @intCast(s.code)), 6)]);
+        const code_result_1 = parseCode(self.bit_reader.current, dc_code_params[@min(@as(usize, @intCast(self.code)), 6)]);
 
-        s.code = @intCast(code_result_1.value);
-        s.sign = @intFromBool(s.code > 0) * (s.sign ^ -(s.code & 1));
+        self.code = @intCast(code_result_1.value);
+        self.sign = @intFromBool(self.code > 0) * (self.sign ^ -(self.code & 1));
 
-        const result_1 = s.prev_dc + (((s.code + 1) >> 1) ^ s.sign) - s.sign;
-        s.slice_data[64 * j] = @floatFromInt(result_1);
+        const result_1 = self.prev_dc + (((self.code + 1) >> 1) ^ self.sign) - self.sign;
+        self.slice_data[64 * j] = @floatFromInt(result_1);
 
         const code_result_2 = parseCode(
-            s.bit_reader.current << @as(u6, @intCast(code_result_1.bits)),
+            self.bit_reader.current << @as(u6, @intCast(code_result_1.bits)),
             dc_code_params[@min(code_result_1.value, 6)],
         );
 
-        s.code = @intCast(code_result_2.value);
-        s.sign = @intFromBool(s.code > 0) * (s.sign ^ -(s.code & 1));
+        self.code = @intCast(code_result_2.value);
+        self.sign = @intFromBool(self.code > 0) * (self.sign ^ -(self.code & 1));
 
-        const result_2 = result_1 + (((s.code + 1) >> 1) ^ s.sign) - s.sign;
-        s.slice_data[64 * j + 64] = @floatFromInt(result_2);
-        s.prev_dc = result_2;
+        const result_2 = result_1 + (((self.code + 1) >> 1) ^ self.sign) - self.sign;
+        self.slice_data[64 * j + 64] = @floatFromInt(result_2);
+        self.prev_dc = result_2;
 
-        s.bit_reader.consume(@intCast(code_result_1.bits + code_result_2.bits));
+        self.bit_reader.consume(@intCast(code_result_1.bits + code_result_2.bits));
     }
 };
 
@@ -224,27 +224,27 @@ const AcState = struct {
     run: u32 = 4,
     level: i32 = 2,
 
-    inline fn step(s: *AcState) bool {
-        s.bit_reader.maybeLoadData();
-        if (s.bit_reader.current == 0) {
+    inline fn step(self: *AcState) bool {
+        self.bit_reader.maybeLoadData();
+        if (self.bit_reader.current == 0) {
             return false;
         }
 
-        const run_result = parseCode(s.bit_reader.current, run_to_cb[@min(s.run, 15)]);
-        s.run = run_result.value;
-        s.pos += s.run + 1;
+        const run_result = parseCode(self.bit_reader.current, run_to_cb[@min(self.run, 15)]);
+        self.run = run_result.value;
+        self.pos += self.run + 1;
 
         const level_result = parseCode(
-            s.bit_reader.current << @as(u6, @intCast(run_result.bits)),
-            lev_to_cb[@min(@as(u32, @intCast(s.level)), 9)],
+            self.bit_reader.current << @as(u6, @intCast(run_result.bits)),
+            lev_to_cb[@min(@as(u32, @intCast(self.level)), 9)],
         );
-        s.level = @as(i32, @intCast(level_result.value)) + 1;
+        self.level = @as(i32, @intCast(level_result.value)) + 1;
 
-        const j = s.pos >> s.log2_block_count;
+        const j = self.pos >> self.log2_block_count;
         const thing = run_result.bits + level_result.bits + 1;
-        const sign = -@as(i32, @intCast((s.bit_reader.current >> @as(u6, @intCast(64 - thing))) & 1));
-        s.bit_reader.consume(@intCast(thing));
-        s.slice_data[((s.pos & s.block_mask) << 6) + scan_order[j]] = @floatFromInt((s.level ^ sign) - sign);
+        const sign = -@as(i32, @intCast((self.bit_reader.current >> @as(u6, @intCast(64 - thing))) & 1));
+        self.bit_reader.consume(@intCast(thing));
+        self.slice_data[((self.pos & self.block_mask) << 6) + scan_order[j]] = @floatFromInt((self.level ^ sign) - sign);
 
         return true;
     }
@@ -326,7 +326,7 @@ fn parseAcSingle(bit_reader: *BitReader, slice_data: []f32, num_blocks: u32) voi
     while (ac_state.step()) {}
 }
 
-fn reconstructSlice(
+fn transformAndStoreSliceData(
     decoder: *Decoder,
     slice_data: []const f32,
     frame_data: []u16,
@@ -566,7 +566,7 @@ fn decodePacketInternal(decoder: *Decoder) !void {
             slice_2_luma_data,
             num_luma_blocks,
         );
-        reconstructSlice(
+        transformAndStoreSliceData(
             decoder,
             slice_1_luma_data,
             luma_frame_data,
@@ -575,7 +575,7 @@ fn decodePacketInternal(decoder: *Decoder) !void {
             num_luma_blocks,
             4,
         );
-        reconstructSlice(
+        transformAndStoreSliceData(
             decoder,
             slice_2_luma_data,
             luma_frame_data,
@@ -600,7 +600,7 @@ fn decodePacketInternal(decoder: *Decoder) !void {
             slice_2_u_data,
             num_chroma_blocks,
         );
-        reconstructSlice(
+        transformAndStoreSliceData(
             decoder,
             slice_1_u_data,
             u_frame_data,
@@ -609,7 +609,7 @@ fn decodePacketInternal(decoder: *Decoder) !void {
             num_chroma_blocks,
             2,
         );
-        reconstructSlice(
+        transformAndStoreSliceData(
             decoder,
             slice_2_u_data,
             u_frame_data,
@@ -634,7 +634,7 @@ fn decodePacketInternal(decoder: *Decoder) !void {
             slice_2_v_data,
             num_chroma_blocks,
         );
-        reconstructSlice(
+        transformAndStoreSliceData(
             decoder,
             slice_1_v_data,
             v_frame_data,
@@ -643,7 +643,7 @@ fn decodePacketInternal(decoder: *Decoder) !void {
             num_chroma_blocks,
             2,
         );
-        reconstructSlice(
+        transformAndStoreSliceData(
             decoder,
             slice_2_v_data,
             v_frame_data,
@@ -675,17 +675,17 @@ fn decodePacketInternal(decoder: *Decoder) !void {
         // Luma
         parseDcSingle(&header.luma_bit_reader, luma_data, num_luma_blocks);
         parseAcSingle(&header.luma_bit_reader, luma_data, num_luma_blocks);
-        reconstructSlice(decoder, luma_data, luma_frame_data, luma_vec, pos, num_luma_blocks, 4);
+        transformAndStoreSliceData(decoder, luma_data, luma_frame_data, luma_vec, pos, num_luma_blocks, 4);
 
         // U
         parseDcSingle(&header.u_bit_reader, u_data, num_chroma_blocks);
         parseAcSingle(&header.u_bit_reader, u_data, num_chroma_blocks);
-        reconstructSlice(decoder, u_data, u_frame_data, chroma_vec, pos, num_chroma_blocks, 2);
+        transformAndStoreSliceData(decoder, u_data, u_frame_data, chroma_vec, pos, num_chroma_blocks, 2);
 
         // V
         parseDcSingle(&header.v_bit_reader, v_data, num_chroma_blocks);
         parseAcSingle(&header.v_bit_reader, v_data, num_chroma_blocks);
-        reconstructSlice(decoder, v_data, v_frame_data, chroma_vec, pos, num_chroma_blocks, 2);
+        transformAndStoreSliceData(decoder, v_data, v_frame_data, chroma_vec, pos, num_chroma_blocks, 2);
     }
 }
 
