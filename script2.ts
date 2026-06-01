@@ -73,14 +73,21 @@ const packet = (await sink.getFirstPacket())!;
 const packetPtr = exports.allocatePacket(decoder, packet.byteLength);
 new Uint8Array(memory.buffer).set(packet.data, packetPtr);
 
+if (true) {
+	const warmup = 20;
+	for (let i = 0; i < warmup; i++) {
+		console.log("Decode result", exports.decodePacket(decoder));
+	}
+}
+
 const start = performance.now();
-const iters = 500;
+const iters = 100;
 
 for (let i = 0; i < iters; i++) {
 	console.log("Decode result", exports.decodePacket(decoder));
 }
 
-alert((performance.now() - start) / iters);
+const end = performance.now();
 
 const canvas = document.createElement('canvas');
 canvas.width = exports.getDisplayWidth(decoder);
@@ -93,15 +100,36 @@ const context = canvas.getContext('2d')!;
 const codedWidth = exports.getCodedWidth(decoder);
 const codedHeight = exports.getCodedHeight(decoder);
 const frameDataPtr = exports.getFrameDataPtr(decoder);
-const frameData = new Int32Array(memory.buffer, frameDataPtr, codedWidth * codedHeight);
+const frameData = new Uint16Array(memory.buffer, frameDataPtr, 2 * codedWidth * codedHeight);
+
+const frame = new VideoFrame(frameData, {
+	format: 'I422P10' as VideoPixelFormat,
+	codedWidth,
+	codedHeight,
+	timestamp: 0,
+	duration: 0,
+	colorSpace: {
+		primaries: 'bt2020',
+		transfer: 'hlg',
+		matrix: 'bt2020-ncl',
+		fullRange: true,
+	},
+});
+
+context.drawImage(frame, 0, 0);
+frame.close();
+
+setTimeout(() => {
+	alert((end - start) / iters);
+});
 
 // Each element in frameData contains a float from 0-1. Paint as grayscale image to canvas using putImageData
-const imageData = context.createImageData(codedWidth, codedHeight);
-for (let i = 0; i < frameData.length; i++) {
-	const value = Math.round(255 * frameData[i]! / 1023);
-	imageData.data[i * 4] = value;
-	imageData.data[i * 4 + 1] = value;
-	imageData.data[i * 4 + 2] = value;
-	imageData.data[i * 4 + 3] = 255;
-}
-context.putImageData(imageData, 0, 0);
+//const imageData = context.createImageData(codedWidth, codedHeight);
+//for (let i = 0; i < frameData.length; i++) {
+//	const value = Math.round(255 * frameData[i]! / 1023);
+//	imageData.data[i * 4] = value;
+//	imageData.data[i * 4 + 1] = value;
+//	imageData.data[i * 4 + 2] = value;
+//	imageData.data[i * 4 + 3] = 255;
+//}
+//context.putImageData(imageData, 0, 0);

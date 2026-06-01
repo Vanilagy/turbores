@@ -61,7 +61,7 @@ inline fn transpose_8x8(Element: type, matrix: [64]Element) [64]Element {
 
 const Decoder = struct {
     packet: []u8,
-    frame_data: []i32,
+    frame_data: []u16,
     coded_width: u32,
     coded_height: u32,
     display_width: u32,
@@ -98,7 +98,7 @@ export fn getCodedHeight(decoder: *Decoder) u32 {
     return decoder.coded_height;
 }
 
-export fn getFrameDataPtr(decoder: *Decoder) [*]i32 {
+export fn getFrameDataPtr(decoder: *Decoder) [*]u16 {
     return decoder.frame_data.ptr;
 }
 
@@ -115,7 +115,9 @@ export fn decodePacket(decoder: *Decoder) i32 {
 
 const SliceHeader = struct {
     scale_factor: u32,
-    bit_reader: BitReader,
+    luma_bit_reader: BitReader,
+    u_bit_reader: BitReader,
+    v_bit_reader: BitReader,
 };
 
 inline fn parseSliceHeader(slice_sizes: []u16, reader: *ByteReader, i: usize) SliceHeader {
@@ -130,24 +132,27 @@ inline fn parseSliceHeader(slice_sizes: []u16, reader: *ByteReader, i: usize) Sl
     const luma_data_size = reader.takeInt(u16);
     const u_data_size = reader.takeInt(u16);
     const v_data_size = slice_size - luma_data_size - u_data_size - @divExact(slice_hdr_size, 8);
-    _ = v_data_size;
 
-    const ac_data = reader.take(luma_data_size);
+    const luma_data = reader.take(luma_data_size);
+    const u_data = reader.take(u_data_size);
+    const v_data = reader.take(v_data_size);
 
     return .{
         .scale_factor = scale_factor,
-        .bit_reader = BitReader.fromData(ac_data),
+        .luma_bit_reader = BitReader.fromData(luma_data),
+        .u_bit_reader = BitReader.fromData(u_data),
+        .v_bit_reader = BitReader.fromData(v_data),
     };
 }
 
 const DcState = struct {
-    bit_reader: BitReader,
+    bit_reader: *BitReader,
     slice_data: []i32,
     code: i32,
     sign: i32,
     prev_dc: i32,
 
-    inline fn init(bit_reader: BitReader, slice_data: []i32) DcState {
+    inline fn init(bit_reader: *BitReader, slice_data: []i32) DcState {
         var s = DcState{
             .bit_reader = bit_reader,
             .slice_data = slice_data,
@@ -209,7 +214,7 @@ const DcState = struct {
 };
 
 const AcState = struct {
-    bit_reader: BitReader,
+    bit_reader: *BitReader,
     slice_data: []i32,
     pos: u32,
     log2_block_count: u5,
@@ -247,29 +252,28 @@ fn parseDcPair(
     bit_reader_2: *BitReader,
     slice_1_data: []i32,
     slice_2_data: []i32,
-    num_luma_blocks: u32,
+    num_blocks: u32,
 ) void {
-    var dc_state_1 = DcState.init(bit_reader_1.*, slice_1_data);
-    var dc_state_2 = DcState.init(bit_reader_2.*, slice_2_data);
+    var dc_state_1 = DcState.init(bit_reader_1, slice_1_data);
+    var dc_state_2 = DcState.init(bit_reader_2, slice_2_data);
 
     var j: u32 = 2;
-    while (j < num_luma_blocks) : (j += 2) {
+    while (j < num_blocks) : (j += 2) {
         dc_state_1.step(j);
         dc_state_2.step(j);
     }
-
-    bit_reader_1.* = dc_state_1.bit_reader;
-    bit_reader_2.* = dc_state_2.bit_reader;
 }
 
 fn parseAcPair(
-    bit_reader_1: BitReader,
-    bit_reader_2: BitReader,
+    bit_reader_1: *BitReader,
+    bit_reader_2: *BitReader,
     slice_1_data: []i32,
     slice_2_data: []i32,
-    log2_block_count: u5,
-    block_mask: u32,
+    num_blocks: u32,
 ) void {
+    const log2_block_count: u5 = @intCast(std.math.log2_int(u32, num_blocks));
+    const block_mask = num_blocks - 1;
+
     var ac_state_1 = AcState{
         .bit_reader = bit_reader_1,
         .slice_data = slice_1_data,
@@ -295,40 +299,78 @@ fn parseAcPair(
     while (active_2) active_2 = ac_state_2.step();
 }
 
+fn parseDcSingle(bit_reader: *BitReader, slice_data: []i32, num_blocks: u32) void {
+    var dc_state = DcState.init(bit_reader, slice_data);
+
+    var j: u32 = 2;
+    while (j < num_blocks) : (j += 2) {
+        dc_state.step(j);
+    }
+}
+
+fn parseAcSingle(bit_reader: *BitReader, slice_data: []i32, num_blocks: u32) void {
+    const log2_block_count: u5 = @intCast(std.math.log2_int(u32, num_blocks));
+    const block_mask = num_blocks - 1;
+
+    var ac_state = AcState{
+        .bit_reader = bit_reader,
+        .slice_data = slice_data,
+        .pos = block_mask,
+        .log2_block_count = log2_block_count,
+        .block_mask = block_mask,
+    };
+
+    while (ac_state.step()) {}
+}
+
 fn reconstructSlice(
     decoder: *Decoder,
     slice_data: []const i32,
-    scaling_matrix: [64]f32,
-    scale_factor: u32,
+    frame_data: []u16,
+    scaling_matrix_vec: @Vector(64, f32),
     slice_pos: SlicePos,
-    num_luma_blocks: u32,
+    num_blocks: u32,
+    comptime blocks_per_macroblock: u8,
 ) void {
-    var scaling_matrix_vec: @Vector(64, f32) = scaling_matrix;
-    scaling_matrix_vec *= @splat(@floatFromInt(scale_factor));
+    comptime std.debug.assert(blocks_per_macroblock == 2 or blocks_per_macroblock == 4);
+
+    const coded_width = decoder.coded_width >> (if (blocks_per_macroblock == 2) 1 else 0);
 
     var j: u32 = 0;
-    while (j < num_luma_blocks) : (j += 2) {
-        var block_a = slice_data[64 * j ..][0..64].*;
-        var block_b = slice_data[64 * j + 64 ..][0..64].*;
+    while (j < num_blocks) : (j += 2) {
+        const block_a = slice_data[64 * j ..][0..64].*;
+        const block_b = slice_data[64 * j + 64 ..][0..64].*;
 
-        idct_8x8(&block_a, scaling_matrix_vec);
-        idct_8x8(&block_b, scaling_matrix_vec);
+        const result_a = idct_8x8(block_a, scaling_matrix_vec);
+        const result_b = idct_8x8(block_b, scaling_matrix_vec);
 
-        const block_a_x = slice_pos.x + ((j >> 2) << 4);
-        const block_a_y = slice_pos.y + ((j & 2) << 2);
+        const block_a_x = if (blocks_per_macroblock == 2)
+            (slice_pos.x >> 1) + ((j >> 1) << 3)
+        else
+            slice_pos.x + ((j >> 2) << 4);
+        const block_a_y = if (blocks_per_macroblock == 2)
+            slice_pos.y
+        else
+            slice_pos.y + ((j & 2) << 2);
 
-        const block_b_x = block_a_x + 8;
-        const block_b_y = block_a_y;
+        const block_b_x = if (blocks_per_macroblock == 2)
+            block_a_x
+        else
+            block_a_x + 8;
+        const block_b_y = if (blocks_per_macroblock == 2)
+            block_a_y + 8
+        else
+            block_a_y;
 
         // Copy into frame data
         inline for (0..8) |row| {
             @memcpy(
-                decoder.frame_data[decoder.coded_width * (block_a_y + row) + block_a_x ..][0..8],
-                block_a[8 * row ..][0..8],
+                frame_data[coded_width * (block_a_y + row) + block_a_x ..][0..8],
+                result_a[8 * row ..][0..8],
             );
             @memcpy(
-                decoder.frame_data[decoder.coded_width * (block_b_y + row) + block_b_x ..][0..8],
-                block_b[8 * row ..][0..8],
+                frame_data[coded_width * (block_b_y + row) + block_b_x ..][0..8],
+                result_b[8 * row ..][0..8],
             );
         }
     }
@@ -404,6 +446,18 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     else
         @splat(4);
 
+    var chroma_scaling_matrix: [64]f32 = undefined;
+    inline for (0..8) |x| {
+        inline for (0..8) |y| {
+            const i = 8 * y + x;
+            chroma_scaling_matrix[i] = @floatFromInt(q_mat_chroma[8 * x + y]); // Read the matrix transposed-ly
+            chroma_scaling_matrix[i] *= 0.25; // >> 2
+            chroma_scaling_matrix[i] *= comptime 1 / (S[x] * S[y]);
+        }
+    }
+
+    std.debug.assert(chrominance_factor == 2); // 422
+
     printValues(.{ frame_size, frame_type_outer, hdr_size, version, creator_id, frame_width, frame_height, frame_flags, chrominance_factor, frame_type, primaries, transfer_function, color_matrix, src_pix_format, alpha_info, q_mat_flags, q_mat_luma, q_mat_chroma });
 
     decoder.display_width = frame_width;
@@ -411,7 +465,9 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     decoder.coded_width = (frame_width + 15) & ~@as(u32, 15);
     decoder.coded_height = (frame_height + 15) & ~@as(u32, 15);
 
-    decoder.frame_data = try gpa.realloc(decoder.frame_data, decoder.coded_width * decoder.coded_height);
+    const frame_data_size = decoder.coded_width * decoder.coded_height * 2;
+    decoder.frame_data = try gpa.realloc(decoder.frame_data, frame_data_size);
+    //@memset(decoder.frame_data[decoder.coded_width * decoder.coded_height ..], 512);
 
     const pic_hdr_size = reader.takeInt(u8);
     const pic_data_size = reader.takeInt(u32);
@@ -434,16 +490,16 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     }
 
     const num_luma_blocks = 4 * slice_width * slice_height;
+    const num_chroma_blocks = 2 * slice_width * slice_height;
 
-    const slice_len = 64 * num_luma_blocks;
-    const slice_data = try arena.alloc(i32, 2 * slice_len);
+    const luma_slice_len = 64 * num_luma_blocks;
+    const chroma_slice_len = 64 * num_chroma_blocks;
+
+    const slice_data = try arena.alloc(i32, 2 * luma_slice_len + 4 * chroma_slice_len);
 
     printValues(.{ pic_hdr_size, pic_data_size, total_slices, slice_dimensions, slice_width, slice_height, slice_sizes });
 
-    const log2_block_count: u5 = @intCast(std.math.log2_int(u32, num_luma_blocks));
-    const block_mask = num_luma_blocks - 1;
-
-    const slices_per_row = (decoder.coded_width + (slice_width << 4) - 1) / ((slice_width << 4));
+    const luma_slices_per_row = (decoder.coded_width + (slice_width << 4) - 1) / ((slice_width << 4));
 
     const slice_indices = try arena.alloc(usize, total_slices);
 
@@ -466,58 +522,142 @@ fn decodePacketInternal(decoder: *Decoder) !void {
         std.mem.sortUnstable(usize, slice_indices, ctx, Context.sort);
     }
 
+    const chroma_entries = (decoder.coded_width * decoder.coded_height) / 2;
+    const luma_frame_data = decoder.frame_data[0 .. decoder.coded_width * decoder.coded_height];
+    const u_frame_data = decoder.frame_data[decoder.coded_width * decoder.coded_height ..][0..chroma_entries];
+    const v_frame_data = decoder.frame_data[decoder.coded_width * decoder.coded_height + chroma_entries ..][0..chroma_entries];
+
+    const slice_1_luma_data = slice_data[0..luma_slice_len];
+    const slice_2_luma_data = slice_data[luma_slice_len..][0..luma_slice_len];
+    const slice_1_u_data = slice_data[2 * luma_slice_len ..][0..chroma_slice_len];
+    const slice_2_u_data = slice_data[2 * luma_slice_len + chroma_slice_len ..][0..chroma_slice_len];
+    const slice_1_v_data = slice_data[2 * luma_slice_len + 2 * chroma_slice_len ..][0..chroma_slice_len];
+    const slice_2_v_data = slice_data[2 * luma_slice_len + 3 * chroma_slice_len ..][0..chroma_slice_len];
+
     var i: usize = 0;
     while (i + 1 < total_slices) : (i += 2) {
         const index_1 = slice_indices[i];
         const index_2 = slice_indices[i + 1];
         reader.pos = slice_offsets[index_1];
-        const header_1 = parseSliceHeader(slice_sizes, &reader, index_1);
+        var header_1 = parseSliceHeader(slice_sizes, &reader, index_1);
         reader.pos = slice_offsets[index_2];
-        const header_2 = parseSliceHeader(slice_sizes, &reader, index_2);
+        var header_2 = parseSliceHeader(slice_sizes, &reader, index_2);
 
+        // AC parameters are sparse, so we must memset them all to zero
         @memset(slice_data, 0);
 
-        const slice_1_data = slice_data[0..slice_len];
-        const slice_2_data = slice_data[slice_len..];
+        const pos_1 = getSlicePos(index_1, luma_slices_per_row, slice_width, slice_height);
+        const pos_2 = getSlicePos(index_2, luma_slices_per_row, slice_width, slice_height);
 
-        var bit_reader_1 = header_1.bit_reader;
-        var bit_reader_2 = header_2.bit_reader;
+        // Fold each slice's quantization scale into its matrices up front. The U and V planes of a slice
+        // share the same chroma matrix, so this also avoids redoing that multiply for both.
+        const scale_1: @Vector(64, f32) = @splat(@floatFromInt(header_1.scale_factor));
+        const scale_2: @Vector(64, f32) = @splat(@floatFromInt(header_2.scale_factor));
+        const luma_vec_1 = @as(@Vector(64, f32), luma_scaling_matrix) * scale_1;
+        const luma_vec_2 = @as(@Vector(64, f32), luma_scaling_matrix) * scale_2;
+        const chroma_vec_1 = @as(@Vector(64, f32), chroma_scaling_matrix) * scale_1;
+        const chroma_vec_2 = @as(@Vector(64, f32), chroma_scaling_matrix) * scale_2;
 
+        // Luma for slice 1 and 2
         parseDcPair(
-            &bit_reader_1,
-            &bit_reader_2,
-            slice_1_data,
-            slice_2_data,
+            &header_1.luma_bit_reader,
+            &header_2.luma_bit_reader,
+            slice_1_luma_data,
+            slice_2_luma_data,
             num_luma_blocks,
         );
-
         parseAcPair(
-            bit_reader_1,
-            bit_reader_2,
-            slice_1_data,
-            slice_2_data,
-            log2_block_count,
-            block_mask,
+            &header_1.luma_bit_reader,
+            &header_2.luma_bit_reader,
+            slice_1_luma_data,
+            slice_2_luma_data,
+            num_luma_blocks,
         );
-
-        const pos_1 = getSlicePos(index_1, slices_per_row, slice_width, slice_height);
-        const pos_2 = getSlicePos(index_2, slices_per_row, slice_width, slice_height);
-
         reconstructSlice(
             decoder,
-            slice_1_data,
-            luma_scaling_matrix,
-            header_1.scale_factor,
+            slice_1_luma_data,
+            luma_frame_data,
+            luma_vec_1,
             pos_1,
             num_luma_blocks,
+            4,
         );
         reconstructSlice(
             decoder,
-            slice_2_data,
-            luma_scaling_matrix,
-            header_2.scale_factor,
+            slice_2_luma_data,
+            luma_frame_data,
+            luma_vec_2,
             pos_2,
             num_luma_blocks,
+            4,
+        );
+
+        // U for slice 1 and 2
+        parseDcPair(
+            &header_1.u_bit_reader,
+            &header_2.u_bit_reader,
+            slice_1_u_data,
+            slice_2_u_data,
+            num_chroma_blocks,
+        );
+        parseAcPair(
+            &header_1.u_bit_reader,
+            &header_2.u_bit_reader,
+            slice_1_u_data,
+            slice_2_u_data,
+            num_chroma_blocks,
+        );
+        reconstructSlice(
+            decoder,
+            slice_1_u_data,
+            u_frame_data,
+            chroma_vec_1,
+            pos_1,
+            num_chroma_blocks,
+            2,
+        );
+        reconstructSlice(
+            decoder,
+            slice_2_u_data,
+            u_frame_data,
+            chroma_vec_2,
+            pos_2,
+            num_chroma_blocks,
+            2,
+        );
+
+        // V for slice 1 and 2
+        parseDcPair(
+            &header_1.v_bit_reader,
+            &header_2.v_bit_reader,
+            slice_1_v_data,
+            slice_2_v_data,
+            num_chroma_blocks,
+        );
+        parseAcPair(
+            &header_1.v_bit_reader,
+            &header_2.v_bit_reader,
+            slice_1_v_data,
+            slice_2_v_data,
+            num_chroma_blocks,
+        );
+        reconstructSlice(
+            decoder,
+            slice_1_v_data,
+            v_frame_data,
+            chroma_vec_1,
+            pos_1,
+            num_chroma_blocks,
+            2,
+        );
+        reconstructSlice(
+            decoder,
+            slice_2_v_data,
+            v_frame_data,
+            chroma_vec_2,
+            pos_2,
+            num_chroma_blocks,
+            2,
         );
     }
 
@@ -525,40 +665,34 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     if (i < total_slices) {
         const index = slice_indices[i];
         reader.pos = slice_offsets[index];
-        const header = parseSliceHeader(slice_sizes, &reader, index);
+        var header = parseSliceHeader(slice_sizes, &reader, index);
 
-        const tail_slice_data = slice_data[0..slice_len];
-        @memset(tail_slice_data, 0);
+        @memset(slice_data, 0);
 
-        var dc_state = DcState.init(header.bit_reader, tail_slice_data);
-        var j: u32 = 2;
-        while (j < num_luma_blocks) : (j += 2) {
-            dc_state.step(j);
-        }
+        const luma_data = slice_data[0..luma_slice_len];
+        const u_data = slice_data[2 * luma_slice_len ..][0..chroma_slice_len];
+        const v_data = slice_data[2 * luma_slice_len + 2 * chroma_slice_len ..][0..chroma_slice_len];
 
-        var ac_state = AcState{
-            .bit_reader = dc_state.bit_reader,
-            .slice_data = tail_slice_data,
-            .pos = block_mask,
-            .log2_block_count = log2_block_count,
-            .block_mask = block_mask,
-        };
-        while (ac_state.step()) {}
+        const pos = getSlicePos(index, luma_slices_per_row, slice_width, slice_height);
 
-        const pos = getSlicePos(
-            index,
-            slices_per_row,
-            slice_width,
-            slice_height,
-        );
-        reconstructSlice(
-            decoder,
-            tail_slice_data,
-            luma_scaling_matrix,
-            header.scale_factor,
-            pos,
-            num_luma_blocks,
-        );
+        const scale: @Vector(64, f32) = @splat(@floatFromInt(header.scale_factor));
+        const luma_vec = @as(@Vector(64, f32), luma_scaling_matrix) * scale;
+        const chroma_vec = @as(@Vector(64, f32), chroma_scaling_matrix) * scale;
+
+        // Luma
+        parseDcSingle(&header.luma_bit_reader, luma_data, num_luma_blocks);
+        parseAcSingle(&header.luma_bit_reader, luma_data, num_luma_blocks);
+        reconstructSlice(decoder, luma_data, luma_frame_data, luma_vec, pos, num_luma_blocks, 4);
+
+        // U
+        parseDcSingle(&header.u_bit_reader, u_data, num_chroma_blocks);
+        parseAcSingle(&header.u_bit_reader, u_data, num_chroma_blocks);
+        reconstructSlice(decoder, u_data, u_frame_data, chroma_vec, pos, num_chroma_blocks, 2);
+
+        // V
+        parseDcSingle(&header.v_bit_reader, v_data, num_chroma_blocks);
+        parseAcSingle(&header.v_bit_reader, v_data, num_chroma_blocks);
+        reconstructSlice(decoder, v_data, v_frame_data, chroma_vec, pos, num_chroma_blocks, 2);
     }
 }
 
@@ -582,27 +716,38 @@ const A = [_]f32{
     0.382683432365089771728460,
 };
 
-inline fn idct_8x8(block: *[64]i32, scaling_matrix: @Vector(64, f32)) void {
+pub inline fn fastMin(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    const c = a - b;
+    return a - (c + @abs(c)) * @as(@TypeOf(a), @splat(0.5)); // splat(@TypeOf(a), 0.5);
+}
+
+inline fn idct_8x8(block: [64]i32, scaling_matrix: @Vector(64, f32)) [64]u16 {
     var float_block: [64]f32 = @as(
         @Vector(64, f32),
-        @floatFromInt(@as(@Vector(64, i32), block.*)),
+        @floatFromInt(@as(@Vector(64, i32), block)),
     );
 
     const Vec = @Vector(64, f32);
     var float_vec: Vec = float_block;
     float_vec *= scaling_matrix;
+    float_vec[0] += comptime 4096 / (S[0] * S[0]); // Add the DC dequant offset but pre-scaled
 
     float_block = float_vec;
-    float_block[0] += comptime 4096 / (S[0] * S[0]); // Add the DC dequant offset but pre-scaled
 
     idct_columns(&float_block);
     float_block = transpose_8x8(f32, float_block);
     idct_columns(&float_block);
 
-    block.* = @as(
-        @Vector(64, i32),
-        @intFromFloat(@as(@Vector(64, f32), float_block)),
-    );
+    float_vec = float_block;
+
+    // WASM doesn't have a neat f32->u16 instruction, so we first do f32->u32, followed by u32->u16!
+    var as_u32: @Vector(64, u32) = @intFromFloat(float_vec);
+
+    // Already clamped at 0 due to the f32->u32 conversion, now let's clamp the upper end (it's faster for int than
+    // for float).
+    as_u32 = @min(as_u32, @as(@Vector(64, u32), @splat(1023)));
+
+    return @as(@Vector(64, u16), @intCast(as_u32));
 }
 
 inline fn idct_columns(block: *[64]f32) void {

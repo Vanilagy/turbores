@@ -10,7 +10,7 @@ zig build-exe \
     -fno-entry \
     -rdynamic \
     -O $mode \
-    -mcpu=generic+atomics+bulk_memory+multivalue+nontrapping_fptoint+reference_types+sign_ext+simd128 \
+    -mcpu=generic+atomics+bulk_memory+multivalue+nontrapping_fptoint+reference_types+sign_ext+simd128+relaxed_simd \
     -femit-bin=lib.wasm \
     --import-memory \
     decode.zig
