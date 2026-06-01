@@ -74,7 +74,7 @@ const packetPtr = exports.allocatePacket(decoder, packet.byteLength);
 new Uint8Array(memory.buffer).set(packet.data, packetPtr);
 
 const start = performance.now();
-const iters = 100;
+const iters = 500;
 
 for (let i = 0; i < iters; i++) {
 	console.log("Decode result", exports.decodePacket(decoder));

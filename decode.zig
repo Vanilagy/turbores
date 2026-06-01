@@ -33,6 +33,10 @@ const scan_order = transpose_scan_values(.{
     53, 60, 61, 54, 47, 55, 62, 63,
 });
 
+const run_to_cb = [_]u8{ 0x06, 0x06, 0x05, 0x05, 0x04, 0x29, 0x29, 0x29, 0x29, 0x28, 0x28, 0x28, 0x28, 0x28, 0x28, 0x4C };
+const lev_to_cb = [_]u8{ 0x04, 0x0A, 0x05, 0x06, 0x04, 0x28, 0x28, 0x28, 0x28, 0x4C };
+const dc_code_params = [_]u8{ 0x04, 0x28, 0x28, 0x4D, 0x4D, 0x70, 0x70 };
+
 fn transpose_scan_values(s: [64]u8) [64]u8 {
     var result: [64]u8 = undefined;
 
@@ -57,8 +61,6 @@ inline fn transpose_8x8(Element: type, matrix: [64]Element) [64]Element {
 
 const Decoder = struct {
     packet: []u8,
-    slice_sizes: []u16,
-    slice_data: []i32,
     frame_data: []i32,
     coded_width: u32,
     coded_height: u32,
@@ -70,8 +72,6 @@ export fn createDecoder() *Decoder {
     const result = gpa.create(Decoder) catch unreachable;
     result.* = .{
         .packet = &.{},
-        .slice_sizes = &.{},
-        .slice_data = &.{},
         .frame_data = &.{},
         .coded_width = undefined,
         .coded_height = undefined,
@@ -113,105 +113,269 @@ export fn decodePacket(decoder: *Decoder) i32 {
     return 0;
 }
 
-fn parseDc(decoder: *Decoder, bit_reader: *BitReader, num_luma_blocks: u32) void {
-    bit_reader.maybeLoadData();
+const SliceHeader = struct {
+    scale_factor: u8,
+    bit_reader: BitReader,
+};
 
-    const first_code_result = parseCode(bit_reader.current, 0xb8);
-    var code: i32 = @intCast(first_code_result.value);
+inline fn parseSliceHeader(slice_sizes: []u16, reader: *ByteReader, i: usize) SliceHeader {
+    const slice_size = slice_sizes[i];
+    const slice_hdr_size = reader.takeInt(u8);
 
-    const first_dc = (code >> 1) ^ -(code & 1);
+    var scale_factor = reader.takeInt(u8);
+    if (scale_factor > 128) {
+        scale_factor = (scale_factor - 96) << 2;
+    }
 
-    decoder.slice_data[0] = first_dc;
+    const luma_data_size = reader.takeInt(u16);
+    const u_data_size = reader.takeInt(u16);
+    const v_data_size = slice_size - luma_data_size - u_data_size - @divExact(slice_hdr_size, 8);
+    _ = v_data_size;
 
-    var prev_dc = first_dc;
+    const ac_data = reader.take(luma_data_size);
 
-    const second_code_result = parseCode(
-        bit_reader.current << @as(u6, @intCast(first_code_result.bits)),
-        0x70,
-    );
-    code = @intCast(second_code_result.value);
-    var sign: i32 = @intFromBool(code > 0) * -(code & 1); // else 0;
+    return .{
+        .scale_factor = scale_factor,
+        .bit_reader = BitReader.fromData(ac_data),
+    };
+}
 
-    const result = prev_dc + (((code + 1) >> 1) ^ sign) - sign;
-    decoder.slice_data[64] = result;
-    prev_dc = result;
+const DcState = struct {
+    bit_reader: BitReader,
+    slice_data: []i32,
+    code: i32,
+    sign: i32,
+    prev_dc: i32,
 
-    bit_reader.consume(@intCast(first_code_result.bits + second_code_result.bits));
+    inline fn init(bit_reader: BitReader, slice_data: []i32) DcState {
+        var s = DcState{
+            .bit_reader = bit_reader,
+            .slice_data = slice_data,
+            .code = undefined,
+            .sign = undefined,
+            .prev_dc = undefined,
+        };
 
-    const dc_code_params = [_]u8{ 0x04, 0x28, 0x28, 0x4D, 0x4D, 0x70, 0x70 };
+        s.bit_reader.maybeLoadData();
 
-    var j: usize = 2;
-    while (j < num_luma_blocks) {
-        bit_reader.maybeLoadData();
+        const first_code_result = parseCode(s.bit_reader.current, 0xb8);
+        s.code = @intCast(first_code_result.value);
 
-        const code_result_1 = parseCode(bit_reader.current, dc_code_params[@min(@as(usize, @intCast(code)), 6)]);
+        const first_dc = (s.code >> 1) ^ -(s.code & 1);
+        s.slice_data[0] = first_dc;
+        s.prev_dc = first_dc;
 
-        code = @intCast(code_result_1.value);
-        sign = @intFromBool(code > 0) * (sign ^ -(code & 1)); // else 0
+        const second_code_result = parseCode(
+            s.bit_reader.current << @as(u6, @intCast(first_code_result.bits)),
+            0x70,
+        );
+        s.code = @intCast(second_code_result.value);
+        s.sign = @intFromBool(s.code > 0) * -(s.code & 1); // else 0;
 
-        const result_1 = prev_dc + (((code + 1) >> 1) ^ sign) - sign;
-        decoder.slice_data[64 * j] = result_1;
+        const result = s.prev_dc + (((s.code + 1) >> 1) ^ s.sign) - s.sign;
+        s.slice_data[64] = result;
+        s.prev_dc = result;
+
+        s.bit_reader.consume(@intCast(first_code_result.bits + second_code_result.bits));
+
+        return s;
+    }
+
+    inline fn step(s: *DcState, j: usize) void {
+        s.bit_reader.maybeLoadData();
+
+        const code_result_1 = parseCode(s.bit_reader.current, dc_code_params[@min(@as(usize, @intCast(s.code)), 6)]);
+
+        s.code = @intCast(code_result_1.value);
+        s.sign = @intFromBool(s.code > 0) * (s.sign ^ -(s.code & 1)); // else 0
+
+        const result_1 = s.prev_dc + (((s.code + 1) >> 1) ^ s.sign) - s.sign;
+        s.slice_data[64 * j] = result_1;
 
         const code_result_2 = parseCode(
-            bit_reader.current << @as(u6, @intCast(code_result_1.bits)),
+            s.bit_reader.current << @as(u6, @intCast(code_result_1.bits)),
             dc_code_params[@min(code_result_1.value, 6)],
         );
 
-        code = @intCast(code_result_2.value);
-        sign = @intFromBool(code > 0) * (sign ^ -(code & 1)); // else 0
+        s.code = @intCast(code_result_2.value);
+        s.sign = @intFromBool(s.code > 0) * (s.sign ^ -(s.code & 1)); // else 0
 
-        const result_2 = result_1 + (((code + 1) >> 1) ^ sign) - sign;
+        const result_2 = result_1 + (((s.code + 1) >> 1) ^ s.sign) - s.sign;
+        s.slice_data[64 * j + 64] = result_2;
+        s.prev_dc = result_2;
 
-        decoder.slice_data[64 * j + 64] = result_2;
-        prev_dc = result_2;
+        s.bit_reader.consume(@intCast(code_result_1.bits + code_result_2.bits));
+    }
+};
 
-        j += 2;
-        bit_reader.consume(@intCast(code_result_1.bits + code_result_2.bits));
+const AcState = struct {
+    bit_reader: BitReader,
+    slice_data: []i32,
+    pos: u32,
+    log2_block_count: u5,
+    block_mask: u32,
+    run: u32 = 4,
+    level: i32 = 2,
+
+    inline fn step(s: *AcState) bool {
+        s.bit_reader.maybeLoadData();
+        if (s.bit_reader.current == 0) {
+            return false;
+        }
+
+        const run_result = parseCode(s.bit_reader.current, run_to_cb[@min(s.run, 15)]);
+        s.run = run_result.value;
+        s.pos += s.run + 1;
+
+        const level_result = parseCode(
+            s.bit_reader.current << @as(u6, @intCast(run_result.bits)),
+            lev_to_cb[@min(@as(u32, @intCast(s.level)), 9)],
+        );
+        s.level = @as(i32, @intCast(level_result.value)) + 1;
+
+        const j = s.pos >> s.log2_block_count;
+        const thing = run_result.bits + level_result.bits + 1;
+        const sign = -@as(i32, @intCast((s.bit_reader.current >> @as(u6, @intCast(64 - thing))) & 1));
+        s.bit_reader.consume(@intCast(thing));
+        s.slice_data[((s.pos & s.block_mask) << 6) + scan_order[j]] = (s.level ^ sign) - sign;
+        return true;
+    }
+};
+
+fn parseDcPair(
+    bit_reader_1: *BitReader,
+    bit_reader_2: *BitReader,
+    slice_1_data: []i32,
+    slice_2_data: []i32,
+    num_luma_blocks: u32,
+) void {
+    var dc_state_1 = DcState.init(bit_reader_1.*, slice_1_data);
+    var dc_state_2 = DcState.init(bit_reader_2.*, slice_2_data);
+
+    var j: u32 = 2;
+    while (j < num_luma_blocks) : (j += 2) {
+        dc_state_1.step(j);
+        dc_state_2.step(j);
+    }
+
+    bit_reader_1.* = dc_state_1.bit_reader;
+    bit_reader_2.* = dc_state_2.bit_reader;
+}
+
+fn parseAcPair(
+    bit_reader_1: BitReader,
+    bit_reader_2: BitReader,
+    slice_1_data: []i32,
+    slice_2_data: []i32,
+    log2_block_count: u5,
+    block_mask: u32,
+) void {
+    var ac_state_1 = AcState{
+        .bit_reader = bit_reader_1,
+        .slice_data = slice_1_data,
+        .pos = block_mask,
+        .log2_block_count = log2_block_count,
+        .block_mask = block_mask,
+    };
+    var ac_state_2 = AcState{
+        .bit_reader = bit_reader_2,
+        .slice_data = slice_2_data,
+        .pos = block_mask,
+        .log2_block_count = log2_block_count,
+        .block_mask = block_mask,
+    };
+
+    var active_1 = true;
+    var active_2 = true;
+    while (active_1 and active_2) {
+        active_1 = ac_state_1.step();
+        active_2 = ac_state_2.step();
+    }
+    while (active_1) active_1 = ac_state_1.step();
+    while (active_2) active_2 = ac_state_2.step();
+}
+
+fn reconstructSlice(
+    decoder: *Decoder,
+    slice_data: []const i32,
+    q_mat_luma: [64]u8,
+    scale_factor: u8,
+    pos: SlicePos,
+    num_luma_blocks: u32,
+) void {
+    var q_mat_luma_vector: @Vector(64, i32) = q_mat_luma;
+    q_mat_luma_vector *= @splat(scale_factor);
+
+    var j: u32 = 0;
+    while (j < num_luma_blocks) : (j += 2) {
+        var block_a = slice_data[64 * j ..][0..64].*;
+        var block_b = slice_data[64 * j + 64 ..][0..64].*;
+
+        var block_vec_a: @Vector(64, i32) = block_a;
+        var block_vec_b: @Vector(64, i32) = block_b;
+
+        block_vec_a *= q_mat_luma_vector;
+        block_vec_b *= q_mat_luma_vector;
+
+        block_vec_a >>= @splat(2);
+        block_vec_b >>= @splat(2);
+
+        block_a = block_vec_a;
+        block_b = block_vec_b;
+
+        block_a[0] += 4096;
+        block_b[0] += 4096;
+
+        idct_8x8_int(&block_a);
+        idct_8x8_int(&block_b);
+
+        const block_a_x = pos.x + 16 * (j / 4) + 8 * (j % 2);
+        const block_a_y = pos.y + @as(u32, if (j % 4 < 2) 0 else 8);
+
+        const jb = j + 1;
+        const block_b_x = pos.x + 16 * (jb / 4) + 8 * (jb % 2);
+        const block_b_y = pos.y + @as(u32, if (jb % 4 < 2) 0 else 8);
+
+        // Copy into frame data
+        inline for (0..8) |row| {
+            @memcpy(
+                decoder.frame_data[decoder.coded_width * (block_a_y + row) + block_a_x ..][0..8],
+                block_a[8 * row ..][0..8],
+            );
+            @memcpy(
+                decoder.frame_data[decoder.coded_width * (block_b_y + row) + block_b_x ..][0..8],
+                block_b[8 * row ..][0..8],
+            );
+        }
     }
 }
 
-fn parseAc(decoder: *Decoder, bit_reader: *BitReader, num_luma_blocks: u32) void {
-    var run: u32 = 4;
-    var level: i32 = 2;
+const SlicePos = struct { x: u32, y: u32 };
 
-    const log2_block_count = std.math.log2_int(u32, num_luma_blocks);
-    const max_coeffs = @as(u32, 64) << log2_block_count;
-    _ = max_coeffs;
+inline fn getSlicePos(index: usize, slices_per_row: usize, slice_width: u32, slice_height: u32) SlicePos {
+    const index_in_row = index % slices_per_row;
+    const row_index = index / slices_per_row;
 
-    const block_mask = num_luma_blocks - 1;
-    var pos = block_mask;
+    return .{
+        .x = @intCast(index_in_row * (slice_width << 4)),
+        .y = @intCast(row_index * (slice_height << 4)),
+    };
+}
 
-    const run_to_cb = [_]u8{ 0x06, 0x06, 0x05, 0x05, 0x04, 0x29, 0x29, 0x29, 0x29, 0x28, 0x28, 0x28, 0x28, 0x28, 0x28, 0x4C };
-    const lev_to_cb = [_]u8{ 0x04, 0x0A, 0x05, 0x06, 0x04, 0x28, 0x28, 0x28, 0x28, 0x4C };
+fn lessThanU16(context: void, a: u16, b: u16) bool {
+    _ = context;
+    return a < b;
+}
 
-    while (true) {
-        bit_reader.maybeLoadData();
-
-        if (bit_reader.current == 0) {
-            break;
-        }
-
-        const run_result = parseCode(bit_reader.current, run_to_cb[@min(run, 15)]);
-
-        run = run_result.value;
-        pos += run + 1;
-
-        const level_result = parseCode(bit_reader.current << @as(u6, @intCast(run_result.bits)), lev_to_cb[@min(@as(u32, @intCast(level)), 9)]);
-        level = @intCast(level_result.value);
-        level += 1;
-
-        const j = pos >> log2_block_count;
-        const thing = run_result.bits + level_result.bits + 1;
-
-        const sign = -@as(i32, @intCast((bit_reader.current >> @as(u6, @intCast(64 - thing))) & 1));
-
-        bit_reader.consume(@intCast(thing));
-
-        decoder.slice_data[((pos & block_mask) << 6) + scan_order[j]] = (level ^ sign) - sign;
-    }
+fn ceilToMultiple(x: anytype, m: @TypeOf(x)) @TypeOf(x) {
+    return ((x + m - 1) / m) * m;
 }
 
 fn decodePacketInternal(decoder: *Decoder) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     var reader = ByteReader.init(decoder.packet);
 
     const frame_size = reader.takeInt(u32);
@@ -263,124 +427,145 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     const slice_width = @as(u32, 1) << @as(u5, @intCast(slice_dimensions >> 4));
     const slice_height = @as(u32, 1) << @as(u5, @intCast(slice_dimensions & 0b1111));
 
-    decoder.slice_sizes = try gpa.realloc(decoder.slice_sizes, total_slices);
+    const slice_sizes = try arena.alloc(u16, total_slices);
     for (0..total_slices) |i| {
-        decoder.slice_sizes[i] = reader.takeInt(u16);
+        slice_sizes[i] = reader.takeInt(u16);
+    }
+
+    const slice_offsets = try arena.alloc(usize, total_slices);
+
+    var current_offset: usize = reader.pos;
+    for (0..total_slices) |i| {
+        slice_offsets[i] = current_offset;
+        current_offset += slice_sizes[i];
     }
 
     const num_luma_blocks = 4 * slice_width * slice_height;
 
-    decoder.slice_data = try gpa.realloc(decoder.slice_data, 64 * num_luma_blocks);
+    const slice_len = 64 * num_luma_blocks;
+    const slice_data = try arena.alloc(i32, 2 * slice_len);
 
-    printValues(.{ pic_hdr_size, pic_data_size, total_slices, slice_dimensions, slice_width, slice_height, decoder.slice_sizes });
+    printValues(.{ pic_hdr_size, pic_data_size, total_slices, slice_dimensions, slice_width, slice_height, slice_sizes });
 
-    var slice_x: u32 = 0;
-    var slice_y: u32 = 0;
+    const log2_block_count: u5 = @intCast(std.math.log2_int(u32, num_luma_blocks));
+    const block_mask = num_luma_blocks - 1;
+
+    const slices_per_row = (decoder.coded_width + (slice_width << 4) - 1) / ((slice_width << 4));
+
+    const slice_indices = try arena.alloc(usize, total_slices);
 
     for (0..total_slices) |i| {
-        const slice_start_pos = reader.pos;
-        const slice_size = decoder.slice_sizes[i];
-        const slice_hdr_size = reader.takeInt(u8);
+        slice_indices[i] = i;
+    }
 
-        var scale_factor = reader.takeInt(u8);
-        if (scale_factor > 128) {
-            scale_factor = (scale_factor - 96) << 2;
-        }
+    if (true) {
+        const Context = struct {
+            items: []u16,
 
-        const luma_data_size = reader.takeInt(u16);
-        const u_data_size = reader.takeInt(u16);
-        const v_data_size = slice_size - luma_data_size - u_data_size - @divExact(slice_hdr_size, 8);
-
-        _ = v_data_size;
-
-        @memset(decoder.slice_data, 0);
-
-        const ac_data = reader.take(luma_data_size);
-        var bit_reader = BitReader.fromData(ac_data);
-
-        parseDc(decoder, &bit_reader, num_luma_blocks);
-
-        parseAc(decoder, &bit_reader, num_luma_blocks);
-
-        if (true) {
-            var q_mat_luma_vector: @Vector(64, i32) = q_mat_luma;
-            q_mat_luma_vector *= @splat(scale_factor);
-
-            for (0..num_luma_blocks) |j| {
-                var block = decoder.slice_data[64 * j ..][0..64].*;
-
-                var block_vec: @Vector(64, i32) = block;
-                block_vec *= q_mat_luma_vector;
-                block_vec >>= @splat(2);
-
-                block = block_vec;
-                block[0] += 4096;
-
-                //printValues(.{ 0, block });
-                idct_8x8_int(&block);
-                //printValues(.{ 1, block });
-
-                const block_offset_x = 16 * (j / 4) + 8 * (j % 2);
-                const block_offset_y: u32 = if (j % 4 < 2) 0 else 8;
-                const block_x = slice_x + block_offset_x;
-                const block_y = slice_y + block_offset_y;
-
-                //_ = block_x;
-                //_ = block_y;
-
-                @memcpy(decoder.frame_data[0..64], &block);
-
-                // Copy into frame data
-                inline for (0..8) |row| {
-                    @memcpy(
-                        decoder.frame_data[decoder.coded_width * (block_y + row) + block_x ..][0..8],
-                        block[8 * row ..][0..8],
-                    );
-                }
-                //block_vec
-                //block_vec *= @splat()
+            fn sort(self: @This(), a: usize, b: usize) bool {
+                return self.items[a] < self.items[b];
             }
+        };
+        const ctx = Context{
+            .items = slice_sizes,
+        };
 
-            //std.debug.assert(false);
+        std.mem.sortUnstable(usize, slice_indices, ctx, Context.sort);
+    }
+
+    var i: usize = 0;
+    while (i + 1 < total_slices) : (i += 2) {
+        const index_1 = slice_indices[i];
+        const index_2 = slice_indices[i + 1];
+        reader.pos = slice_offsets[index_1];
+        const header_1 = parseSliceHeader(slice_sizes, &reader, index_1);
+        reader.pos = slice_offsets[index_2];
+        const header_2 = parseSliceHeader(slice_sizes, &reader, index_2);
+
+        @memset(slice_data, 0);
+
+        const slice_1_data = slice_data[0..slice_len];
+        const slice_2_data = slice_data[slice_len..];
+
+        var bit_reader_1 = header_1.bit_reader;
+        var bit_reader_2 = header_2.bit_reader;
+
+        parseDcPair(
+            &bit_reader_1,
+            &bit_reader_2,
+            slice_1_data,
+            slice_2_data,
+            num_luma_blocks,
+        );
+
+        parseAcPair(
+            bit_reader_1,
+            bit_reader_2,
+            slice_1_data,
+            slice_2_data,
+            log2_block_count,
+            block_mask,
+        );
+
+        const pos_1 = getSlicePos(index_1, slices_per_row, slice_width, slice_height);
+        const pos_2 = getSlicePos(index_2, slices_per_row, slice_width, slice_height);
+
+        reconstructSlice(
+            decoder,
+            slice_1_data,
+            q_mat_luma,
+            header_1.scale_factor,
+            pos_1,
+            num_luma_blocks,
+        );
+        reconstructSlice(
+            decoder,
+            slice_2_data,
+            q_mat_luma,
+            header_2.scale_factor,
+            pos_2,
+            num_luma_blocks,
+        );
+    }
+
+    // Odd slice count leaves one slice over; decode it on its own
+    if (i < total_slices) {
+        const index = slice_indices[i];
+        reader.pos = slice_offsets[index];
+        const header = parseSliceHeader(slice_sizes, &reader, index);
+
+        const tail_slice_data = slice_data[0..slice_len];
+        @memset(tail_slice_data, 0);
+
+        var dc_state = DcState.init(header.bit_reader, tail_slice_data);
+        var j: u32 = 2;
+        while (j < num_luma_blocks) : (j += 2) {
+            dc_state.step(j);
         }
 
-        if (false) {
-            for (0..num_luma_blocks) |j| {
-                const block_offset_x = 16 * (j / 4) + 8 * (j % 2);
-                const block_offset_y: u32 = if (j % 4 < 2) 0 else 8;
-                const block_x = slice_x + block_offset_x;
-                const block_y = slice_y + block_offset_y;
-                const block = decoder.slice_data[64 * j ..][0..64];
+        var ac_state = AcState{
+            .bit_reader = dc_state.bit_reader,
+            .slice_data = tail_slice_data,
+            .pos = block_mask,
+            .log2_block_count = log2_block_count,
+            .block_mask = block_mask,
+        };
+        while (ac_state.step()) {}
 
-                var mh: [64]f32 = undefined;
-
-                for (0..64) |k| {
-                    const value = if (k == 0)
-                        4096 + ((block[k] * q_mat_luma[k] * scale_factor) >> 2)
-                    else
-                        (block[k] * q_mat_luma[k] * scale_factor) >> 2;
-
-                    mh[k] = @floatFromInt(value);
-                }
-
-                //idct8x8(&mh);
-
-                for (0..8) |x| {
-                    for (0..8) |y| {
-                        decoder.frame_data[decoder.coded_width * (block_y + y) + block_x + x] = mh[y * 8 + x] / 1024;
-                    }
-                }
-            }
-        }
-
-        reader.pos = slice_start_pos + slice_size;
-
-        slice_x += 16 * slice_width;
-
-        if (slice_x >= decoder.coded_width) {
-            slice_x = 0;
-            slice_y += 16 * slice_height;
-        }
+        const pos = getSlicePos(
+            index,
+            slices_per_row,
+            slice_width,
+            slice_height,
+        );
+        reconstructSlice(
+            decoder,
+            tail_slice_data,
+            q_mat_luma,
+            header.scale_factor,
+            pos,
+            num_luma_blocks,
+        );
     }
 }
 
