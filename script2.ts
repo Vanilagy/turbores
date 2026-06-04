@@ -73,7 +73,9 @@ const packet = (await sink.getFirstPacket())!;
 const packetPtr = exports.allocatePacket(decoder, packet.byteLength);
 new Uint8Array(memory.buffer).set(packet.data, packetPtr);
 
-if (true) {
+const tryhard = true;
+
+if (tryhard) {
 	const warmup = 20;
 	for (let i = 0; i < warmup; i++) {
 		exports.decodePacket(decoder)
@@ -82,7 +84,7 @@ if (true) {
 }
 
 const start = performance.now();
-const iters = 100;
+const iters = tryhard ? 500 : 1;
 
 for (let i = 0; i < iters; i++) {
 	exports.decodePacket(decoder)

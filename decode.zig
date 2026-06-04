@@ -219,7 +219,7 @@ const AcState = struct {
         }
 
         const run_result = parseCode(self.bit_reader.current, run_to_cb[@min(self.run, 15)]);
-        self.run = run_result.value;
+        self.run = @intCast(run_result.value);
         self.pos += self.run + 1;
 
         const level_result = parseCode(
@@ -688,6 +688,8 @@ inline fn idct_8x8(block: [64]f32, scaling_matrix: @Vector(64, f32)) [64]u16 {
     // f32->u32 already clamps the bottom at 0, so we only need to clamp the top (cheaper as int).
     var result: [64]u16 = undefined;
     inline for (0..8) |r| {
+        @setRuntimeSafety(false); // Since the f32->u32 clamp is actually intended here
+
         var as_u32: @Vector(8, u32) = @intFromFloat(rows[r]);
         as_u32 = @min(as_u32, @as(@Vector(8, u32), @splat(1023)));
         result[8 * r ..][0..8].* = @as(@Vector(8, u16), @intCast(as_u32));
@@ -841,25 +843,25 @@ const ByteReader = struct {
 };
 
 const ParsedCode = struct {
-    value: u32,
-    bits: u32,
+    value: u64,
+    bits: u64,
 };
 
-inline fn parseCode(word: u64, params: u8) ParsedCode {
-    const mp: u32 = params & 0b11;
-    const g: u32 = (params >> 2) & 0b111;
-    const r: u32 = params >> 5;
+inline fn parseCode(word: u64, params: u64) ParsedCode {
+    const mp: u64 = params & 0b11;
+    const g: u64 = (params >> 2) & 0b111;
+    const r: u64 = params >> 5;
 
-    const n: u32 = @clz(word);
+    const n: u64 = @clz(word);
     const is_big = n > mp;
 
-    const base = @as(u32, @min(n, mp + 1)) << @as(u5, @intCast(r));
+    const base = @as(u64, @min(n, mp + 1)) << @as(u6, @intCast(r));
 
     const bits_big = 2 *% n +% g -% mp;
     const bits_small = n + 1 + r;
     const bits = if (is_big) bits_big else bits_small;
-    const sub = @as(u32, 1) << (if (is_big) @intCast(g) else @intCast(r));
-    const raw: u32 = @intCast(word >> @as(u6, @intCast(64 - bits)));
+    const sub = @as(u64, 1) << (if (is_big) @intCast(g) else @intCast(r));
+    const raw = word >> @as(u6, @intCast(64 - bits));
 
     const result = base +% raw -% sub;
 
@@ -873,7 +875,7 @@ const BitReader = struct {
     reader: ByteReader,
     current: u64,
     next: u64,
-    bit_health: u8,
+    bit_health: u64,
 
     fn fromData(data: []u8) BitReader {
         return .{
@@ -886,6 +888,7 @@ const BitReader = struct {
 
     inline fn maybeLoadData(self: *BitReader) void {
         if (self.bit_health >= 64) {
+            @branchHint(.likely);
             return;
         }
 
@@ -896,24 +899,27 @@ const BitReader = struct {
         if (remaining < 8) {
             @branchHint(.unlikely);
 
+            var next_word: u64 = undefined;
+
+            // This version is faster than a generic for loop that reads bytes
             switch (remaining) {
                 0 => {},
                 inline 1...7 => |remaining_captured| {
                     const int_type = @Int(.unsigned, remaining_captured << 3);
-                    var next_word: u64 = self.reader.takeInt(int_type);
+                    next_word = self.reader.takeInt(int_type);
                     next_word <<= (8 - remaining_captured) << 3;
-
-                    self.current |= next_word >> @as(u6, @intCast(self.bit_health));
-
-                    self.next = if (self.bit_health != 0)
-                        next_word << @as(u6, @intCast(64 - self.bit_health))
-                    else
-                        0;
-
-                    self.bit_health += @intCast(remaining_captured << 3);
                 },
                 else => unreachable,
             }
+
+            self.current |= next_word >> @as(u6, @intCast(self.bit_health));
+
+            self.next = if (self.bit_health != 0)
+                next_word << @as(u6, @intCast(64 - self.bit_health))
+            else
+                0;
+
+            self.bit_health = comptime std.math.maxInt(u64); // So that the load never runs again
         } else {
             const next_word: u64 = self.reader.takeInt(u64);
 
@@ -928,7 +934,7 @@ const BitReader = struct {
         }
     }
 
-    inline fn consume(self: *BitReader, bits: u8) void {
+    inline fn consume(self: *BitReader, bits: u64) void {
         self.current <<= @as(u6, @intCast(bits));
         self.current |= self.next >> @as(u6, @intCast(64 - bits));
         self.next <<= @as(u6, @intCast(bits));
