@@ -669,17 +669,7 @@ inline fn idct_8x8(block: [64]f32, scaling_matrix: @Vector(64, f32)) [64]u16 {
     float_vec *= scaling_matrix;
     float_vec[0] += comptime 4096 / (S[0] * S[0]); // Add the DC dequant offset but pre-scaled
 
-    // Let's keep the eight rows in vector registers across both column passes and the transpose
-    var rows: [8]V8 = undefined;
-    inline for (0..8) |r| {
-        const mask = comptime blk: {
-            var m: [8]i32 = undefined;
-            for (0..8) |k| m[k] = @intCast(8 * r + k);
-            break :blk m;
-        };
-        rows[r] = @shuffle(f32, float_vec, undefined, mask);
-    }
-
+    var rows: [8]V8 = @bitCast(float_vec);
     rows = idct_columns(rows);
     rows = transpose_rows(rows);
     rows = idct_columns(rows);
@@ -692,6 +682,7 @@ inline fn idct_8x8(block: [64]f32, scaling_matrix: @Vector(64, f32)) [64]u16 {
 
         var as_u32: @Vector(8, u32) = @intFromFloat(rows[r]);
         as_u32 = @min(as_u32, @as(@Vector(8, u32), @splat(1023)));
+
         result[8 * r ..][0..8].* = @as(@Vector(8, u16), @intCast(as_u32));
     }
 
