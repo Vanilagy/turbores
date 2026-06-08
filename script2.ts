@@ -1,84 +1,121 @@
 import { ALL_FORMATS, EncodedPacketSink, FilePathSource, Input, UrlSource } from 'mediabunny';
+import { initWasmModule } from './wasm-init';
 
-// https://gist.github.com/pascaldekloe/62546103a1576803dade9269ccf76330
-const decodeUtf8 = (bytes: Uint8Array) => {
-	let i = 0, s = '';
+const memory = new WebAssembly.Memory({ initial: 32, maximum: 65536, shared: true });
 
-	while (i < bytes.length) {
-		var c = bytes[i++]!;
-		if (c > 127) {
-			if (c > 191 && c < 224) {
-				if (i >= bytes.length)
-					throw new Error('UTF-8 decode: incomplete 2-byte sequence');
-				c = (c & 31) << 6 | bytes[i++]! & 63;
-			} else if (c > 223 && c < 240) {
-				if (i + 1 >= bytes.length)
-					throw new Error('UTF-8 decode: incomplete 3-byte sequence');
-				c = (c & 15) << 12 | (bytes[i++]! & 63) << 6 | bytes[i++]! & 63;
-			} else if (c > 239 && c < 248) {
-				if (i + 2 >= bytes.length)
-					throw new Error('UTF-8 decode: incomplete 4-byte sequence');
-				c = (c & 7) << 18 | (bytes[i++]! & 63) << 12 | (bytes[i++]! & 63) << 6 | bytes[i++]! & 63;
-			} else throw new Error('UTF-8 decode: unknown multibyte start 0x' + c.toString(16) + ' at index ' + (i - 1));
-		}
-		if (c <= 0xffff) s += String.fromCharCode(c);
-		else if (c <= 0x10ffff) {
-			c -= 0x10000;
-			s += String.fromCharCode(c >> 10 | 0xd800)
-			s += String.fromCharCode(c & 0x3FF | 0xdc00)
-		} else throw new Error('UTF-8 decode: code point 0x' + c.toString(16) + ' exceeds UTF-16 reach');
-	}
+const exports = await initWasmModule(memory);
+console.log(exports)
 
-	return s;
+exports.__wasm_init_tls(exports.allocateThreadLocalState(exports.__tls_size.value, exports.__tls_align.value));
+
+const concurrency = navigator.hardwareConcurrency;
+const workers: Worker[] = [];
+const promises: Promise<void>[] = [];
+
+for (let i = 0; i < concurrency; i++) {
+	const stackPointer = exports.allocateWorkerStack();
+	const tlsPointer = exports.allocateThreadLocalState(exports.__tls_size.value, exports.__tls_align.value);
+
+	const worker = new Worker('./worker.ts', { type: 'module' });
+	worker.postMessage({ memory, stackPointer, tlsPointer });
+
+	promises.push(new Promise(resolve => {
+		worker.addEventListener('message', () => resolve());
+	}));
 }
 
-const memory = new WebAssembly.Memory({ initial: 128 });
-const module = await WebAssembly.instantiateStreaming(fetch('./lib.wasm'), {
-    env: {
-        memory,
-        externPrint: (offset: number, length: number) => {
-            const bytes = new Uint8Array(memory.buffer, offset, length);
-            console.log(decodeUtf8(bytes));
-        },
-		consoleTime: console.time,
-		consoleTimeEnd: console.timeEnd,
-    },
-});
-
-const exports = module.instance.exports as {
-    createDecoder: () => number,
-    allocatePacket: (decoder: number, size: number) => number,
-    decodePacket: (decoder: number) => void,
-	getDisplayWidth: (decoder: number) => number,
-	getDisplayHeight: (decoder: number) => number,
-	getCodedWidth: (decoder: number) => number,
-	getCodedHeight: (decoder: number) => number,
-	getFrameDataPtr: (decoder: number) => number,
-};
+await Promise.all(promises);
 
 const decoder = exports.createDecoder();
 console.log(decoder)
+
+//await new Promise(() => {});
 
 const input = new Input({
     source: new UrlSource('./IMG_0159-prores-hdr.MOV'),
     formats: ALL_FORMATS,
 });
 
+const addr = exports.getWaitWordAddress(decoder);
+
 const videoTrack = (await input.getPrimaryVideoTrack())!;
 const sink = new EncodedPacketSink(videoTrack);
-const packet = (await sink.getFirstPacket())!;
+
+const decode = async () => {
+	exports.decodePacket(decoder)
+	await Atomics.waitAsync(new Int32Array(memory.buffer), addr / 4, 0).value;
+};
+
+const canvas = document.createElement('canvas');
+const context = canvas.getContext('2d')!;
+document.body.append(canvas);
+
+const start = performance.now();
+let total = 0;
+
+const packetDatas: Uint8Array[] = [];
+for await (const packet of sink.packets()) {
+	packetDatas.push(packet.data);
+}
+
+const fileIters = 10;
+
+for (let i = 0; i < fileIters; i++) {
+	for (const packetData of packetDatas) {
+		//console.log(packet.data.byteLength)
+		const packetPtr = exports.allocatePacket(decoder, packetData.byteLength);
+		new Uint8Array(memory.buffer).set(packetData, packetPtr);
+
+		await decode();
+
+		total++;
+		continue;
+
+		canvas.width = exports.getDisplayWidth(decoder);
+		canvas.height = exports.getDisplayHeight(decoder);
+
+		const codedWidth = exports.getCodedWidth(decoder);
+		const codedHeight = exports.getCodedHeight(decoder);
+		const frameDataPtr = exports.getFrameDataPtr(decoder);
+		const frameData = new Uint16Array(memory.buffer, frameDataPtr, 2 * codedWidth * codedHeight);
+		//console.log(frameData);
+
+		const frame = new VideoFrame(frameData, {
+			format: 'I422P10' as VideoPixelFormat,
+			codedWidth,
+			codedHeight,
+			timestamp: 0,
+			duration: 0,
+			colorSpace: {
+				primaries: 'bt2020',
+				transfer: 'hlg',
+				matrix: 'bt2020-ncl',
+				fullRange: true,
+			},
+		});
+
+		context.drawImage(frame, 0, 0);
+		frame.close();
+	}
+}
+
+console.log(packetDatas.length);
+alert((performance.now() - start) / fileIters);
+//const packet = (await sink.getFirstPacket())!;
 
 //await new Promise(() => {});
 
-const packetPtr = exports.allocatePacket(decoder, packet.byteLength);
-new Uint8Array(memory.buffer).set(packet.data, packetPtr);
 
+
+
+
+/*
 const tryhard = true;
 
 if (tryhard) {
 	const warmup = 20;
 	for (let i = 0; i < warmup; i++) {
-		exports.decodePacket(decoder)
+		await decode();
 		//console.log("Decode result", exports.decodePacket(decoder));
 	}
 }
@@ -87,7 +124,7 @@ const start = performance.now();
 const iters = tryhard ? 500 : 1;
 
 for (let i = 0; i < iters; i++) {
-	exports.decodePacket(decoder)
+	await decode();
 	//console.log("Decode result", exports.decodePacket(decoder));
 }
 
@@ -98,36 +135,12 @@ const end = performance.now();
 setTimeout(() => {
 	alert((end - start) / iters);
 });
+*/
 
-const canvas = document.createElement('canvas');
-canvas.width = exports.getDisplayWidth(decoder);
-canvas.height = exports.getDisplayHeight(decoder);
+//await new Promise((resolve) => setTimeout(resolve, 500));
 
-document.body.append(canvas);
 
-const context = canvas.getContext('2d')!;
 
-const codedWidth = exports.getCodedWidth(decoder);
-const codedHeight = exports.getCodedHeight(decoder);
-const frameDataPtr = exports.getFrameDataPtr(decoder);
-const frameData = new Uint16Array(memory.buffer, frameDataPtr, 2 * codedWidth * codedHeight);
-
-const frame = new VideoFrame(frameData, {
-	format: 'I422P10' as VideoPixelFormat,
-	codedWidth,
-	codedHeight,
-	timestamp: 0,
-	duration: 0,
-	colorSpace: {
-		primaries: 'bt2020',
-		transfer: 'hlg',
-		matrix: 'bt2020-ncl',
-		fullRange: true,
-	},
-});
-
-context.drawImage(frame, 0, 0);
-frame.close();
 
 
 

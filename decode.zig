@@ -1,14 +1,134 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const BrkAllocator = @import("./BrkAllocator.zig");
 
-const gpa = std.heap.wasm_allocator;
+const io = blk: {
+    var vtable = std.Io.failing.vtable.*;
+    vtable.futexWait = &futexWait;
+    vtable.futexWake = &futexWake;
+    const vtable_const = vtable;
+
+    break :blk std.Io{
+        .userdata = null,
+        .vtable = &vtable_const,
+    };
+};
+
+var gpa_mutex = std.Io.Mutex.init;
+const wasm_allocator: std.mem.Allocator = .{
+    .ptr = undefined,
+    .vtable = &BrkAllocator.vtable,
+};
+const gpa: std.mem.Allocator = .{
+    .ptr = undefined,
+    .vtable = &.{
+        .alloc = &alloc,
+        .resize = &resize,
+        .remap = &remap,
+        .free = &free,
+    },
+};
+
+fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+    lockMutex(&gpa_mutex);
+    defer gpa_mutex.unlock(io);
+
+    return wasm_allocator.vtable.alloc(ptr, len, alignment, ret_addr);
+}
+
+fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+    lockMutex(&gpa_mutex);
+    defer gpa_mutex.unlock(io);
+
+    return wasm_allocator.vtable.resize(ptr, memory, alignment, new_len, ret_addr);
+}
+
+fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    lockMutex(&gpa_mutex);
+    defer gpa_mutex.unlock(io);
+
+    return wasm_allocator.vtable.remap(ptr, memory, alignment, new_len, ret_addr);
+}
+
+fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+    lockMutex(&gpa_mutex);
+    defer gpa_mutex.unlock(io);
+
+    wasm_allocator.vtable.free(ptr, memory, alignment, ret_addr);
+}
+
+fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+    _ = userdata;
+
+    const timeout_ns: ?u64 = ns: {
+        const d = timeout.toDurationFromNow(io) orelse break :ns null;
+        break :ns std.math.lossyCast(u64, d.raw.toNanoseconds());
+    };
+
+    const is_debug = builtin.mode == .Debug;
+
+    comptime std.debug.assert(builtin.cpu.has(.wasm, .atomics));
+    const to: i64 = if (timeout_ns) |ns| std.math.cast(i64, ns) orelse std.math.maxInt(i64) else -1;
+    const signed_expect: i32 = @bitCast(expected);
+    const result = asm volatile (
+        \\local.get %[ptr]
+        \\local.get %[expected]
+        \\local.get %[timeout]
+        \\memory.atomic.wait32 0
+        \\local.set %[ret]
+        : [ret] "=r" (-> u32),
+        : [ptr] "r" (ptr),
+          [expected] "r" (signed_expect),
+          [timeout] "r" (to),
+    );
+    switch (result) {
+        0 => {}, // ok
+        1 => {}, // expected != loaded
+        2 => {}, // timeout
+        else => std.debug.assert(!is_debug),
+    }
+}
+
+fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
+    @branchHint(.cold);
+    std.debug.assert(max_waiters != 0);
+
+    _ = userdata;
+
+    comptime std.debug.assert(builtin.cpu.has(.wasm, .atomics));
+    const woken_count = asm volatile (
+        \\local.get %[ptr]
+        \\local.get %[waiters]
+        \\memory.atomic.notify 0
+        \\local.set %[ret]
+        : [ret] "=r" (-> u32),
+        : [ptr] "r" (ptr),
+          [waiters] "r" (max_waiters),
+    );
+    _ = woken_count; // can be 0 when linker flag 'shared-memory' is not enabled
+}
 
 extern fn externPrint(offset: usize, length: usize) void;
 extern fn consoleTime() void;
 extern fn consoleTimeEnd() void;
 
-var print_buffer: [1 << 16]u8 = undefined;
+threadlocal var is_worker = false;
+
+export fn setIsWorker(is_worker_int: u32) void {
+    is_worker = is_worker_int != 0;
+}
+
+inline fn lockMutex(mutex: *std.Io.Mutex) void {
+    if (is_worker) {
+        mutex.lock(io) catch unreachable;
+    } else {
+        while (!mutex.tryLock()) {}
+    }
+}
 
 pub fn print(comptime string: []const u8, arguments: anytype) void {
+    var print_buffer: [1 << 16]u8 = undefined;
+
     const message = std.fmt.bufPrint(&print_buffer, string, arguments) catch |err| switch (err) {
         error.NoSpaceLeft => &print_buffer, // Just print the entire buffer
     };
@@ -49,6 +169,8 @@ fn transpose_scan_values(s: [64]u8) [64]u8 {
     return result;
 }
 
+var num_workers = std.atomic.Value(u32).init(0);
+
 const Decoder = struct {
     packet: []u8,
     frame_data: []align(16) u16,
@@ -56,9 +178,21 @@ const Decoder = struct {
     coded_height: u32,
     display_width: u32,
     display_height: u32,
+    slice_width: u32,
+    slice_height: u32,
+    slice_indices: []usize,
+    slice_sizes: []usize,
+    slice_offsets: []usize,
+    luma_scaling_matrix: [64]f32,
+    chroma_scaling_matrix: [64]f32,
+    tasks: []WorkerDecodeTask,
+    running_task_count: std.atomic.Value(u32),
+    wait_word: u32,
 };
 
 export fn createDecoder() *Decoder {
+    printValues(.{ num_workers.load(.monotonic), is_worker });
+
     const result = gpa.create(Decoder) catch unreachable;
     result.* = .{
         .packet = &.{},
@@ -67,6 +201,16 @@ export fn createDecoder() *Decoder {
         .coded_height = undefined,
         .display_width = undefined,
         .display_height = undefined,
+        .slice_width = undefined,
+        .slice_height = undefined,
+        .slice_indices = &.{},
+        .slice_sizes = &.{},
+        .slice_offsets = &.{},
+        .luma_scaling_matrix = undefined,
+        .chroma_scaling_matrix = undefined,
+        .tasks = &.{},
+        .running_task_count = .init(0),
+        .wait_word = 0,
     };
 
     return result;
@@ -103,6 +247,237 @@ export fn decodePacket(decoder: *Decoder) i32 {
     return 0;
 }
 
+export fn getWaitWordAddress(decoder: *Decoder) *u32 {
+    return &decoder.wait_word;
+}
+
+export fn allocateWorkerStack() [*]u8 {
+    // 512 KiB per worker should be plenty
+    const stack = gpa.alloc(u8, 512 * 1024) catch unreachable;
+    return stack.ptr;
+}
+
+export fn allocateThreadLocalState(size: usize, alignment: u8) [*]u8 {
+    // Use wasm_allocator instead of gpa here because gpa requires thread-local state
+    const result = wasm_allocator.rawAlloc(size, .fromByteUnits(alignment), @returnAddress());
+    return result.?;
+}
+
+const WorkerDecodeTask = struct {
+    decoder: *Decoder,
+    slice_start: usize,
+    slice_count: usize,
+};
+
+const WorkerTask = union(enum) {
+    decode: *WorkerDecodeTask,
+};
+
+var worker_task_queue = std.Deque(WorkerTask).empty;
+var worker_task_queue_mutex = std.Io.Mutex.init;
+
+export fn startWorker() noreturn {
+    _ = num_workers.fetchAdd(1, .monotonic);
+
+    while (true) {
+        io.futexWait(u32, &worker_task_queue.len, 0) catch unreachable;
+
+        var task: WorkerTask = undefined;
+        {
+            lockMutex(&worker_task_queue_mutex);
+            defer worker_task_queue_mutex.unlock(io);
+
+            if (worker_task_queue.len == 0) {
+                continue;
+            }
+
+            task = worker_task_queue.popFront().?;
+        }
+
+        switch (task) {
+            .decode => |decode_task| {
+                executeDecodeTask(decode_task) catch unreachable; // Temp
+            },
+        }
+    }
+}
+
+fn executeDecodeTask(task: *WorkerDecodeTask) !void {
+    const decoder = task.decoder;
+    const slice_count = task.slice_count;
+    const slice_start = task.slice_start;
+
+    var reader = ByteReader.init(decoder.packet);
+
+    const num_luma_blocks = (decoder.slice_width * decoder.slice_height) << 2;
+    const num_chroma_blocks = (decoder.slice_width * decoder.slice_height) << 1;
+
+    const luma_slice_len = num_luma_blocks << 6;
+    const chroma_slice_len = num_chroma_blocks << 6;
+
+    const luma_slices_per_row = (decoder.coded_width + (decoder.slice_width << 4) - 1) / ((decoder.slice_width << 4));
+
+    const luma_scaling_matrix = decoder.luma_scaling_matrix;
+    const chroma_scaling_matrix = decoder.chroma_scaling_matrix;
+
+    const chroma_entries = (decoder.coded_width * decoder.coded_height) >> 1;
+    const luma_frame_data = decoder.frame_data[0 .. decoder.coded_width * decoder.coded_height];
+    const u_frame_data = decoder.frame_data[decoder.coded_width * decoder.coded_height ..][0..chroma_entries];
+    const v_frame_data = decoder.frame_data[decoder.coded_width * decoder.coded_height + chroma_entries ..][0..chroma_entries];
+
+    // Aligned for SIMD access
+    const slice_data = try gpa.alignedAlloc(f32, .@"16", (luma_slice_len + (chroma_slice_len << 1)) << 1);
+    defer gpa.free(slice_data);
+
+    const slice_1_luma_data = slice_data[0..luma_slice_len];
+    const slice_2_luma_data = slice_data[luma_slice_len..][0..luma_slice_len];
+    const slice_1_u_data = slice_data[(luma_slice_len << 1)..][0..chroma_slice_len];
+    const slice_2_u_data = slice_data[(luma_slice_len << 1) + 1 * chroma_slice_len ..][0..chroma_slice_len];
+    const slice_1_v_data = slice_data[(luma_slice_len << 1) + 2 * chroma_slice_len ..][0..chroma_slice_len];
+    const slice_2_v_data = slice_data[(luma_slice_len << 1) + 3 * chroma_slice_len ..][0..chroma_slice_len];
+
+    var i: usize = 0;
+    while (i + 1 < slice_count) : (i += 2) {
+        const index_1 = decoder.slice_indices[slice_start + i];
+        const index_2 = decoder.slice_indices[slice_start + i + 1];
+        reader.pos = decoder.slice_offsets[index_1];
+        const header_1 = parseSliceHeader(decoder.slice_sizes, &reader, index_1);
+        reader.pos = decoder.slice_offsets[index_2];
+        const header_2 = parseSliceHeader(decoder.slice_sizes, &reader, index_2);
+
+        // AC parameters are sparse, so we must memset them all to zero
+        @memset(slice_data, 0);
+
+        const pos_1 = getSlicePos(index_1, luma_slices_per_row, decoder.slice_width, decoder.slice_height);
+        const pos_2 = getSlicePos(index_2, luma_slices_per_row, decoder.slice_width, decoder.slice_height);
+
+        // Fold each slice's quantization scale into its matrices up front. The U and V planes of a slice
+        // share the same chroma matrix, so this also avoids redoing that multiply for both.
+        const scale_1: @Vector(64, f32) = @splat(@floatFromInt(header_1.scale_factor));
+        const scale_2: @Vector(64, f32) = @splat(@floatFromInt(header_2.scale_factor));
+        const luma_vec_1 = @as(@Vector(64, f32), luma_scaling_matrix) * scale_1;
+        const luma_vec_2 = @as(@Vector(64, f32), luma_scaling_matrix) * scale_2;
+        const chroma_vec_1 = @as(@Vector(64, f32), chroma_scaling_matrix) * scale_1;
+        const chroma_vec_2 = @as(@Vector(64, f32), chroma_scaling_matrix) * scale_2;
+
+        // Luma for slice 1 and 2
+        parseDcAndAcPair(
+            header_1.luma_bit_reader,
+            header_2.luma_bit_reader,
+            slice_1_luma_data,
+            slice_2_luma_data,
+            num_luma_blocks,
+        );
+        transformAndStoreSliceData(
+            decoder,
+            slice_1_luma_data,
+            luma_frame_data,
+            luma_vec_1,
+            pos_1,
+            num_luma_blocks,
+            4,
+        );
+        transformAndStoreSliceData(
+            decoder,
+            slice_2_luma_data,
+            luma_frame_data,
+            luma_vec_2,
+            pos_2,
+            num_luma_blocks,
+            4,
+        );
+
+        // U for slice 1 and 2
+        parseDcAndAcPair(
+            header_1.u_bit_reader,
+            header_2.u_bit_reader,
+            slice_1_u_data,
+            slice_2_u_data,
+            num_chroma_blocks,
+        );
+        transformAndStoreSliceData(
+            decoder,
+            slice_1_u_data,
+            u_frame_data,
+            chroma_vec_1,
+            pos_1,
+            num_chroma_blocks,
+            2,
+        );
+        transformAndStoreSliceData(
+            decoder,
+            slice_2_u_data,
+            u_frame_data,
+            chroma_vec_2,
+            pos_2,
+            num_chroma_blocks,
+            2,
+        );
+
+        // V for slice 1 and 2
+        parseDcAndAcPair(
+            header_1.v_bit_reader,
+            header_2.v_bit_reader,
+            slice_1_v_data,
+            slice_2_v_data,
+            num_chroma_blocks,
+        );
+        transformAndStoreSliceData(
+            decoder,
+            slice_1_v_data,
+            v_frame_data,
+            chroma_vec_1,
+            pos_1,
+            num_chroma_blocks,
+            2,
+        );
+        transformAndStoreSliceData(
+            decoder,
+            slice_2_v_data,
+            v_frame_data,
+            chroma_vec_2,
+            pos_2,
+            num_chroma_blocks,
+            2,
+        );
+    }
+
+    // Odd slice count leaves one slice over; decode it on its own
+    if (i < slice_count) {
+        const index = decoder.slice_indices[slice_start + i];
+        reader.pos = decoder.slice_offsets[index];
+        const header = parseSliceHeader(decoder.slice_sizes, &reader, index);
+
+        @memset(slice_data[0 .. luma_slice_len + (chroma_slice_len << 1)], 0);
+
+        const luma_data = slice_data[0..luma_slice_len];
+        const u_data = slice_data[luma_slice_len..][0..chroma_slice_len];
+        const v_data = slice_data[luma_slice_len + chroma_slice_len ..][0..chroma_slice_len];
+
+        const pos = getSlicePos(index, luma_slices_per_row, decoder.slice_width, decoder.slice_height);
+
+        const scale: @Vector(64, f32) = @splat(@floatFromInt(header.scale_factor));
+        const luma_vec = @as(@Vector(64, f32), luma_scaling_matrix) * scale;
+        const chroma_vec = @as(@Vector(64, f32), chroma_scaling_matrix) * scale;
+
+        // Luma
+        parseDcAndAcSingle(header.luma_bit_reader, luma_data, num_luma_blocks);
+        transformAndStoreSliceData(decoder, luma_data, luma_frame_data, luma_vec, pos, num_luma_blocks, 4);
+
+        // U
+        parseDcAndAcSingle(header.u_bit_reader, u_data, num_chroma_blocks);
+        transformAndStoreSliceData(decoder, u_data, u_frame_data, chroma_vec, pos, num_chroma_blocks, 2);
+
+        // V
+        parseDcAndAcSingle(header.v_bit_reader, v_data, num_chroma_blocks);
+        transformAndStoreSliceData(decoder, v_data, v_frame_data, chroma_vec, pos, num_chroma_blocks, 2);
+    }
+
+    if (decoder.running_task_count.fetchSub(1, .monotonic) == 1) {
+        io.futexWake(u32, &decoder.wait_word, 4);
+    }
+}
+
 const SliceHeader = struct {
     scale_factor: u32,
     luma_bit_reader: BitReader,
@@ -110,7 +485,7 @@ const SliceHeader = struct {
     v_bit_reader: BitReader,
 };
 
-inline fn parseSliceHeader(slice_sizes: []u16, reader: *ByteReader, i: usize) SliceHeader {
+inline fn parseSliceHeader(slice_sizes: []usize, reader: *ByteReader, i: usize) SliceHeader {
     const slice_size = slice_sizes[i];
     const slice_hdr_size = reader.takeInt(u8);
 
@@ -185,7 +560,7 @@ const DcState = struct {
         self.sign = @intFromBool(self.code > 0) * (self.sign ^ -(self.code & 1));
 
         const result_1 = self.prev_dc + (((self.code + 1) >> 1) ^ self.sign) - self.sign;
-        self.slice_data[64 * j] = @floatFromInt(result_1);
+        self.slice_data[j << 6] = @floatFromInt(result_1);
 
         const code_result_2 = parseCode(
             self.bit_reader.current << @as(u6, @intCast(code_result_1.bits)),
@@ -196,7 +571,7 @@ const DcState = struct {
         self.sign = @intFromBool(self.code > 0) * (self.sign ^ -(self.code & 1));
 
         const result_2 = result_1 + (((self.code + 1) >> 1) ^ self.sign) - self.sign;
-        self.slice_data[64 * j + 64] = @floatFromInt(result_2);
+        self.slice_data[(j << 6) + 64] = @floatFromInt(result_2);
         self.prev_dc = result_2;
 
         self.bit_reader.consume(@intCast(code_result_1.bits + code_result_2.bits));
@@ -319,8 +694,8 @@ fn transformAndStoreSliceData(
 
     var j: u32 = 0;
     while (j < num_blocks) : (j += 2) {
-        const block_a = slice_data[64 * j ..][0..64].*;
-        const block_b = slice_data[64 * j + 64 ..][0..64].*;
+        const block_a = slice_data[(j << 6)..][0..64].*;
+        const block_b = slice_data[(j << 6) + 64 ..][0..64].*;
 
         const result_a = idct_8x8(block_a, scaling_matrix_vec);
         const result_b = idct_8x8(block_b, scaling_matrix_vec);
@@ -403,13 +778,12 @@ fn decodePacketInternal(decoder: *Decoder) !void {
         @splat(4);
 
     // Fold the dequantization and AAN scaling factors into a single matrix
-    var luma_scaling_matrix: [64]f32 = undefined;
     inline for (0..8) |x| {
         inline for (0..8) |y| {
             const i = 8 * y + x;
-            luma_scaling_matrix[i] = @floatFromInt(q_mat_luma[8 * x + y]); // Read the matrix transposed-ly
-            luma_scaling_matrix[i] *= 0.25; // >> 2
-            luma_scaling_matrix[i] *= comptime 1 / (S[x] * S[y]);
+            decoder.luma_scaling_matrix[i] = @floatFromInt(q_mat_luma[8 * x + y]); // Read the matrix transposed-ly
+            decoder.luma_scaling_matrix[i] *= 0.25; // >> 2
+            decoder.luma_scaling_matrix[i] *= comptime 1 / (S[x] * S[y]);
         }
     }
 
@@ -418,13 +792,12 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     else
         @splat(4);
 
-    var chroma_scaling_matrix: [64]f32 = undefined;
     inline for (0..8) |x| {
         inline for (0..8) |y| {
             const i = 8 * y + x;
-            chroma_scaling_matrix[i] = @floatFromInt(q_mat_chroma[8 * x + y]); // Read the matrix transposed-ly
-            chroma_scaling_matrix[i] *= 0.25; // >> 2
-            chroma_scaling_matrix[i] *= comptime 1 / (S[x] * S[y]);
+            decoder.chroma_scaling_matrix[i] = @floatFromInt(q_mat_chroma[8 * x + y]); // Read the matrix transposed-ly
+            decoder.chroma_scaling_matrix[i] *= 0.25; // >> 2
+            decoder.chroma_scaling_matrix[i] *= comptime 1 / (S[x] * S[y]);
         }
     }
 
@@ -437,211 +810,97 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     decoder.coded_width = (frame_width + 15) & ~@as(u32, 15);
     decoder.coded_height = (frame_height + 15) & ~@as(u32, 15);
 
-    const frame_data_size = decoder.coded_width * decoder.coded_height * 2;
+    const frame_data_size = (decoder.coded_width * decoder.coded_height) << 1;
     decoder.frame_data = try gpa.realloc(decoder.frame_data, frame_data_size);
 
     const pic_hdr_size = reader.takeInt(u8);
     const pic_data_size = reader.takeInt(u32);
     const total_slices = reader.takeInt(u16);
     const slice_dimensions = reader.takeInt(u8);
-    const slice_width = @as(u32, 1) << @as(u5, @intCast(slice_dimensions >> 4));
-    const slice_height = @as(u32, 1) << @as(u5, @intCast(slice_dimensions & 0b1111));
 
-    const slice_sizes = try arena.alloc(u16, total_slices);
+    _ = pic_hdr_size;
+    _ = pic_data_size;
+
+    decoder.slice_width = @as(u32, 1) << @as(u5, @intCast(slice_dimensions >> 4));
+    decoder.slice_height = @as(u32, 1) << @as(u5, @intCast(slice_dimensions & 0b1111));
+
+    const fixed_per_slice = 100;
+
+    var total_slice_size: usize = 0;
+    decoder.slice_sizes = try arena.realloc(decoder.slice_sizes, total_slices);
     for (0..total_slices) |i| {
-        slice_sizes[i] = reader.takeInt(u16);
+        const size: usize = reader.takeInt(u16);
+
+        decoder.slice_sizes[i] = size;
+        total_slice_size += size + fixed_per_slice;
     }
 
-    const slice_offsets = try arena.alloc(usize, total_slices);
+    decoder.slice_offsets = try arena.realloc(decoder.slice_offsets, total_slices);
 
     var current_offset: usize = reader.pos;
     for (0..total_slices) |i| {
-        slice_offsets[i] = current_offset;
-        current_offset += slice_sizes[i];
+        decoder.slice_offsets[i] = current_offset;
+        current_offset += decoder.slice_sizes[i];
     }
 
-    const num_luma_blocks = 4 * slice_width * slice_height;
-    const num_chroma_blocks = 2 * slice_width * slice_height;
-
-    const luma_slice_len = 64 * num_luma_blocks;
-    const chroma_slice_len = 64 * num_chroma_blocks;
-
-    // Aligned for SIMD access
-    const slice_data = try arena.alignedAlloc(f32, .@"16", 2 * (luma_slice_len + 2 * chroma_slice_len));
-
-    printValues(.{ pic_hdr_size, pic_data_size, total_slices, slice_dimensions, slice_width, slice_height, slice_sizes });
-
-    const luma_slices_per_row = (decoder.coded_width + (slice_width << 4) - 1) / ((slice_width << 4));
-
-    const slice_indices = try arena.alloc(usize, total_slices);
+    decoder.slice_indices = try arena.realloc(decoder.slice_indices, total_slices);
 
     for (0..total_slices) |i| {
-        slice_indices[i] = i;
+        decoder.slice_indices[i] = i;
     }
 
-    if (true) {
+    if (false) {
         const Context = struct {
-            items: []u16,
+            items: []usize,
 
             fn sort(self: @This(), a: usize, b: usize) bool {
                 return self.items[a] < self.items[b];
             }
         };
         const ctx = Context{
-            .items = slice_sizes,
+            .items = decoder.slice_sizes,
         };
 
-        std.mem.sortUnstable(usize, slice_indices, ctx, Context.sort);
+        std.mem.sortUnstable(usize, decoder.slice_indices, ctx, Context.sort);
     }
 
-    const chroma_entries = (decoder.coded_width * decoder.coded_height) / 2;
-    const luma_frame_data = decoder.frame_data[0 .. decoder.coded_width * decoder.coded_height];
-    const u_frame_data = decoder.frame_data[decoder.coded_width * decoder.coded_height ..][0..chroma_entries];
-    const v_frame_data = decoder.frame_data[decoder.coded_width * decoder.coded_height + chroma_entries ..][0..chroma_entries];
+    lockMutex(&worker_task_queue_mutex);
+    defer worker_task_queue_mutex.unlock(io);
 
-    const slice_1_luma_data = slice_data[0..luma_slice_len];
-    const slice_2_luma_data = slice_data[luma_slice_len..][0..luma_slice_len];
-    const slice_1_u_data = slice_data[2 * luma_slice_len ..][0..chroma_slice_len];
-    const slice_2_u_data = slice_data[2 * luma_slice_len + chroma_slice_len ..][0..chroma_slice_len];
-    const slice_1_v_data = slice_data[2 * luma_slice_len + 2 * chroma_slice_len ..][0..chroma_slice_len];
-    const slice_2_v_data = slice_data[2 * luma_slice_len + 3 * chroma_slice_len ..][0..chroma_slice_len];
+    const num_workers_val = num_workers.load(.monotonic);
 
-    var i: usize = 0;
-    while (i + 1 < total_slices) : (i += 2) {
-        const index_1 = slice_indices[i];
-        const index_2 = slice_indices[i + 1];
-        reader.pos = slice_offsets[index_1];
-        const header_1 = parseSliceHeader(slice_sizes, &reader, index_1);
-        reader.pos = slice_offsets[index_2];
-        const header_2 = parseSliceHeader(slice_sizes, &reader, index_2);
+    const size_per_worker = total_slice_size / num_workers_val;
 
-        // AC parameters are sparse, so we must memset them all to zero
-        @memset(slice_data, 0);
+    decoder.tasks = try gpa.realloc(decoder.tasks, num_workers_val);
 
-        const pos_1 = getSlicePos(index_1, luma_slices_per_row, slice_width, slice_height);
-        const pos_2 = getSlicePos(index_2, luma_slices_per_row, slice_width, slice_height);
+    var slice_start_index: usize = 0;
 
-        // Fold each slice's quantization scale into its matrices up front. The U and V planes of a slice
-        // share the same chroma matrix, so this also avoids redoing that multiply for both.
-        const scale_1: @Vector(64, f32) = @splat(@floatFromInt(header_1.scale_factor));
-        const scale_2: @Vector(64, f32) = @splat(@floatFromInt(header_2.scale_factor));
-        const luma_vec_1 = @as(@Vector(64, f32), luma_scaling_matrix) * scale_1;
-        const luma_vec_2 = @as(@Vector(64, f32), luma_scaling_matrix) * scale_2;
-        const chroma_vec_1 = @as(@Vector(64, f32), chroma_scaling_matrix) * scale_1;
-        const chroma_vec_2 = @as(@Vector(64, f32), chroma_scaling_matrix) * scale_2;
+    for (0..num_workers_val) |i| {
+        const start_index = slice_start_index;
 
-        // Luma for slice 1 and 2
-        parseDcAndAcPair(
-            header_1.luma_bit_reader,
-            header_2.luma_bit_reader,
-            slice_1_luma_data,
-            slice_2_luma_data,
-            num_luma_blocks,
-        );
-        transformAndStoreSliceData(
-            decoder,
-            slice_1_luma_data,
-            luma_frame_data,
-            luma_vec_1,
-            pos_1,
-            num_luma_blocks,
-            4,
-        );
-        transformAndStoreSliceData(
-            decoder,
-            slice_2_luma_data,
-            luma_frame_data,
-            luma_vec_2,
-            pos_2,
-            num_luma_blocks,
-            4,
-        );
+        var current_size: usize = 0;
+        while (slice_start_index < total_slices) : (slice_start_index += 1) {
+            if (current_size >= size_per_worker) {
+                break;
+            }
 
-        // U for slice 1 and 2
-        parseDcAndAcPair(
-            header_1.u_bit_reader,
-            header_2.u_bit_reader,
-            slice_1_u_data,
-            slice_2_u_data,
-            num_chroma_blocks,
-        );
-        transformAndStoreSliceData(
-            decoder,
-            slice_1_u_data,
-            u_frame_data,
-            chroma_vec_1,
-            pos_1,
-            num_chroma_blocks,
-            2,
-        );
-        transformAndStoreSliceData(
-            decoder,
-            slice_2_u_data,
-            u_frame_data,
-            chroma_vec_2,
-            pos_2,
-            num_chroma_blocks,
-            2,
-        );
+            current_size += decoder.slice_sizes[decoder.slice_indices[slice_start_index]] + fixed_per_slice;
+        }
 
-        // V for slice 1 and 2
-        parseDcAndAcPair(
-            header_1.v_bit_reader,
-            header_2.v_bit_reader,
-            slice_1_v_data,
-            slice_2_v_data,
-            num_chroma_blocks,
-        );
-        transformAndStoreSliceData(
-            decoder,
-            slice_1_v_data,
-            v_frame_data,
-            chroma_vec_1,
-            pos_1,
-            num_chroma_blocks,
-            2,
-        );
-        transformAndStoreSliceData(
-            decoder,
-            slice_2_v_data,
-            v_frame_data,
-            chroma_vec_2,
-            pos_2,
-            num_chroma_blocks,
-            2,
-        );
+        decoder.tasks[i] = .{
+            .decoder = decoder,
+            .slice_start = start_index,
+            .slice_count = slice_start_index - start_index,
+        };
+
+        try worker_task_queue.pushBack(gpa, .{
+            .decode = &decoder.tasks[i],
+        });
     }
 
-    // Odd slice count leaves one slice over; decode it on its own
-    if (i < total_slices) {
-        const index = slice_indices[i];
-        reader.pos = slice_offsets[index];
-        const header = parseSliceHeader(slice_sizes, &reader, index);
+    io.futexWake(u32, &worker_task_queue.len, num_workers_val);
 
-        @memset(slice_data[0 .. luma_slice_len + 2 * chroma_slice_len], 0);
-
-        const luma_data = slice_data[0..luma_slice_len];
-        const u_data = slice_data[luma_slice_len..][0..chroma_slice_len];
-        const v_data = slice_data[luma_slice_len + chroma_slice_len ..][0..chroma_slice_len];
-
-        const pos = getSlicePos(index, luma_slices_per_row, slice_width, slice_height);
-
-        const scale: @Vector(64, f32) = @splat(@floatFromInt(header.scale_factor));
-        const luma_vec = @as(@Vector(64, f32), luma_scaling_matrix) * scale;
-        const chroma_vec = @as(@Vector(64, f32), chroma_scaling_matrix) * scale;
-
-        // Luma
-        parseDcAndAcSingle(header.luma_bit_reader, luma_data, num_luma_blocks);
-        transformAndStoreSliceData(decoder, luma_data, luma_frame_data, luma_vec, pos, num_luma_blocks, 4);
-
-        // U
-        parseDcAndAcSingle(header.u_bit_reader, u_data, num_chroma_blocks);
-        transformAndStoreSliceData(decoder, u_data, u_frame_data, chroma_vec, pos, num_chroma_blocks, 2);
-
-        // V
-        parseDcAndAcSingle(header.v_bit_reader, v_data, num_chroma_blocks);
-        transformAndStoreSliceData(decoder, v_data, v_frame_data, chroma_vec, pos, num_chroma_blocks, 2);
-    }
+    decoder.running_task_count.store(num_workers_val, .monotonic);
 }
 
 const S = [_]f32{
@@ -849,7 +1108,7 @@ inline fn parseCode(word: u64, params: u64) ParsedCode {
 
     const base = @as(u64, @min(n, mp + 1)) << @as(u6, @intCast(r));
 
-    const bits_big = 2 *% n +% g -% mp;
+    const bits_big = (n << 1) +% g -% mp;
     const bits_small = n + 1 + r;
     const bits = if (is_big) bits_big else bits_small;
     const sub = @as(u64, 1) << (if (is_big) @intCast(g) else @intCast(r));
