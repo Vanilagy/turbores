@@ -51,7 +51,7 @@ fn transpose_scan_values(s: [64]u8) [64]u8 {
 
 const Decoder = struct {
     packet: []u8,
-    frame_data: []u16,
+    frame_data: []align(16) u16,
     coded_width: u32,
     coded_height: u32,
     display_width: u32,
@@ -466,7 +466,8 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     const luma_slice_len = 64 * num_luma_blocks;
     const chroma_slice_len = 64 * num_chroma_blocks;
 
-    const slice_data = try arena.alloc(f32, 2 * (luma_slice_len + 2 * chroma_slice_len));
+    // Aligned for SIMD access
+    const slice_data = try arena.alignedAlloc(f32, .@"16", 2 * (luma_slice_len + 2 * chroma_slice_len));
 
     printValues(.{ pic_hdr_size, pic_data_size, total_slices, slice_dimensions, slice_width, slice_height, slice_sizes });
 
