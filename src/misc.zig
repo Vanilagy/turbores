@@ -1,9 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const BrkAllocator = @import("./BrkAllocator.zig");
-const worker = @import("./worker.zig");
 
 extern fn externPrint(offset: usize, length: usize) void;
+
+pub threadlocal var is_browser_main_thread: bool = undefined;
+
+export fn setIsBrowserMainThread(value: u32) void {
+    is_browser_main_thread = value != 0;
+}
 
 pub fn print(comptime string: []const u8, arguments: anytype) void {
     var print_buffer: [1 << 16]u8 = undefined;
@@ -128,10 +133,11 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
 }
 
 pub inline fn lockMutex(mutex: *std.Io.Mutex) void {
-    if (worker.is_worker) {
-        mutex.lock(io) catch unreachable;
-    } else {
+    if (is_browser_main_thread) {
+        // The browser main thread isn't allowed to block on atomics.wait, so the best we can do is a spinlock
         while (!mutex.tryLock()) {}
+    } else {
+        mutex.lock(io) catch unreachable;
     }
 }
 

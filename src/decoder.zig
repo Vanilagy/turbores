@@ -105,6 +105,33 @@ export fn getFrameDataPtr(decoder: *Decoder) [*]u16 {
     return decoder.frame_data.ptr;
 }
 
+export fn getFrameDataSize(decoder: *Decoder) usize {
+    return decoder.frame_data.len;
+}
+
+export fn getChromaSubsampling(decoder: *Decoder) u32 {
+    return if (decoder.log2_chroma_blocks_per_mb == 2) 444 else 422;
+}
+
+export fn getBitDepth(decoder: *Decoder) u32 {
+    return decoder.bit_depth;
+}
+
+export fn getAlphaBitDepth(decoder: *Decoder) u32 {
+    return decoder.alpha_bit_depth;
+}
+
+export fn closeDecoder(decoder: *Decoder) void {
+    gpa.free(decoder.packet);
+    gpa.free(decoder.frame_data);
+    decoder.slice_info_in_row.deinit(gpa);
+    gpa.free(decoder.slice_indices);
+    gpa.free(decoder.slice_sizes);
+    gpa.free(decoder.slice_offsets);
+    gpa.free(decoder.tasks);
+    gpa.destroy(decoder);
+}
+
 export fn allocatePacket(decoder: *Decoder, size: usize) [*]u8 {
     decoder.packet = gpa.realloc(decoder.packet, size) catch unreachable;
     return decoder.packet.ptr;
@@ -144,6 +171,8 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     reader.toss(1);
     const q_mat_flags = reader.takeInt(u8);
 
+    _ = .{ frame_size, frame_type_outer, hdr_size, version, creator_id, frame_width, frame_height, frame_flags, chrominance_factor, frame_type, primaries, transfer_function, color_matrix, next_byte, src_pix_format, alpha_info, q_mat_flags };
+
     const q_mat_luma: [64]u8 = if (q_mat_flags & 0b10 != 0)
         reader.takeArray(64).*
     else
@@ -177,8 +206,6 @@ fn decodePacketInternal(decoder: *Decoder) !void {
     decoder.log2_chroma_blocks_per_mb = if (chrominance_factor == 2) 1 else 2;
 
     decoder.alpha_bit_depth = alpha_info << 3;
-
-    misc.printValues(.{ frame_size, frame_type_outer, hdr_size, version, creator_id, frame_width, frame_height, frame_flags, chrominance_factor, frame_type, primaries, transfer_function, color_matrix, src_pix_format, alpha_info, q_mat_flags, q_mat_luma, q_mat_chroma });
 
     decoder.display_width = frame_width;
     decoder.display_height = frame_height;
@@ -228,8 +255,6 @@ fn decodePacketInternal(decoder: *Decoder) !void {
             decoder.max_slice_width = width;
         }
     }
-
-    misc.printValues(.{ decoder.slice_width, decoder.slice_info_in_row.items(.size) });
 
     const fixed_per_slice = 100;
 

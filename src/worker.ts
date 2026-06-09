@@ -1,4 +1,4 @@
-import { initWasmModule } from "./wasm-init";
+import { initWasmModule } from './wasm';
 
 self.addEventListener('message', async (event) => {
     const data = event.data as {
@@ -11,7 +11,7 @@ self.addEventListener('message', async (event) => {
     exports.__stack_pointer.value = data.stackPointer;
     exports.__wasm_init_tls(data.tlsPointer);
 
-    exports.setIsWorker(Number(true));
+    exports.setIsBrowserMainThread(Number(false));
 
     self.postMessage(null);
     exports.startWorker();

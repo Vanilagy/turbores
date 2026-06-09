@@ -5,12 +5,6 @@ const io = misc.io;
 const Decoder = @import("./decoder.zig").Decoder;
 const executeDecodeTask = @import("./decoder.zig").executeDecodeTask;
 
-pub threadlocal var is_worker = false;
-
-export fn setIsWorker(is_worker_int: u32) void {
-    is_worker = is_worker_int != 0;
-}
-
 export fn allocateWorkerStack() [*]u8 {
     // 512 KiB per worker should be plenty
     const stack = gpa.alloc(u8, 512 * 1024) catch unreachable;
