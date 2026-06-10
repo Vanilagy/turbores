@@ -44,7 +44,7 @@ pub const Decoder = struct {
     color_primaries: u32,
     color_transfer: u32,
     color_matrix: u32,
-    tasks: []worker.WorkerDecodeTask,
+    tasks: []DecodeTask,
     running_task_count: std.atomic.Value(u32),
     wait_word: u32,
     worker_error: std.atomic.Value(?*worker.WorkerError),
@@ -59,6 +59,13 @@ const SliceInfo = struct {
 const SlicePos = struct {
     x: u32,
     y: u32,
+};
+
+pub const DecodeTask = struct {
+    decoder: *Decoder,
+    slice_start: usize,
+    slice_count: usize,
+    error_message: ?[]const u8,
 };
 
 export fn createDecoder() ?*Decoder {
@@ -491,7 +498,7 @@ export fn finalizePacketDecoding(decoder: *Decoder) i32 {
     return 0;
 }
 
-pub fn executeDecodeTask(task: *worker.WorkerDecodeTask) !void {
+pub fn executeDecodeTask(task: *DecodeTask) !void {
     const decoder = task.decoder;
     const slice_count = task.slice_count;
     const slice_start = task.slice_start;
@@ -797,7 +804,7 @@ const SliceHeader = struct {
     pos_y_mb: u32,
 };
 
-inline fn parseSliceHeader(task: *worker.WorkerDecodeTask, reader: *misc.ByteReader, i: usize) !SliceHeader {
+inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize) !SliceHeader {
     // We can do unchecked reads here because we have already verified that the slice data fits
 
     const decoder = task.decoder;
@@ -894,7 +901,7 @@ fn parseDcAndAcPair(
     slice_2_data: []f32,
     num_blocks_1: u32,
     num_blocks_2: u32,
-    task: *worker.WorkerDecodeTask,
+    task: *DecodeTask,
 ) !void {
     // Special logic in case the data is empty (which is handled gracefully)
     if (data_1.len == 0 or data_2.len == 0) {
@@ -960,7 +967,7 @@ fn parseDcAndAcPair(
     task.error_message = null;
 }
 
-fn parseDcAndAcSingle(data: []u8, slice_data: []f32, num_blocks: u32, task: *worker.WorkerDecodeTask) !void {
+fn parseDcAndAcSingle(data: []u8, slice_data: []f32, num_blocks: u32, task: *DecodeTask) !void {
     // An empty scan carries no coefficients; the slice data is already zeroed, so there's nothing to do.
     if (data.len == 0) {
         @branchHint(.unlikely);

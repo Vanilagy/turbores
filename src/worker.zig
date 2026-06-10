@@ -2,7 +2,7 @@ const std = @import("std");
 const misc = @import("./misc.zig");
 const gpa = misc.gpa;
 const io = misc.io;
-const Decoder = @import("./decoder.zig").Decoder;
+const DecodeTask = @import("./decoder.zig").DecodeTask;
 const executeDecodeTask = @import("./decoder.zig").executeDecodeTask;
 
 export fn allocateWorkerStack() ?[*]u8 {
@@ -16,15 +16,8 @@ export fn allocateThreadLocalState(size: usize, alignment: u8) ?[*]u8 {
     return misc.wasm_allocator.rawAlloc(size, .fromByteUnits(alignment), @returnAddress());
 }
 
-pub const WorkerDecodeTask = struct {
-    decoder: *Decoder,
-    slice_start: usize,
-    slice_count: usize,
-    error_message: ?[]const u8,
-};
-
 const WorkerTask = union(enum) {
-    decode: *WorkerDecodeTask,
+    decode: *DecodeTask,
 };
 
 pub const WorkerError = struct {
