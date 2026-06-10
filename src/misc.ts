@@ -1,3 +1,9 @@
+export function assert(condition: unknown): asserts condition {
+    if (!condition) {
+        throw new Error("Assertion failed.");
+    }
+}
+
 // This thing is much faster than TextDecoder
 // https://gist.github.com/pascaldekloe/62546103a1576803dade9269ccf76330
 export const decodeUtf8 = (bytes: Uint8Array) => {

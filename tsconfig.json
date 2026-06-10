@@ -10,9 +10,11 @@
 
     // Bundler mode
     "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
-    "noEmit": true,
+    "declaration": true,
+    "outDir": "./build",
+    "rootDir": "./src",
+    "emitDeclarationOnly": true,
 
     // Best practices
     "strict": true,
@@ -20,10 +22,8 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
-
-    // Some stricter flags (disabled by default)
-    "noUnusedLocals": false,
-    "noUnusedParameters": false,
-    "noPropertyAccessFromIndexSignature": false
-  }
+    
+    "types": ["node", "vite/client"],
+  },
+  "include": ["./src/**/*.ts"],
 }

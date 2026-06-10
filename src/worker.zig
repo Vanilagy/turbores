@@ -25,7 +25,6 @@ pub const WorkerError = struct {
     message: ?[]const u8,
 };
 
-pub var num_workers = std.atomic.Value(u32).init(0);
 pub var worker_task_queue = std.Deque(WorkerTask).empty;
 pub var worker_task_queue_mutex = std.Io.Mutex.init;
 
@@ -33,8 +32,6 @@ pub var worker_task_queue_mutex = std.Io.Mutex.init;
 threadlocal var worker_error: WorkerError = undefined;
 
 export fn startWorker() noreturn {
-    _ = num_workers.fetchAdd(1, .seq_cst);
-
     while (true) {
         io.futexWait(u32, &worker_task_queue.len, 0) catch unreachable; // Can't cancel in WASM
 

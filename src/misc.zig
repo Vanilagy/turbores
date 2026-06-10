@@ -151,14 +151,14 @@ pub const ConvertibleError = error{
 };
 
 pub inline fn toErrorCode(err: ConvertibleError) i32 {
-    switch (err) {
-        error.OutOfMemory => return -1,
-        error.UnexpectedEof => return -2,
-        error.InvalidData => return -3,
-        error.NotSupported => return -4,
-        error.InvalidState => return -5,
-        error.Overflow => return -6,
-    }
+    return switch (err) {
+        error.OutOfMemory => -1,
+        error.UnexpectedEof => -2,
+        error.InvalidData => -3,
+        error.NotSupported => -4,
+        error.InvalidState => -5,
+        error.Overflow => -6,
+    };
 }
 
 pub const ByteReader = struct {

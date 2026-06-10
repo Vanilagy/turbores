@@ -1,9 +1,12 @@
 #!/bin/sh
+set -e
 
 mode="Debug"
 for arg in "$@"; do
     [ "$arg" = "--release" ] && mode="ReleaseSmall"
 done
+
+mkdir -p build
 
 zig build-exe \
     -target wasm32-freestanding \
@@ -11,7 +14,7 @@ zig build-exe \
     -rdynamic \
     -O $mode \
     -mcpu=generic+atomics+bulk_memory+multivalue+nontrapping_fptoint+reference_types+sign_ext+simd128+relaxed_simd \
-    -femit-bin=build/lib.wasm \
+    -femit-bin=./build/lib.wasm \
     -fno-single-threaded \
     --import-memory \
     --shared-memory \
@@ -21,4 +24,4 @@ zig build-exe \
     --export=__tls_size \
     --export=__tls_align \
     --export=__wasm_init_tls \
-    src/index.zig
+    ./src/index.zig

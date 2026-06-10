@@ -1,3 +1,13 @@
+// Mirrors the codes returned by misc.zig's toErrorCode.
+export enum ErrorCode {
+    OutOfMemory = -1,
+    UnexpectedEof = -2,
+    InvalidData = -3,
+    NotSupported = -4,
+    InvalidState = -5,
+    Overflow = -6,
+}
+
 export class OutOfMemoryError extends Error {
     constructor(message = 'The decoder ran out of memory.') {
         super(message);
@@ -33,15 +43,22 @@ export class InvalidStateError extends Error {
     }
 }
 
+export class DecoderClosedError extends Error {
+    constructor(message = 'The decoder has been closed.') {
+        super(message);
+        this.name = 'DecoderClosedError';
+    }
+}
+
 export const createErrorFromCodeAndMessage = (code: number, message?: string) => {
     switch (code) {
-        case -1: return new OutOfMemoryError(message);
-        case -2: return new UnexpectedEofError(message);
-        case -3: return new InvalidDataError(message);
-        case -4: return new NotSupportedError(message);
-        case -5: return new InvalidStateError(message);
+        case ErrorCode.OutOfMemory: return new OutOfMemoryError(message);
+        case ErrorCode.UnexpectedEof: return new UnexpectedEofError(message);
+        case ErrorCode.InvalidData: return new InvalidDataError(message);
+        case ErrorCode.NotSupported: return new NotSupportedError(message);
+        case ErrorCode.InvalidState: return new InvalidStateError(message);
         // Overflow is just another flavor of invalid data
-        case -6: return new InvalidDataError(message ?? 'Unexpected integer overflow.');
+        case ErrorCode.Overflow: return new InvalidDataError(message ?? 'Unexpected integer overflow.');
         default: throw new Error(`Unhandled error code: ${code}`);
     }
 };

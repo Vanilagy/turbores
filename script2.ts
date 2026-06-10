@@ -34,7 +34,7 @@ for (let i = 0; i < fileIters; i++) {
         if (result instanceof Error) {
             throw result;
         }
-    
+
         //console.log(result)
     
         total++;
@@ -56,7 +56,7 @@ for (let i = 0; i < fileIters; i++) {
         ctx!.drawImage(frame, 0, 0);
         frame.close();
 
-        break;
+        //break;
     }
 }
 

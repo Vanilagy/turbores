@@ -1,3 +1,4 @@
+import initWasm from '../build/lib.wasm?init';
 import { decodeUtf8 } from "./misc";
 
 export type WasmExports = {
@@ -12,7 +13,7 @@ export type WasmExports = {
     allocateThreadLocalState: (size: number, alignment: number) => number;
     startWorker: () => never;
     getWaitWordAddress: (decoder: number) => number;
-    createDecoder: () => number;
+    createDecoder: (concurrency: number) => number;
     closeDecoder: (decoder: number) => void;
     allocatePacket: (decoder: number, size: number) => number;
     decodePacket: (decoder: number) => number;
@@ -34,7 +35,7 @@ export type WasmExports = {
 };
 
 export const initWasmModule = async (memory: WebAssembly.Memory) => {
-    const module = await WebAssembly.instantiateStreaming(fetch(new URL('../build/lib.wasm', import.meta.url)), {
+    const instance = await initWasm({
         env: {
             memory,
             externPrint: (offset: number, length: number) => {
@@ -44,6 +45,6 @@ export const initWasmModule = async (memory: WebAssembly.Memory) => {
         },
     });
 
-    return module.instance.exports as unknown as WasmExports;
+    return instance.exports as unknown as WasmExports;
 };
 

@@ -6,11 +6,20 @@ export type Runtime = {
     workers: Worker[];
 }
 
-let runtimePromise: Promise<Runtime> | null = null;
+export const canUseSharedMemory = typeof SharedArrayBuffer !== 'undefined';
 
-export const getRuntime = () => {
-    return runtimePromise ??= initRuntime();
+export const getConcurrency = async (): Promise<number> => {
+    if (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) {
+        return navigator.hardwareConcurrency;
+    }
+
+    // Fallback for server-side environments without `navigator`
+    const os = await import('node:os');
+    return os.availableParallelism?.() ?? os.cpus().length;
 };
+
+let runtimePromise: Promise<Runtime> | null = null;
+export const getRuntime = () => runtimePromise ??= initRuntime();
 
 const initRuntime = async (): Promise<Runtime> => {
     const memory = new WebAssembly.Memory({ initial: 32, maximum: 65536, shared: true });
@@ -28,11 +37,14 @@ const initRuntime = async (): Promise<Runtime> => {
         self === window;
     exports.setIsBrowserMainThread(Number(isBrowserMainThread));
 
-    const concurrency = navigator.hardwareConcurrency;
-    const workers: Worker[] = [];
-    const ready: Promise<void>[] = [];
+    return { memory, exports, workers: [] };
+};
 
-    for (let i = 0; i < concurrency; i++) {
+export const ensureWorkers = (runtime: Runtime, count: number) => {
+    const { memory, exports, workers } = runtime;
+
+    // Add however many workers are missing
+    while (workers.length < count) {
         const stackPointer = exports.allocateWorkerStack();
         const tlsPointer = exports.allocateThreadLocalState(exports.__tls_size.value, exports.__tls_align.value);
         if (stackPointer === 0 || tlsPointer === 0) {
@@ -40,13 +52,8 @@ const initRuntime = async (): Promise<Runtime> => {
         }
 
         const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
-        worker.postMessage({ memory, stackPointer, tlsPointer });
+        worker.postMessage({ type: 'shared-worker', memory, stackPointer, tlsPointer });
 
         workers.push(worker);
-        ready.push(new Promise(resolve => worker.addEventListener('message', () => resolve(), { once: true })));
     }
-
-    await Promise.all(ready);
-
-    return { memory, exports, workers };
 };

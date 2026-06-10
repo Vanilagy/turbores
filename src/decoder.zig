@@ -44,6 +44,7 @@ pub const Decoder = struct {
     color_primaries: u32,
     color_transfer: u32,
     color_matrix: u32,
+    concurrency: u32,
     tasks: []DecodeTask,
     running_task_count: std.atomic.Value(u32),
     wait_word: u32,
@@ -68,7 +69,7 @@ pub const DecodeTask = struct {
     error_message: ?[]const u8,
 };
 
-export fn createDecoder() ?*Decoder {
+export fn createDecoder(concurrency: u32) ?*Decoder {
     const result = gpa.create(Decoder) catch return null;
 
     result.* = .{
@@ -91,6 +92,7 @@ export fn createDecoder() ?*Decoder {
         .color_primaries = undefined,
         .color_transfer = undefined,
         .color_matrix = undefined,
+        .concurrency = concurrency,
         .tasks = &.{},
         .running_task_count = .init(0),
         .wait_word = 0,
@@ -419,27 +421,44 @@ inline fn decodePacketInternal(decoder: *Decoder) misc.ConvertibleError!void {
         return error.UnexpectedEof;
     }
 
+    const task_count = decoder.concurrency;
+
+    if (task_count == 0) {
+        // Synchronous, just decode right here right now
+        var task = DecodeTask{
+            .decoder = decoder,
+            .slice_start = 0,
+            .slice_count = total_slices,
+            .error_message = null,
+        };
+
+        executeDecodeTask(&task) catch |err| {
+            decoder.error_message = task.error_message;
+            return err;
+        };
+
+        return;
+    }
+
     misc.lockMutex(&worker.worker_task_queue_mutex);
     defer worker.worker_task_queue_mutex.unlock(io);
 
-    const num_workers_val = worker.num_workers.load(.seq_cst);
-
-    decoder.tasks = try gpa.realloc(decoder.tasks, num_workers_val);
+    decoder.tasks = try gpa.realloc(decoder.tasks, task_count);
 
     var slice_start_index: usize = 0;
     var remaining_size = total_slice_size + total_slices * fixed_cost_per_slice;
 
-    // Distribute the slices to the workers mostly evenly based on size: larger slices (with more bytes) take longer to
-    // decode, so in an effort to make sure every worker has roughly the same amount of work to do, we distribute based
-    // on slice size.
-    for (0..num_workers_val) |i| {
+    // Split the work into `task_count` jobs, distributed mostly evenly by slice size: larger slices (with more
+    // bytes) take longer to decode, so this aims to give every job roughly the same amount of work. The jobs are
+    // dispatched to the worker pool, which is assumed to exist (or come online) to eat through them.
+    for (0..task_count) |i| {
         const start_index = slice_start_index;
 
-        if (i == num_workers_val - 1) {
-            // Last worker takes everything left
+        if (i == task_count - 1) {
+            // Last job takes everything left
             slice_start_index = total_slices;
         } else {
-            const target = remaining_size / (num_workers_val - i);
+            const target = remaining_size / (task_count - i);
             var current_size: usize = 0;
 
             while (slice_start_index < total_slices) {
@@ -476,9 +495,9 @@ inline fn decodePacketInternal(decoder: *Decoder) misc.ConvertibleError!void {
         });
     }
 
-    io.futexWake(u32, &worker.worker_task_queue.len, num_workers_val);
+    io.futexWake(u32, &worker.worker_task_queue.len, task_count);
 
-    decoder.running_task_count.store(num_workers_val, .seq_cst);
+    decoder.running_task_count.store(task_count, .seq_cst);
 }
 
 export fn finalizePacketDecoding(decoder: *Decoder) i32 {
