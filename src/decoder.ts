@@ -104,10 +104,11 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
 
         if (options.useSharedMemory && !canUseSharedMemory) {
             return new NotSupportedError(
-                'Shared memory is not available in this environment, so useSharedMemory: true cannot be used. '
-                + 'To enable it, serve the page cross-origin isolated by setting the '
-                + 'Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp response '
-                + 'headers. Otherwise, pass useSharedMemory: false to use the worker-based path.',
+                'Shared memory is not available in this environment, so useSharedMemory: true cannot be used.\n'
+                + 'Since it provides way better performance, you should enable it by serving the page cross-origin '
+                + 'isolated by setting the Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: '
+                + 'require-corp response headers.\nOtherwise, pass useSharedMemory: false to use a slower, '
+                + 'worker-based fallback.',
             );
         }
 
