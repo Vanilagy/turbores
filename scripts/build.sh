@@ -11,3 +11,5 @@ npx vite build
 
 npx tsc -p src
 cp build/*.d.ts dist/
+
+npm run check-docblocks

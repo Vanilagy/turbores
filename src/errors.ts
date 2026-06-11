@@ -16,6 +16,7 @@ export enum ErrorCode {
     Overflow = -6,
 }
 
+/** An error caused by an allocation failure. */
 export class OutOfMemoryError extends Error {
     constructor(message = 'The decoder ran out of memory.') {
         super(message);
@@ -23,13 +24,15 @@ export class OutOfMemoryError extends Error {
     }
 }
 
+/** An error caused by the packet ending before the decoder expected it to. */
 export class UnexpectedEofError extends Error {
-    constructor(message = 'The packet ended before the decoder expected it to.') {
+    constructor(message = 'Invalid data: the packet ended before the decoder expected it to.') {
         super(message);
         this.name = 'UnexpectedEofError';
     }
 }
 
+/** An error caused by the packet containing invalid or corrupted data. */
 export class InvalidDataError extends Error {
     constructor(message = 'The packet contains invalid data.') {
         super(message);
@@ -37,6 +40,7 @@ export class InvalidDataError extends Error {
     }
 }
 
+/** An error caused by the packet using a feature that the decoder doesn't support. */
 export class NotSupportedError extends Error {
     constructor(message = 'The packet uses a feature that is not supported.') {
         super(message);
@@ -44,13 +48,15 @@ export class NotSupportedError extends Error {
     }
 }
 
+/** An error caused by the decoder being in an invalid internal state. */
 export class InvalidStateError extends Error {
-    constructor(message = 'The decoder is in an invalid state.') {
+    constructor(message = 'The decoder is in an invalid internal state. This should never happen! Please report.') {
         super(message);
         this.name = 'InvalidStateError';
     }
 }
 
+/** An error caused by an operation being attempted on a closed decoder. */
 export class DecoderClosedError extends Error {
     constructor(message = 'The decoder has been closed.') {
         super(message);
