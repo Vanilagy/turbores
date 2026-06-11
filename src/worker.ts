@@ -1,3 +1,11 @@
+/*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
 import { buildDecodeResult } from './decoder';
 import { ErrorCode } from './errors';
 import { assert, decodeUtf8 } from './misc';
@@ -9,6 +17,7 @@ let standaloneState: {
     decoder: number;
 } | null = null;
 
+// eslint-disable-next-line @typescript-eslint/no-misused-promises
 self.addEventListener('message', async (event) => {
     const message = event.data as WorkerMessage;
 
@@ -53,11 +62,11 @@ self.addEventListener('message', async (event) => {
         case 'decode': {
             assert(standaloneState);
             const { exports, memory, decoder } = standaloneState;
-            const packet = message.packet;
+            const { id, packet } = message;
 
             const packetPtr = exports.allocatePacket(decoder, packet.byteLength);
             if (packetPtr === 0) {
-                self.postMessage({ type: 'decode-error', code: ErrorCode.OutOfMemory });
+                self.postMessage({ type: 'decode-error', id, code: ErrorCode.OutOfMemory });
                 return;
             }
             new Uint8Array(memory.buffer).set(packet, packetPtr);
@@ -71,7 +80,7 @@ self.addEventListener('message', async (event) => {
                     errorMessage = decodeUtf8(new Uint8Array(memory.buffer, messagePtr, size));
                 }
 
-                self.postMessage({ type: 'decode-error', code, message: errorMessage });
+                self.postMessage({ type: 'decode-error', id, code, message: errorMessage });
                 return;
             }
 
@@ -79,10 +88,10 @@ self.addEventListener('message', async (event) => {
             result.frameData = result.frameData.slice();
 
             self.postMessage(
-                { type: 'decoded', result },
+                { type: 'decoded', id, result },
                 { transfer: [result.frameData.buffer] },
             );
-            
+
             return;
         }
     }
@@ -94,11 +103,11 @@ import type { DecodeResult } from './decoder';
 export type WorkerMessage =
     | { type: 'shared-worker'; memory: WebAssembly.Memory; stackPointer: number; tlsPointer: number }
     | { type: 'standalone-init' }
-    | { type: 'decode'; packet: Uint8Array };
+    | { type: 'decode'; id: number; packet: Uint8Array };
 
 // Message sent from the worker
 export type WorkerReply =
     | { type: 'ready' }
     | { type: 'init-error'; message: string }
-    | { type: 'decoded'; result: DecodeResult }
-    | { type: 'decode-error'; code: number; message?: string };
+    | { type: 'decoded'; id: number; result: DecodeResult }
+    | { type: 'decode-error'; id: number; code: number; message?: string };

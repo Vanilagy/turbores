@@ -1,3 +1,9 @@
+// Copyright (c) 2026-present, Vanilagy and contributors
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Copied from std lib to remove multithreading restriction. The allocator itself isn't thread-safe, but since we wrap
 //! every call in a mutex, we're good.
 //!

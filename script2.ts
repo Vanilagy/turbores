@@ -1,7 +1,7 @@
 import { ALL_FORMATS, EncodedPacketSink, Input, UrlSource } from 'mediabunny';
-import { createDecoder } from './src/index';
+import { Decoder } from './src/index';
 
-const decoder = await createDecoder({});
+const decoder = await Decoder.create({ useSharedMemory: false });
 if (decoder instanceof Error) {
     throw decoder;
 }

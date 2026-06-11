@@ -11,10 +11,6 @@
     // Bundler mode
     "moduleResolution": "bundler",
     "verbatimModuleSyntax": true,
-    "declaration": true,
-    "outDir": "./build",
-    "rootDir": "./src",
-    "emitDeclarationOnly": true,
 
     // Best practices
     "strict": true,
@@ -22,8 +18,9 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
-    
+    "noEmit": true,
+
     "types": ["node", "vite/client"],
   },
-  "include": ["./src/**/*.ts"],
+  "include": ["scripts/**/*.ts", "vite.config.ts"],
 }

@@ -1,4 +1,20 @@
-import { createErrorFromCodeAndMessage, DecoderClosedError, InvalidDataError, InvalidStateError, NotSupportedError, OutOfMemoryError, UnexpectedEofError } from './errors';
+/*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+import {
+    createErrorFromCodeAndMessage,
+    DecoderClosedError,
+    InvalidDataError,
+    InvalidStateError,
+    NotSupportedError,
+    OutOfMemoryError,
+    UnexpectedEofError,
+} from './errors';
 import { assert, decodeUtf8 } from './misc';
 import { canUseSharedMemory, ensureWorkers, getConcurrency, getRuntime, type Runtime } from './runtime';
 import type { WasmExports } from './wasm';
@@ -23,15 +39,129 @@ export type DecodeResult = {
     colorTransfer: number;
     colorMatrix: number;
     colorRangeFull: boolean;
-}
+};
 
 export type DecodeOptions = {
     transfer?: boolean;
 };
 
+export type DecoderOptions = {
+    useSharedMemory: boolean;
+    concurrency?: number;
+};
+
 export abstract class Decoder implements Disposable, AsyncDisposable {
-    private _closed = false;
-    private queue: Promise<unknown> = Promise.resolve();
+    /** @internal */
+    _closed = false;
+    /** @internal */
+    _queue: Promise<unknown> = Promise.resolve();
+    /** @internal */
+    readonly _concurrentDecode: boolean;
+    /** @internal */
+    _decodeQueueSize = 0;
+    /** @internal */
+    _dequeuedResolve!: () => void;
+    /** @internal */
+    _dequeued = new Promise<void>((resolve) => {
+        this._dequeuedResolve = resolve;
+    });
+
+    protected constructor(concurrentDecode = false) {
+        this._concurrentDecode = concurrentDecode;
+    }
+
+    get decodeQueueSize() {
+        return this._decodeQueueSize;
+    }
+
+    get dequeued() {
+        return this._dequeued;
+    }
+
+    /** @internal */
+    _markDequeued() {
+        this._decodeQueueSize--;
+
+        this._dequeuedResolve();
+        this._dequeued = new Promise<void>((resolve) => {
+            this._dequeuedResolve = resolve;
+        });
+    }
+
+    static async create(options: DecoderOptions) {
+        if (typeof options !== 'object' || !options) {
+            throw new TypeError('options must be an object.');
+        }
+        if (typeof options.useSharedMemory !== 'boolean') {
+            throw new TypeError('options.useSharedMemory must be a boolean.');
+        }
+        if (
+            options.concurrency !== undefined
+            && (!Number.isInteger(options.concurrency) || options.concurrency < 0)
+        ) {
+            throw new TypeError('options.concurrency, when provided, must be a non-negative integer.');
+        }
+
+        if (options.useSharedMemory && !canUseSharedMemory) {
+            return new NotSupportedError(
+                'Shared memory is not available in this environment, so useSharedMemory: true cannot be used. '
+                + 'To enable it, serve the page cross-origin isolated by setting the '
+                + 'Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp response '
+                + 'headers. Otherwise, pass useSharedMemory: false to use the worker-based path.',
+            );
+        }
+
+        const concurrency = options.concurrency ?? await getConcurrency();
+
+        // Concurrency 0 means synchronous decoding on the calling thread
+        if (options.useSharedMemory || concurrency === 0) {
+            const runtime = await getRuntime();
+            ensureWorkers(runtime, concurrency);
+
+            const decoderPtr = runtime.exports.createDecoder(concurrency);
+            if (decoderPtr === 0) {
+                return new OutOfMemoryError();
+            }
+
+            return new SharedMemoryDecoder(runtime, decoderPtr, concurrency) as Decoder;
+        }
+
+        // No shared memory: spin up an independent pool of `concurrency` workers
+        const results = await Promise.all(
+            Array.from({ length: concurrency }, async () => {
+                const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+
+                const reply = await new Promise<WorkerReply>((resolve) => {
+                    worker.addEventListener('message', event => resolve(event.data as WorkerReply), { once: true });
+                    worker.postMessage({ type: 'standalone-init' } satisfies WorkerMessage);
+                });
+
+                if (reply.type === 'init-error') {
+                    worker.terminate();
+                    return new OutOfMemoryError(reply.message);
+                }
+
+                return worker;
+            }),
+        );
+
+        const failure = results.find((result): result is OutOfMemoryError => result instanceof Error);
+        if (failure) {
+            for (const result of results) {
+                if (!(result instanceof Error)) {
+                    result.terminate();
+                }
+            }
+
+            return failure;
+        }
+
+        return new WorkerPoolDecoder(results as Worker[]) as Decoder;
+    }
+
+    static async sharedMemoryIsAvailable() {
+        return canUseSharedMemory;
+    }
 
     decode(packetData: Uint8Array, options: DecodeOptions = {}) {
         if (!(packetData instanceof Uint8Array)) {
@@ -48,8 +178,15 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
             return new DecoderClosedError();
         }
 
-        const promise = this.queue.then(() => this.runDecode(packetData, options));
-        this.queue = promise.catch(() => {});
+        this._decodeQueueSize++;
+        const start = () => {
+            this._markDequeued();
+            return this._runDecode(packetData, options);
+        };
+
+        const work = this._concurrentDecode ? start() : null;
+        const promise = this._queue.then(() => work ?? start());
+        this._queue = promise.catch(() => {});
 
         return promise;
     }
@@ -57,12 +194,12 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
     close() {
         if (this._closed) {
             // Idempotent, just resolve when the queue is done
-            return this.queue as Promise<void>;
+            return this._queue as Promise<void>;
         }
         this._closed = true;
 
-        const promise = this.queue.then(() => this.runClose());
-        this.queue = promise.catch(() => {});
+        const promise = this._queue.then(() => this._runClose());
+        this._queue = promise.catch(() => {});
 
         return promise;
     }
@@ -80,81 +217,90 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
         return this.close();
     }
 
-    protected abstract runDecode(packetData: Uint8Array, options: DecodeOptions): Promise<
+    /** @internal */
+    protected abstract _runDecode(packetData: Uint8Array, options: DecodeOptions): Promise<
         DecodeResult | OutOfMemoryError | UnexpectedEofError | InvalidDataError | NotSupportedError | InvalidStateError
     >;
-    protected abstract runClose(): void | Promise<void>;
+    /** @internal */
+    protected abstract _runClose(): void | Promise<void>;
 }
 
 // For automatic freeing of the WASM side
-const sharedDecoderRegistry = new FinalizationRegistry<{ runtime: Runtime; ptr: number }>(({ runtime, ptr }) => {
+const sharedMemoryDecoderRegistry = new FinalizationRegistry<{ runtime: Runtime; ptr: number }>(({ runtime, ptr }) => {
     runtime.exports.closeDecoder(ptr);
 });
 
 // Used when proper shared memory is available
-class SharedDecoder extends Decoder {
-    private runtime: Runtime | null;
-    private ptr: number;
-    private waitWordAddress: number;
-    // 0 means decodePacket runs synchronously in the main thread
-    private concurrency: number;
+class SharedMemoryDecoder extends Decoder {
+    /** @internal */
+    _runtime: Runtime | null;
+    /** @internal */
+    _ptr: number;
+    /** @internal */
+    _waitWordAddress: number;
+    /**
+     * 0 means decodePacket runs synchronously in the main thread
+     * @internal
+     */
+    _concurrency: number;
 
     constructor(runtime: Runtime, ptr: number, concurrency: number) {
         super();
-        this.runtime = runtime;
-        this.ptr = ptr;
-        this.waitWordAddress = runtime.exports.getWaitWordAddress(ptr);
-        this.concurrency = concurrency;
+        this._runtime = runtime;
+        this._ptr = ptr;
+        this._waitWordAddress = runtime.exports.getWaitWordAddress(ptr);
+        this._concurrency = concurrency;
 
-        sharedDecoderRegistry.register(this, { runtime, ptr }, this);
+        sharedMemoryDecoderRegistry.register(this, { runtime, ptr }, this);
     }
 
-    protected runClose() {
-        assert(this.runtime)
+    protected _runClose() {
+        assert(this._runtime);
 
-        sharedDecoderRegistry.unregister(this);
-        this.runtime.exports.closeDecoder(this.ptr);
+        sharedMemoryDecoderRegistry.unregister(this);
+        this._runtime.exports.closeDecoder(this._ptr);
 
-        this.runtime = null; // Allow it to get GCd if necessary
+        this._runtime = null; // Allow it to get GCd if necessary
     }
 
-    protected async runDecode(packetData: Uint8Array) {
-        assert(this.runtime);
-        const { exports, memory } = this.runtime;
+    protected async _runDecode(packetData: Uint8Array) {
+        assert(this._runtime);
+        const { exports, memory } = this._runtime;
 
-        const packetPtr = exports.allocatePacket(this.ptr, packetData.byteLength);
+        const packetPtr = exports.allocatePacket(this._ptr, packetData.byteLength);
         if (packetPtr === 0) {
             return new OutOfMemoryError();
         }
         new Uint8Array(memory.buffer).set(packetData, packetPtr);
 
-        let resultCode = exports.decodePacket(this.ptr);
+        let resultCode = exports.decodePacket(this._ptr);
         if (resultCode < 0) {
-            return this.createError(resultCode);
+            return this._createError(resultCode);
         }
 
-        if (this.concurrency > 0) {
+        if (this._concurrency > 0) {
             // Wait for all workers to finish
-            await Atomics.waitAsync(new Int32Array(memory.buffer), this.waitWordAddress / 4, 0).value;
+            await Atomics.waitAsync(new Int32Array(memory.buffer), this._waitWordAddress / 4, 0).value;
 
-            resultCode = exports.finalizePacketDecoding(this.ptr);
+            resultCode = exports.finalizePacketDecoding(this._ptr);
             if (resultCode < 0) {
-                return this.createError(resultCode);
+                return this._createError(resultCode);
             }
         }
 
-        return buildDecodeResult(exports, memory, this.ptr);
+        return buildDecodeResult(exports, memory, this._ptr);
     }
 
-    private createError(code: number) {
-        assert(this.runtime);
-        const { exports, memory } = this.runtime;
+    /** @internal */
+    _createError(code: number) {
+        assert(this._runtime);
+        const { exports, memory } = this._runtime;
 
         let errorMessage: string | undefined = undefined;
 
-        const messagePtr = exports.getErrorMessagePtr(this.ptr);
+        const messagePtr = exports.getErrorMessagePtr(this._ptr);
         if (messagePtr !== 0) {
-            const size = exports.getErrorMessageSize(this.ptr);
+            const size = exports.getErrorMessageSize(this._ptr);
             errorMessage = decodeUtf8(new Uint8Array(memory.buffer, messagePtr, size));
         }
 
@@ -162,39 +308,75 @@ class SharedDecoder extends Decoder {
     }
 }
 
-// Used when shared memory is not available
-class StandaloneDecoder extends Decoder {
-    private worker: Worker;
+// Used when shared memory is not available. Each worker owns an independent decoder, and packets
+// are spread across them so multiple can decode in parallel.
+class WorkerPoolDecoder extends Decoder {
+    /** @internal */
+    _workers: Worker[];
+    /**
+     * How many packets each worker currently has in flight
+     * @internal
+     */
+    _workerLoad: number[];
+    /** @internal */
+    _nextRequestId = 0;
 
-    constructor(worker: Worker) {
-        super();
-        this.worker = worker;
+    constructor(workers: Worker[]) {
+        super(true);
+        this._workers = workers;
+        this._workerLoad = workers.map(() => 0);
     }
 
-    protected runClose() {
-        this.worker.terminate();
+    protected _runClose() {
+        for (const worker of this._workers) {
+            worker.terminate();
+        }
     }
 
-    protected runDecode(packetData: Uint8Array, options: DecodeOptions) {
-        const packet = options?.transfer ? packetData : packetData.slice();
+    protected _runDecode(packetData: Uint8Array, options: DecodeOptions) {
+        const packet = options.transfer ? packetData : packetData.slice();
+
+        // Hand the packet to the first worker with the lowest load
+        let workerIndex = 0;
+        for (let i = 1; i < this._workerLoad.length; i++) {
+            if (this._workerLoad[i]! < this._workerLoad[workerIndex]!) {
+                workerIndex = i;
+            }
+        }
+
+        const worker = this._workers[workerIndex]!;
+        this._workerLoad[workerIndex] = this._workerLoad[workerIndex]! + 1;
+
+        const id = this._nextRequestId++;
 
         return new Promise<
             | DecodeResult | OutOfMemoryError | UnexpectedEofError
             | InvalidDataError | NotSupportedError | InvalidStateError
-        >(resolve => {
-            this.worker.postMessage(
-                { type: 'decode', packet } satisfies WorkerMessage,
+        >((resolve) => {
+            worker.postMessage(
+                { type: 'decode', id, packet } satisfies WorkerMessage,
                 { transfer: [packet.buffer] },
             );
 
-            this.worker.addEventListener('message', (event) => {
+            const onMessage = (event: MessageEvent) => {
                 const reply = event.data as WorkerReply;
+                if (reply.type !== 'decoded' && reply.type !== 'decode-error') {
+                    return;
+                }
+                if (reply.id !== id) {
+                    return;
+                }
+
+                worker.removeEventListener('message', onMessage);
+                this._workerLoad[workerIndex]!--;
+
                 if (reply.type === 'decode-error') {
                     resolve(createErrorFromCodeAndMessage(reply.code, reply.message));
-                } else if (reply.type === 'decoded') {
+                } else {
                     resolve(reply.result);
                 }
-            }, { once: true });
+            };
+            worker.addEventListener('message', onMessage);
         });
     }
 }
@@ -221,66 +403,4 @@ export const buildDecodeResult = (exports: WasmExports, memory: WebAssembly.Memo
         colorMatrix: exports.getColorMatrix(ptr),
         colorRangeFull: false, // Always limited range, but expose it for clarity
     };
-};
-
-let warnedAboutMissingHeaders = false;
-
-export type DecoderOptions = {
-    threaded?: boolean;
-    concurrency?: number;
-};
-
-export const createDecoder = async (options: DecoderOptions = {}) => {
-    if (typeof options !== 'object' || !options) {
-        throw new TypeError('options must be an object.');
-    }
-    if (options.threaded !== undefined && typeof options.threaded !== 'boolean') {
-        throw new TypeError('options.threaded, when provided, must be a boolean.');
-    }
-    if (options.concurrency !== undefined
-        && (!Number.isInteger(options.concurrency) || options.concurrency <= 0)) {
-        throw new TypeError('options.concurrency, when provided, must be a positive integer.');
-    }
-
-    const threaded = options.threaded ?? true;
-
-    if (threaded && !canUseSharedMemory) {
-        // Can't do shared memory, so fall back to a single-worker approach
-        if (!warnedAboutMissingHeaders) {
-            warnedAboutMissingHeaders = true;
-            console.warn(
-                'SharedArrayBuffer is unavailable, so decoding falls back to the slow path. '
-                + 'For massively increased performance, serve the page cross-origin isolated by setting the '
-                + 'Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp headers.',
-            );
-        }
-
-        const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
-
-        const reply = await new Promise<WorkerReply>(resolve => {
-            worker.addEventListener('message', event => resolve(event.data as WorkerReply), { once: true });
-            worker.postMessage({ type: 'standalone-init' } satisfies WorkerMessage);
-        });
-
-        if (reply.type === 'init-error') {
-            worker.terminate();
-            return new OutOfMemoryError(reply.message);
-        }
-
-        return new StandaloneDecoder(worker);
-    }
-
-    const concurrency = threaded
-        ? (options.concurrency ?? await getConcurrency())
-        : 0; // Also uses the core runtime, just with zero workers which is fine
-
-    const runtime = await getRuntime();
-    ensureWorkers(runtime, concurrency);
-
-    const decoderPtr = runtime.exports.createDecoder(concurrency);
-    if (decoderPtr === 0) {
-        return new OutOfMemoryError();
-    }
-
-    return new SharedDecoder(runtime, decoderPtr, concurrency);
 };

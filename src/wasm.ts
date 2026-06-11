@@ -1,11 +1,19 @@
+/*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
 import initWasm from '../build/lib.wasm?init';
-import { decodeUtf8 } from "./misc";
+import { decodeUtf8 } from './misc';
 
 export type WasmExports = {
-    __stack_pointer: WebAssembly.Global;
-    __tls_align: WebAssembly.Global;
-    __tls_base: WebAssembly.Global;
-    __tls_size: WebAssembly.Global;
+    __stack_pointer: WebAssembly.Global<'i32'>;
+    __tls_align: WebAssembly.Global<'i32'>;
+    __tls_base: WebAssembly.Global<'i32'>;
+    __tls_size: WebAssembly.Global<'i32'>;
     __wasm_init_tls: (ptr: number) => void;
 
     setIsBrowserMainThread: (value: number) => void;
@@ -47,4 +55,3 @@ export const initWasmModule = async (memory: WebAssembly.Memory) => {
 
     return instance.exports as unknown as WasmExports;
 };
-

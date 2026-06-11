@@ -1,3 +1,11 @@
+/*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
 import { AsyncMutex } from './misc';
 import { initWasmModule, type WasmExports } from './wasm';
 
@@ -5,7 +13,7 @@ export type Runtime = {
     memory: WebAssembly.Memory;
     exports: WasmExports;
     workers: Worker[];
-}
+};
 
 const runtimeFinalizationRegistry = new FinalizationRegistry((workers: Worker[]) => {
     for (const worker of workers) {
@@ -38,10 +46,10 @@ export const getRuntime = async () => {
                 return runtime;
             }
         }
-    
+
         const runtime = await initRuntime();
         runtimeRef = new WeakRef(runtime);
-    
+
         return runtime;
     } finally {
         release();
@@ -58,10 +66,10 @@ const initRuntime = async () => {
     }
     exports.__wasm_init_tls(mainThreadTls);
 
-    const isBrowserMainThread =
-        typeof window !== "undefined" &&
-        typeof document !== "undefined" &&
-        self === window;
+    const isBrowserMainThread
+        = typeof window !== 'undefined'
+            && typeof document !== 'undefined'
+            && self === window;
     exports.setIsBrowserMainThread(Number(isBrowserMainThread));
 
     const result: Runtime = { memory, exports, workers: [] };
