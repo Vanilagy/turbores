@@ -10,12 +10,12 @@ export {
     Decoder,
     type DecoderOptions,
     type DecodeOptions,
-} from './decoder';
+} from './decoder.js';
 export {
     Frame,
     type FilledFrame,
     type PixelFormat,
-} from './frame';
+} from './frame.js';
 export {
     OutOfMemoryError,
     UnexpectedEofError,
@@ -24,4 +24,4 @@ export {
     InvalidStateError,
     DecoderClosedError,
     FrameLockedError,
-} from './errors';
+} from './errors.js';

@@ -8,10 +8,10 @@
 
 import type { Transferable as NodeTransferable, Worker as NodeWorker } from 'node:worker_threads';
 import wasmBinaryString from '../build/lib.wasm?inline-binary';
-import { OutOfMemoryError } from './errors';
-import { MessageType, type WorkerMessage, type WorkerReply } from './messages';
-import { AsyncMutex } from './misc';
-import { initWasmModule, type WasmExports } from './wasm';
+import { OutOfMemoryError } from './errors.js';
+import { MessageType, type WorkerMessage, type WorkerReply } from './messages.js';
+import { AsyncMutex } from './misc.js';
+import { initWasmModule, type WasmExports } from './wasm.js';
 import workerSource from './worker?inline-worker';
 
 let wasmBinary: Uint8Array<ArrayBuffer> | null = null;

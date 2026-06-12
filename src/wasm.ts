@@ -6,7 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { decodeUtf8 } from './misc';
+import { decodeUtf8 } from './misc.js';
 
 export type WasmExports = {
     __stack_pointer: WebAssembly.Global<'i32'>;

@@ -6,11 +6,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { ErrorCode } from './errors';
-import { readFrameContents } from './frame';
-import { MessageType, type WorkerMessage, type WorkerReply } from './messages';
-import { assert, decodeUtf8 } from './misc';
-import { initWasmModule, type WasmExports } from './wasm';
+import { ErrorCode } from './errors.js';
+import { readFrameContents } from './frame.js';
+import { MessageType, type WorkerMessage, type WorkerReply } from './messages.js';
+import { assert, decodeUtf8 } from './misc.js';
+import { initWasmModule, type WasmExports } from './wasm.js';
 
 let messagePassingState: {
     exports: WasmExports;

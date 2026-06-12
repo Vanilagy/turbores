@@ -15,17 +15,17 @@ import {
     NotSupportedError,
     OutOfMemoryError,
     UnexpectedEofError,
-} from './errors';
-import { Frame, readFrameContents, type FilledFrame } from './frame';
-import { MessageType, type WorkerMessage, type WorkerReply } from './messages';
-import { assert, canUseSharedMemory, decodeUtf8 } from './misc';
+} from './errors.js';
+import { Frame, readFrameContents, type FilledFrame } from './frame.js';
+import { MessageType, type WorkerMessage, type WorkerReply } from './messages.js';
+import { assert, canUseSharedMemory, decodeUtf8 } from './misc.js';
 import {
     getConcurrency,
     getSharedMemoryRuntime,
     getMessagePassingRuntime,
     type SharedMemoryRuntime,
     type MessagePassingRuntime,
-} from './runtime';
+} from './runtime.js';
 
 /** Per-packet decode options. */
 export type DecodeOptions = {
@@ -168,7 +168,7 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
     }
 
     /** Whether the environment supports proper shared-memory multithreading. */
-    static async sharedMemoryIsAvailable() {
+    static sharedMemoryIsAvailable() {
         return canUseSharedMemory;
     }
 

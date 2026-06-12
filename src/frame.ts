@@ -6,10 +6,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { FrameLockedError } from './errors';
-import { assert } from './misc';
-import type { SharedMemoryRuntime } from './runtime';
-import type { WasmExports } from './wasm';
+import { FrameLockedError } from './errors.js';
+import { assert } from './misc.js';
+import type { SharedMemoryRuntime } from './runtime.js';
+import type { WasmExports } from './wasm.js';
 
 // Provide polyfills if needed
 // @ts-expect-error Readonly

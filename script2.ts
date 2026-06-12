@@ -1,14 +1,14 @@
 import { ALL_FORMATS, EncodedPacketSink, FilePathSource, Input, UrlSource } from 'mediabunny';
 import { Decoder, Frame } from './src/index';
 
-const decoder = await Decoder.create({ useSharedMemory: true });
+const decoder = await Decoder.create({ useSharedMemory: false });
 if (decoder instanceof Error) {
     throw decoder;
 }
 
-//const canvas = document.createElement('canvas');
-//document.body.append(canvas);
-//const ctx = canvas.getContext('2d');
+const canvas = document.createElement('canvas');
+document.body.append(canvas);
+const ctx = canvas.getContext('2d');
 
 const input = new Input({
     source: new UrlSource('./IMG_0159-prores-hdr.MOV'),
@@ -41,7 +41,7 @@ for (let i = 0; i < fileIters; i++) {
 
         total++;
 
-        break;
+        //break;
 
         canvas.width = result.displayWidth;
         canvas.height = result.displayHeight;
@@ -58,9 +58,9 @@ for (let i = 0; i < fileIters; i++) {
         ctx!.drawImage(videoFrame, 0, 0);
         videoFrame.close();
 
-        //break;
+        break;
     }
 }
 
 console.log(packetDatas.length, (performance.now() - start) / total);
-alert((performance.now() - start) / total);
+//alert((performance.now() - start) / total);

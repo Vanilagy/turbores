@@ -9,10 +9,12 @@ import {
     InvalidDataError,
     NotSupportedError,
     UnexpectedEofError,
-} from '../src/index';
+} from '../src/index.js';
 
 describe('Decoding', () => {
     test('Full HD 422 frame', async () => {
+        expect(Decoder.sharedMemoryIsAvailable()).toBe(true);
+
         const decoder = await Decoder.create({ useSharedMemory: true, concurrency: 0 });
         if (decoder instanceof Error) {
             throw decoder;

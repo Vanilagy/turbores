@@ -6,7 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import type { FrameContents } from './frame';
+import type { FrameContents } from './frame.js';
 
 export enum MessageType {
     SharedMemoryInit,
