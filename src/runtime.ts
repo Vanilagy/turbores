@@ -7,7 +7,6 @@
  */
 
 import type { Transferable as NodeTransferable, Worker as NodeWorker } from 'node:worker_threads';
-
 import wasmBinaryString from '../build/lib.wasm?inline-binary';
 import { OutOfMemoryError } from './errors';
 import { AsyncMutex } from './misc';

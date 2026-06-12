@@ -48,6 +48,8 @@ export type DecoderOptions = {
      *
      * If you cannot set these headers, use `false` as a fallback. The decoder will still use multithreading but each
      * packet is only decoded by a single worker and more data has to be copied, meaning throughput and latency suffer.
+     *
+     * If you don't know ahead of time and want to be environment-agnostic, use `Decoder.canUseSharedMemory`.
      */
     useSharedMemory: boolean;
     /**

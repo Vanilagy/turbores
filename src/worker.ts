@@ -194,8 +194,8 @@ const sendMessage = (message: WorkerReply, transferables?: Transferable[]) => {
     }
 };
 
-// This file runs both as a web worker (browser, Deno) and as a node:worker_threads worker
-// (Node, Bun), so hook up whichever messaging API the environment provides
+// This file runs both as a web worker (browser, Deno) and as a node:worker_threads worker (Node, Bun), so hook up
+// whichever messaging API the environment provides
 let parentPort: {
     postMessage: (data: unknown, transferables?: Transferable[]) => void;
     on: (event: string, listener: (data: never) => void) => void;
