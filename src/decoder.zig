@@ -11,6 +11,7 @@ const io = misc.io;
 const worker = @import("./worker.zig");
 
 const S = [_]f32{
+    // The "8" bakes in three halving steps that we then don't need to do anymore in the IDCT
     8 * 0.353553390593273762200422,
     8 * 0.254897789552079584470970,
     8 * 0.270598050073098492199862,
