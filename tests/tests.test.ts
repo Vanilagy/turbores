@@ -39,6 +39,7 @@ describe('Decoding', () => {
         expect(frame.colorTransfer).toBe(1);
         expect(frame.colorMatrix).toBe(1);
         expect(frame.colorRangeFull).toBe(false);
+        expect(frame.scanType).toBe('progressive');
         expect(frame.frameData!.byteLength).toBe(1920 * 1088 * 2 * 2);
         const reference = new Uint8Array(gunzipSync(readFileSync(
             new URL('./public/buck-bunny.framedata.gz', import.meta.url),
@@ -68,6 +69,7 @@ describe('Decoding', () => {
         expect(frame.codedWidth).toBe(1904);
         expect(frame.codedHeight).toBe(1088);
         expect(frame.pixelFormat).toBe('I422P10');
+        expect(frame.scanType).toBe('progressive');
         expect(frame.frameData!.byteLength).toBe(1904 * 1088 * 2 * 2);
         const reference = new Uint8Array(gunzipSync(readFileSync(
             new URL('./public/buck-bunny-1904.framedata.gz', import.meta.url),
@@ -90,6 +92,7 @@ describe('Decoding', () => {
         expect(frame.visibleWidth).toBe(1904);
         expect(frame.visibleHeight).toBe(1080);
         expect(frame.pixelFormat).toBe('I444P10');
+        expect(frame.scanType).toBe('progressive');
         expect(frame.frameData!.byteLength).toBe(1904 * 1088 * 3 * 2);
         const reference = new Uint8Array(gunzipSync(readFileSync(
             new URL('./public/buck-bunny-444.framedata.gz', import.meta.url),
@@ -115,6 +118,7 @@ describe('Decoding', () => {
         expect(frame.colorPrimaries).toBe(2);
         expect(frame.colorTransfer).toBe(2);
         expect(frame.colorMatrix).toBe(2);
+        expect(frame.scanType).toBe('progressive');
         expect(frame.frameData!.byteLength).toBe(1904 * 1088 * 4 * 2);
         const reference = new Uint8Array(gunzipSync(readFileSync(
             new URL('./public/transparent-2.framedata.gz', import.meta.url),
@@ -137,9 +141,35 @@ describe('Decoding', () => {
         expect(frame.visibleWidth).toBe(1920);
         expect(frame.visibleHeight).toBe(1080);
         expect(frame.pixelFormat).toBe('I444AP12');
+        expect(frame.scanType).toBe('progressive');
         expect(frame.frameData!.byteLength).toBe(1920 * 1088 * 4 * 2);
         const reference = new Uint8Array(gunzipSync(readFileSync(
             new URL('./public/4444-12bit.framedata.gz', import.meta.url),
+        )));
+        expect(Buffer.compare(frame.frameData!, reference)).toBe(0);
+
+        await decoder.close();
+    });
+
+    test('Interlaced frame', async () => {
+        const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
+        if (decoder instanceof Error) {
+            throw decoder;
+        }
+        using frame = new Frame();
+        const packet = new Uint8Array(readFileSync(new URL('./public/interlaced-buck-bunny.prores', import.meta.url)));
+        await decoder.decode(packet, frame);
+
+        expect(frame.isFilled).toBe(true);
+        expect(frame.visibleWidth).toBe(1920);
+        expect(frame.visibleHeight).toBe(1080);
+        expect(frame.codedWidth).toBe(1920);
+        expect(frame.codedHeight).toBe(1088);
+        expect(frame.pixelFormat).toBe('I422P10');
+        expect(frame.scanType).toBe('interlaced-top-field-first');
+        expect(frame.frameData!.byteLength).toBe(1920 * 1088 * 2 * 2);
+        const reference = new Uint8Array(gunzipSync(readFileSync(
+            new URL('./public/interlaced-buck-bunny.framedata.gz', import.meta.url),
         )));
         expect(Buffer.compare(frame.frameData!, reference)).toBe(0);
 
@@ -182,10 +212,10 @@ describe('Invalid packets', () => {
         expect((result as Error).message).toMatch(/Version/);
     });
 
-    test('Interlaced frame', async () => {
-        const result = await decodeMutated(packet => packet[20]! |= 0b0100);
-        expect(result).toBeInstanceOf(NotSupportedError);
-        expect((result as Error).message).toMatch(/Interlaced/);
+    test('Invalid scan type', async () => {
+        const result = await decodeMutated(packet => packet[20]! |= 0b1100);
+        expect(result).toBeInstanceOf(InvalidDataError);
+        expect((result as Error).message).toMatch(/frame type/);
     });
 
     test('Invalid alpha info', async () => {

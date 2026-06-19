@@ -1,7 +1,7 @@
 import { ALL_FORMATS, EncodedPacketSink, FilePathSource, Input, UrlSource } from 'mediabunny';
 import { Decoder, Frame } from './src/index';
 
-const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: false });
+const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
 if (decoder instanceof Error) {
     throw decoder;
 }
@@ -23,10 +23,12 @@ for await (const packet of sink.packets()) {
     packetDatas.push(packet.data);
 }
 
+//packetDatas.splice(0, 150);
+
 const start = performance.now();
 let total = 0;
 
-const fileIters = 100;
+const fileIters = 1;
 
 const frame = new Frame();
 
@@ -37,7 +39,7 @@ for (let i = 0; i < fileIters; i++) {
             throw result;
         }
 
-        //console.log(result)
+        console.log(result)
 
         total++;
 

@@ -38,6 +38,7 @@ export type WasmExports = {
     getColorPrimaries: (frame: number) => number;
     getColorTransfer: (frame: number) => number;
     getColorMatrix: (frame: number) => number;
+    getScanType: (frame: number) => number;
     getErrorMessagePtr: (decoder: number) => number;
     getErrorMessageSize: (decoder: number) => number;
 };

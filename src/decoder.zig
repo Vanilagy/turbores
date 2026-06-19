@@ -40,11 +40,8 @@ pub const Decoder = struct {
 
     packet: []u8,
 
-    slice_width: u32,
-    slice_info_in_row: std.MultiArrayList(SliceInfo),
-    max_slice_width: u32,
-    slice_sizes: []usize,
-    slice_offsets: []usize,
+    // Need two for interlaced
+    pictures: [2]Picture,
 
     log2_chroma_blocks_per_mb: u32,
     bit_depth: u32,
@@ -66,6 +63,32 @@ pub const Decoder = struct {
     }
 };
 
+const Picture = struct {
+    slice_width: u32,
+    slice_info_in_row: std.MultiArrayList(SliceInfo),
+    max_slice_width: u32,
+    slice_sizes: []usize,
+    slice_offsets: []usize,
+    slice_count: u32,
+    total_slice_size: usize,
+
+    // How this picture maps into the shared frame buffer (needed for interlaced)
+    field_offset_rows: u32,
+    row_stride_shift: u5,
+
+    const empty = Picture{
+        .slice_width = undefined,
+        .slice_info_in_row = .empty,
+        .max_slice_width = undefined,
+        .slice_sizes = &.{},
+        .slice_offsets = &.{},
+        .slice_count = undefined,
+        .total_slice_size = undefined,
+        .field_offset_rows = undefined,
+        .row_stride_shift = undefined,
+    };
+};
+
 const SliceInfo = struct {
     pos: u16,
     size: u8,
@@ -79,6 +102,7 @@ const SlicePos = struct {
 pub const DecodeTask = struct {
     decoder: *Decoder,
     frame: *Frame,
+    picture: *Picture,
     slice_start: usize,
     slice_count: usize,
     error_message: ?[]const u8,
@@ -96,11 +120,7 @@ export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats
 
         .packet = &.{},
 
-        .slice_width = undefined,
-        .slice_info_in_row = .empty,
-        .max_slice_width = undefined,
-        .slice_sizes = &.{},
-        .slice_offsets = &.{},
+        .pictures = .{ Picture.empty, Picture.empty },
 
         .log2_chroma_blocks_per_mb = undefined,
         .bit_depth = bit_depth,
@@ -139,9 +159,11 @@ export fn getErrorMessageSize(decoder: *Decoder) usize {
 
 export fn closeDecoder(decoder: *Decoder) void {
     gpa.free(decoder.packet);
-    decoder.slice_info_in_row.deinit(gpa);
-    gpa.free(decoder.slice_sizes);
-    gpa.free(decoder.slice_offsets);
+    for (&decoder.pictures) |*picture| {
+        picture.slice_info_in_row.deinit(gpa);
+        gpa.free(picture.slice_sizes);
+        gpa.free(picture.slice_offsets);
+    }
     gpa.free(decoder.tasks);
     gpa.destroy(decoder);
 }
@@ -184,7 +206,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         return error.InvalidData;
     }
 
-    const hdr_size: u32 = try reader.takeInt(u16);
+    const header_size: u32 = try reader.takeInt(u16);
 
     const version = try reader.takeInt(u16);
     if (version > 1) {
@@ -212,11 +234,12 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
 
     const frame_flags = try reader.takeInt(u8);
     const frame_type = (frame_flags >> 2) & 0b11;
-    if (frame_type != 0) {
+    if (frame_type > 2) {
         @branchHint(.unlikely);
-        decoder.error_message = "Interlaced frames are not yet supported.";
-        return error.NotSupported;
+        decoder.error_message = "Invalid frame type.";
+        return error.InvalidData;
     }
+    frame.scan_type = @enumFromInt(frame_type);
 
     const chrominance_flag = (frame_flags >> 6) & 1;
     const log2_chroma_blocks_per_mb: u32 = @intCast(chrominance_flag + 1); // 1 => 422, 2 => 444
@@ -347,10 +370,21 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         }
     }
 
+    const is_interlaced = frame_type != 0;
+    const picture_count: u32 = if (is_interlaced) 2 else 1;
+    const row_stride_shift: u5 = if (is_interlaced) 1 else 0;
+
     frame.visible_width = frame_width;
     frame.visible_height = frame_height;
+
     frame.coded_width = (frame_width + 15) & ~@as(u32, 15);
-    frame.coded_height = (frame_height + 15) & ~@as(u32, 15);
+    if (is_interlaced) {
+        const field_visible_height = (frame_height + 1) >> 1;
+        const field_coded_height = (field_visible_height + 15) & ~@as(u32, 15);
+        frame.coded_height = field_coded_height << 1;
+    } else {
+        frame.coded_height = (frame_height + 15) & ~@as(u32, 15);
+    }
 
     const luma_data_size = frame.coded_width * frame.coded_height;
     var frame_data_size = luma_data_size;
@@ -369,16 +403,141 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
 
     frame.frame_data = try gpa.realloc(frame.frame_data, frame_data_size);
 
-    if (8 + hdr_size < reader.pos) {
+    if (8 + header_size < reader.pos) {
         @branchHint(.unlikely);
         decoder.error_message = "Frame header size too small.";
         return error.InvalidData;
     }
 
-    const pic_header_start_pos = 8 + hdr_size;
-    reader.pos = pic_header_start_pos;
+    reader.pos = 8 + header_size;
 
-    const pic_hdr_size: u32 = try reader.takeInt(u8) >> 3;
+    const field_coded_height = frame.coded_height >> row_stride_shift;
+    const first_field_offset: u32 = if (frame_type == 2) 1 else 0;
+
+    for (0..picture_count) |i| {
+        const field_offset_rows: u32 = if (i == 0) first_field_offset else 1 - first_field_offset;
+
+        try parsePicture(
+            decoder,
+            frame,
+            &reader,
+            field_coded_height,
+            &decoder.pictures[i],
+            field_offset_rows,
+            row_stride_shift,
+        );
+    }
+
+    const fixed_cost_per_slice = 100;
+
+    if (decoder.concurrency == 0) {
+        // Synchronous, just decode right here right now
+        decoder.tasks = try gpa.realloc(decoder.tasks, picture_count);
+        for (0..picture_count) |p| {
+            const picture = &decoder.pictures[p];
+            decoder.tasks[p] = .{
+                .decoder = decoder,
+                .frame = frame,
+                .picture = picture,
+                .slice_start = 0,
+                .slice_count = picture.slice_count,
+                .error_message = null,
+            };
+
+            const task = &decoder.tasks[p];
+            executeDecodeTask(task) catch |err| {
+                decoder.error_message = task.error_message;
+                return err;
+            };
+        }
+
+        return;
+    }
+
+    misc.lockMutex(&worker.worker_task_queue_mutex);
+    defer worker.worker_task_queue_mutex.unlock(io);
+
+    const task_count_per_picture = decoder.concurrency;
+    const total_task_count = picture_count * task_count_per_picture;
+    decoder.tasks = try gpa.realloc(decoder.tasks, total_task_count);
+
+    var task_index: usize = 0;
+    for (0..picture_count) |p| {
+        const picture = &decoder.pictures[p];
+        const total_slices = picture.slice_count;
+
+        var slice_start_index: usize = 0;
+        var remaining_size = picture.total_slice_size + total_slices * fixed_cost_per_slice;
+
+        // Split each picture's work into `task_count` jobs, distributed mostly evenly by slice size: larger slices
+        // (with more bytes) take longer to decode, so this aims to give every job roughly the same amount of work.
+        // The jobs are dispatched to the worker pool, which is assumed to exist (or come online) to eat through them.
+        for (0..task_count_per_picture) |i| {
+            const start_index = slice_start_index;
+
+            if (i == task_count_per_picture - 1) {
+                // Last job takes everything left
+                slice_start_index = total_slices;
+            } else {
+                const target = remaining_size / (task_count_per_picture - i);
+                var current_size: usize = 0;
+
+                while (slice_start_index < total_slices) {
+                    const slice_size = picture.slice_sizes[slice_start_index] + fixed_cost_per_slice;
+                    const new_size = current_size + slice_size;
+
+                    if (new_size > target) {
+                        // We now overshot the target. Check if we're now closer to the target than before. If yes, take
+                        // one more slice, if no, don't.
+                        if (new_size - target <= target - current_size) {
+                            current_size = new_size;
+                            slice_start_index += 1;
+                        }
+
+                        break;
+                    }
+
+                    current_size = new_size;
+                    slice_start_index += 1;
+                }
+
+                remaining_size -= current_size;
+            }
+
+            decoder.tasks[task_index] = .{
+                .decoder = decoder,
+                .frame = frame,
+                .picture = picture,
+                .slice_start = start_index,
+                .slice_count = slice_start_index - start_index,
+                .error_message = null,
+            };
+
+            try worker.worker_task_queue.pushBack(gpa, .{
+                .decode = &decoder.tasks[task_index],
+            });
+            task_index += 1;
+        }
+    }
+
+    io.futexWake(u32, &worker.worker_task_queue.len, total_task_count);
+
+    decoder.running_task_count.store(total_task_count, .seq_cst);
+}
+
+fn parsePicture(
+    decoder: *Decoder,
+    frame: *Frame,
+    outside_reader: *misc.ByteReader,
+    field_coded_height: u32,
+    picture: *Picture,
+    field_offset_rows: u32,
+    row_stride_shift: u5,
+) !void {
+    var reader = outside_reader.*;
+
+    const pic_header_start_pos = reader.pos;
+    const pic_header_size: u32 = try reader.takeInt(u8) >> 3;
     const pic_data_size = try reader.takeInt(u32);
 
     // Protect against overflow
@@ -386,7 +545,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
 
     if (reader.data.len < pic_data_end) {
         @branchHint(.unlikely);
-        decoder.error_message = "Packet is smaller than the picture data size indicated in the frame header.";
+        decoder.error_message = "Packet is smaller than the picture data size indicated in the picture header.";
         return error.InvalidData;
     }
 
@@ -395,13 +554,13 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     const total_slices: u32 = try reader.takeInt(u16);
     const slice_dimensions = try reader.takeInt(u8);
 
-    if (pic_header_start_pos + pic_hdr_size < reader.pos) {
+    if (pic_header_start_pos + pic_header_size < reader.pos) {
         @branchHint(.unlikely);
         decoder.error_message = "Picture header size too small.";
         return error.InvalidData;
     }
 
-    reader.pos = pic_header_start_pos + pic_hdr_size;
+    reader.pos = pic_header_start_pos + pic_header_size;
 
     const log2_slice_width = slice_dimensions >> 4;
     if (log2_slice_width > 7) {
@@ -410,7 +569,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         decoder.error_message = "Slice widths larger than 128 are not supported.";
         return error.NotSupported;
     }
-    decoder.slice_width = @as(u32, 1) << @as(u5, @intCast(log2_slice_width));
+    picture.slice_width = @as(u32, 1) << @as(u5, @intCast(log2_slice_width));
 
     const log2_slice_height = slice_dimensions & 0b1111;
     if (log2_slice_height > 0) {
@@ -421,30 +580,30 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         return error.NotSupported;
     }
 
-    decoder.slice_info_in_row.clearRetainingCapacity();
-    decoder.max_slice_width = 0;
+    picture.slice_info_in_row.clearRetainingCapacity();
+    picture.max_slice_width = 0;
 
     var current_x: u16 = 0;
     const coded_width_in_macroblocks = frame.coded_width >> 4;
     while (current_x < coded_width_in_macroblocks) {
-        var width: u8 = @intCast(decoder.slice_width);
+        var width: u8 = @intCast(picture.slice_width);
         while (current_x + width > coded_width_in_macroblocks) {
             width >>= 1;
         }
 
-        try decoder.slice_info_in_row.append(gpa, .{
+        try picture.slice_info_in_row.append(gpa, .{
             .pos = current_x,
             .size = width,
         });
         current_x += width;
 
-        if (decoder.max_slice_width == 0) {
+        if (picture.max_slice_width == 0) {
             // The first slice has the maximum width (no other slice has a longer width)
-            decoder.max_slice_width = width;
+            picture.max_slice_width = width;
         }
     }
 
-    const expected_slice_count = decoder.slice_info_in_row.len * (frame.coded_height >> 4);
+    const expected_slice_count = picture.slice_info_in_row.len * (field_coded_height >> 4);
     if (total_slices != expected_slice_count) {
         @branchHint(.unlikely);
         decoder.error_message = std.fmt.bufPrint(
@@ -458,25 +617,23 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         return error.InvalidData;
     }
 
-    const fixed_cost_per_slice = 100;
-
     var total_slice_size: usize = 0;
-    decoder.slice_sizes = try gpa.realloc(decoder.slice_sizes, total_slices);
+    picture.slice_sizes = try gpa.realloc(picture.slice_sizes, total_slices);
     for (0..total_slices) |i| {
         const size: usize = try reader.takeInt(u16);
 
-        decoder.slice_sizes[i] = size;
+        picture.slice_sizes[i] = size;
         total_slice_size += size;
     }
 
-    decoder.slice_offsets = try gpa.realloc(decoder.slice_offsets, total_slices);
+    picture.slice_offsets = try gpa.realloc(picture.slice_offsets, total_slices);
 
     var current_offset: usize = reader.pos;
     for (0..total_slices) |i| {
-        decoder.slice_offsets[i] = current_offset;
+        picture.slice_offsets[i] = current_offset;
 
         // Protect against overflow
-        current_offset = try std.math.add(usize, current_offset, decoder.slice_sizes[i]);
+        current_offset = try std.math.add(usize, current_offset, picture.slice_sizes[i]);
     }
 
     if (current_offset > reader.data.len) {
@@ -485,87 +642,12 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         return error.UnexpectedEof;
     }
 
-    const task_count = decoder.concurrency;
+    picture.slice_count = total_slices;
+    picture.total_slice_size = total_slice_size;
+    picture.field_offset_rows = field_offset_rows;
+    picture.row_stride_shift = row_stride_shift;
 
-    if (task_count == 0) {
-        // Synchronous, just decode right here right now
-        decoder.tasks = try gpa.realloc(decoder.tasks, 1);
-        decoder.tasks[0] = .{
-            .decoder = decoder,
-            .frame = frame,
-            .slice_start = 0,
-            .slice_count = total_slices,
-            .error_message = null,
-        };
-        const task = &decoder.tasks[0];
-
-        executeDecodeTask(task) catch |err| {
-            decoder.error_message = task.error_message;
-            return err;
-        };
-
-        return;
-    }
-
-    misc.lockMutex(&worker.worker_task_queue_mutex);
-    defer worker.worker_task_queue_mutex.unlock(io);
-
-    decoder.tasks = try gpa.realloc(decoder.tasks, task_count);
-
-    var slice_start_index: usize = 0;
-    var remaining_size = total_slice_size + total_slices * fixed_cost_per_slice;
-
-    // Split the work into `task_count` jobs, distributed mostly evenly by slice size: larger slices (with more
-    // bytes) take longer to decode, so this aims to give every job roughly the same amount of work. The jobs are
-    // dispatched to the worker pool, which is assumed to exist (or come online) to eat through them.
-    for (0..task_count) |i| {
-        const start_index = slice_start_index;
-
-        if (i == task_count - 1) {
-            // Last job takes everything left
-            slice_start_index = total_slices;
-        } else {
-            const target = remaining_size / (task_count - i);
-            var current_size: usize = 0;
-
-            while (slice_start_index < total_slices) {
-                const slice_size = decoder.slice_sizes[slice_start_index] + fixed_cost_per_slice;
-                const new_size = current_size + slice_size;
-
-                if (new_size > target) {
-                    // We now overshot the target. Check if we're now closer to the target than before. If yes, take one
-                    // more slice, if no, don't.
-                    if (new_size - target <= target - current_size) {
-                        current_size = new_size;
-                        slice_start_index += 1;
-                    }
-
-                    break;
-                }
-
-                current_size = new_size;
-                slice_start_index += 1;
-            }
-
-            remaining_size -= current_size;
-        }
-
-        decoder.tasks[i] = .{
-            .decoder = decoder,
-            .frame = frame,
-            .slice_start = start_index,
-            .slice_count = slice_start_index - start_index,
-            .error_message = null,
-        };
-
-        try worker.worker_task_queue.pushBack(gpa, .{
-            .decode = &decoder.tasks[i],
-        });
-    }
-
-    io.futexWake(u32, &worker.worker_task_queue.len, task_count);
-
-    decoder.running_task_count.store(task_count, .seq_cst);
+    outside_reader.pos = pic_data_end;
 }
 
 export fn finalizePacketDecoding(decoder: *Decoder) i32 {
@@ -588,13 +670,23 @@ export fn finalizePacketDecoding(decoder: *Decoder) i32 {
 pub fn executeDecodeTask(task: *DecodeTask) !void {
     const decoder = task.decoder;
     const frame = task.frame;
+    const picture = task.picture;
     const slice_count = task.slice_count;
     const slice_start = task.slice_start;
 
+    const field_offset_rows = picture.field_offset_rows;
+    const row_stride_shift = picture.row_stride_shift;
+
+    // Scan order depends on scan type
+    const scan_table = if (row_stride_shift != 0)
+        &interlaced_scan_order
+    else
+        &progressive_scan_order;
+
     var reader = misc.ByteReader.init(decoder.packet);
 
-    const max_num_luma_blocks = decoder.max_slice_width << 2;
-    const max_num_chroma_blocks = decoder.max_slice_width << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
+    const max_num_luma_blocks = picture.max_slice_width << 2;
+    const max_num_chroma_blocks = picture.max_slice_width << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
 
     const max_luma_slice_len = max_num_luma_blocks << 6;
     const max_chroma_slice_len = max_num_chroma_blocks << 6;
@@ -605,16 +697,26 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     const frame_data = frame.frame_data;
     const bytes_per_sample = (frame.bit_depth + 7) >> 3;
     const chroma_entries = (frame.coded_width * frame.coded_height) >> @as(u5, @intCast(2 - frame.log2_chroma_blocks_per_mb));
+    const chroma_width = if (frame.log2_chroma_blocks_per_mb == 2) frame.coded_width else frame.coded_width >> 1;
+
+    const luma_plane_start = 0;
+    const u_plane_start = bytes_per_sample * frame.coded_width * frame.coded_height;
+    const v_plane_start = bytes_per_sample * (frame.coded_width * frame.coded_height + chroma_entries);
+    const alpha_plane_start = bytes_per_sample * (frame.coded_width * frame.coded_height + (chroma_entries << 1));
+
+    // The field starts at this row within each plane
+    const luma_field_byte_offset = bytes_per_sample * field_offset_rows * frame.coded_width;
+    const chroma_field_byte_offset = bytes_per_sample * field_offset_rows * chroma_width;
 
     // The alignment guarantees are provided by the coded dimensions always being a multiple of 16
-    const luma_frame_data =
-        frame_data[0 .. bytes_per_sample * frame.coded_width * frame.coded_height];
+    const luma_frame_data: []align(2) u8 =
+        @alignCast(frame_data[luma_plane_start + luma_field_byte_offset .. u_plane_start]);
     const u_frame_data: []align(2) u8 =
-        @alignCast(frame_data[bytes_per_sample * frame.coded_width * frame.coded_height ..][0 .. bytes_per_sample * chroma_entries]);
+        @alignCast(frame_data[u_plane_start + chroma_field_byte_offset .. v_plane_start]);
     const v_frame_data: []align(2) u8 =
-        @alignCast(frame_data[bytes_per_sample * (frame.coded_width * frame.coded_height + chroma_entries) ..][0 .. bytes_per_sample * chroma_entries]);
+        @alignCast(frame_data[v_plane_start + chroma_field_byte_offset .. alpha_plane_start]);
     const alpha_frame_data: []align(2) u8 =
-        @alignCast(frame_data[bytes_per_sample * (frame.coded_width * frame.coded_height + (chroma_entries << 1)) ..]);
+        @alignCast(frame_data[alpha_plane_start + (if (frame.alpha_bit_depth > 0) luma_field_byte_offset else 0) ..]);
 
     // Aligned for SIMD access
     const slice_data = try gpa.alignedAlloc(f32, .@"16", (max_luma_slice_len + (max_chroma_slice_len << 1)) << 1);
@@ -667,9 +769,9 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     while (i + 1 < slice_count) : (i += 2) {
         const index_1 = slice_start + i;
         const index_2 = slice_start + i + 1;
-        reader.pos = decoder.slice_offsets[index_1];
+        reader.pos = picture.slice_offsets[index_1];
         const header_1 = try parseSliceHeader(task, &reader, index_1);
-        reader.pos = decoder.slice_offsets[index_2];
+        reader.pos = picture.slice_offsets[index_2];
         const header_2 = try parseSliceHeader(task, &reader, index_2);
 
         // AC parameters are sparse, so we must memset them all to zero
@@ -707,6 +809,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             num_luma_blocks_1,
             num_luma_blocks_2,
             task,
+            scan_table,
         );
         transformAndStoreSliceData(
             task,
@@ -719,6 +822,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             2,
             false,
             bytes_per_sample,
+            row_stride_shift,
         );
         transformAndStoreSliceData(
             task,
@@ -731,6 +835,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             2,
             false,
             bytes_per_sample,
+            row_stride_shift,
         );
 
         // U for slice 1 and 2
@@ -742,6 +847,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             num_chroma_blocks_1,
             num_chroma_blocks_2,
             task,
+            scan_table,
         );
         transformAndStoreSliceData(
             task,
@@ -754,6 +860,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             frame.log2_chroma_blocks_per_mb,
             true,
             bytes_per_sample,
+            row_stride_shift,
         );
         transformAndStoreSliceData(
             task,
@@ -766,6 +873,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             frame.log2_chroma_blocks_per_mb,
             true,
             bytes_per_sample,
+            row_stride_shift,
         );
 
         // V for slice 1 and 2
@@ -777,6 +885,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             num_chroma_blocks_1,
             num_chroma_blocks_2,
             task,
+            scan_table,
         );
         transformAndStoreSliceData(
             task,
@@ -789,6 +898,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             frame.log2_chroma_blocks_per_mb,
             true,
             bytes_per_sample,
+            row_stride_shift,
         );
         transformAndStoreSliceData(
             task,
@@ -801,6 +911,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             frame.log2_chroma_blocks_per_mb,
             true,
             bytes_per_sample,
+            row_stride_shift,
         );
 
         if (has_alpha_to_parse) {
@@ -819,7 +930,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                                 pos_1.y,
                                 header_1.width_mb << 4,
                                 num_luma_blocks_1 << 6,
-                                frame.coded_width,
+                                frame.coded_width << row_stride_shift,
                                 source_bit_depth,
                                 target_bit_depth,
                             );
@@ -831,7 +942,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                                 pos_2.y,
                                 header_2.width_mb << 4,
                                 num_luma_blocks_2 << 6,
-                                frame.coded_width,
+                                frame.coded_width << row_stride_shift,
                                 source_bit_depth,
                                 target_bit_depth,
                             );
@@ -847,7 +958,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     // Odd slice count leaves one slice over; decode it on its own
     if (i < slice_count) {
         const index = slice_start + i;
-        reader.pos = decoder.slice_offsets[index];
+        reader.pos = picture.slice_offsets[index];
         const header = try parseSliceHeader(task, &reader, index);
 
         const num_luma_blocks = header.width_mb << 2;
@@ -871,7 +982,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
         const chroma_vec = @as(@Vector(64, f32), chroma_scaling_matrix) * scale;
 
         // Luma
-        try parseDcAndAcSingle(header.luma_data, luma_data, num_luma_blocks, task);
+        try parseDcAndAcSingle(header.luma_data, luma_data, num_luma_blocks, task, scan_table);
         transformAndStoreSliceData(
             task,
             luma_data,
@@ -883,10 +994,11 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             2,
             false,
             bytes_per_sample,
+            row_stride_shift,
         );
 
         // U
-        try parseDcAndAcSingle(header.u_data, u_data, num_chroma_blocks, task);
+        try parseDcAndAcSingle(header.u_data, u_data, num_chroma_blocks, task, scan_table);
         transformAndStoreSliceData(
             task,
             u_data,
@@ -898,10 +1010,11 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             frame.log2_chroma_blocks_per_mb,
             true,
             bytes_per_sample,
+            row_stride_shift,
         );
 
         // V
-        try parseDcAndAcSingle(header.v_data, v_data, num_chroma_blocks, task);
+        try parseDcAndAcSingle(header.v_data, v_data, num_chroma_blocks, task, scan_table);
         transformAndStoreSliceData(
             task,
             v_data,
@@ -913,6 +1026,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             frame.log2_chroma_blocks_per_mb,
             true,
             bytes_per_sample,
+            row_stride_shift,
         );
 
         if (has_alpha_to_parse) {
@@ -927,7 +1041,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                                 pos.y,
                                 header.width_mb << 4,
                                 num_luma_blocks << 6,
-                                frame.coded_width,
+                                frame.coded_width << row_stride_shift,
                                 source_bit_depth,
                                 target_bit_depth,
                             );
@@ -955,10 +1069,10 @@ const SliceHeader = struct {
 inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize) !SliceHeader {
     // We can do unchecked reads here because we have already verified that the slice data fits
 
-    const decoder = task.decoder;
+    const picture = task.picture;
     const start_pos = reader.pos;
-    const slice_size = decoder.slice_sizes[i];
-    const slice_hdr_size: u32 = try reader.takeInt(u8) >> 3;
+    const slice_size = picture.slice_sizes[i];
+    const slice_header_size: u32 = try reader.takeInt(u8) >> 3;
 
     var scale_factor: u32 = std.math.clamp(try reader.takeInt(u8), 1, 224);
     if (scale_factor > 128) {
@@ -968,14 +1082,14 @@ inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize
     const luma_data_size: u32 = try reader.takeInt(u16);
     const u_data_size: u32 = try reader.takeInt(u16);
 
-    const size_until_v = slice_hdr_size + luma_data_size + u_data_size;
+    const size_until_v = slice_header_size + luma_data_size + u_data_size;
     if (size_until_v > slice_size) {
         @branchHint(.unlikely);
         task.error_message = "Channel data planes too large to fit into slice data.";
         return error.InvalidData;
     }
 
-    const v_data_size: u32 = if (slice_hdr_size >= 8)
+    const v_data_size: u32 = if (slice_header_size >= 8)
         try reader.takeInt(u16) // There's a special field for V data size
     else
         slice_size - size_until_v;
@@ -989,12 +1103,12 @@ inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize
 
     const alpha_data_size = slice_size - size_until_alpha; // This is 0 for non-alpha frames
 
-    if (start_pos + slice_hdr_size < reader.pos) {
+    if (start_pos + slice_header_size < reader.pos) {
         @branchHint(.unlikely);
         task.error_message = "Slice header size too small.";
         return error.InvalidData;
     }
-    reader.pos = start_pos + slice_hdr_size;
+    reader.pos = start_pos + slice_header_size;
 
     // Unchecked because bounds were verified above
     const luma_data = reader.takeUnchecked(luma_data_size);
@@ -1002,8 +1116,8 @@ inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize
     const v_data = reader.takeUnchecked(v_data_size);
     const alpha_data = reader.takeUnchecked(alpha_data_size);
 
-    const y_index = i / decoder.slice_info_in_row.len;
-    const x_index = i - y_index * decoder.slice_info_in_row.len; // No % so we don't need two int divisions
+    const y_index = i / picture.slice_info_in_row.len;
+    const x_index = i - y_index * picture.slice_info_in_row.len; // No % so we don't need two int divisions
 
     return .{
         .scale_factor = scale_factor,
@@ -1011,13 +1125,13 @@ inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize
         .u_data = u_data,
         .v_data = v_data,
         .alpha_data = alpha_data,
-        .width_mb = decoder.slice_info_in_row.items(.size)[x_index],
-        .pos_x_mb = decoder.slice_info_in_row.items(.pos)[x_index],
+        .width_mb = picture.slice_info_in_row.items(.size)[x_index],
+        .pos_x_mb = picture.slice_info_in_row.items(.pos)[x_index],
         .pos_y_mb = y_index,
     };
 }
 
-const scan_order = transpose_scan_values(.{
+const progressive_scan_order = transpose_scan_values(.{
     0,  1,  8,  9,  2,  3,  10, 11,
     16, 17, 24, 25, 18, 19, 26, 27,
     4,  5,  12, 20, 13, 6,  7,  14,
@@ -1026,6 +1140,16 @@ const scan_order = transpose_scan_values(.{
     49, 56, 57, 50, 43, 36, 37, 44,
     51, 58, 59, 52, 45, 38, 39, 46,
     53, 60, 61, 54, 47, 55, 62, 63,
+});
+const interlaced_scan_order = transpose_scan_values(.{
+    0,  8,  1,  9,  16, 24, 17, 25,
+    2,  10, 3,  11, 18, 26, 19, 27,
+    32, 40, 33, 34, 41, 48, 56, 49,
+    42, 35, 43, 50, 57, 58, 51, 59,
+    4,  12, 5,  6,  13, 20, 28, 21,
+    14, 7,  15, 22, 29, 36, 44, 37,
+    30, 23, 31, 38, 45, 52, 60, 53,
+    46, 39, 47, 54, 61, 62, 55, 63,
 });
 
 fn transpose_scan_values(s: [64]u8) [64]u8 {
@@ -1050,15 +1174,16 @@ fn parseDcAndAcPair(
     num_blocks_1: u32,
     num_blocks_2: u32,
     task: *DecodeTask,
+    scan_table: *const [64]u8,
 ) !void {
     // Special logic in case the data is empty (which is handled gracefully)
     if (data_1.len == 0 or data_2.len == 0) {
         @branchHint(.unlikely);
 
         if (data_1.len != 0) {
-            return parseDcAndAcSingle(data_1, slice_1_data, num_blocks_1, task);
+            return parseDcAndAcSingle(data_1, slice_1_data, num_blocks_1, task, scan_table);
         } else {
-            return parseDcAndAcSingle(data_2, slice_2_data, num_blocks_2, task);
+            return parseDcAndAcSingle(data_2, slice_2_data, num_blocks_2, task, scan_table);
         }
     }
 
@@ -1092,6 +1217,7 @@ fn parseDcAndAcPair(
         .log2_block_count = log2_block_count_1,
         .num_coefficients = @as(u32, 64) << log2_block_count_1,
         .block_mask = block_mask_1,
+        .scan_order = scan_table,
     };
     var ac_state_2 = AcState{
         .bit_reader = dc_state_2.bit_reader,
@@ -1100,6 +1226,7 @@ fn parseDcAndAcPair(
         .log2_block_count = log2_block_count_2,
         .num_coefficients = @as(u32, 64) << log2_block_count_2,
         .block_mask = block_mask_2,
+        .scan_order = scan_table,
     };
 
     var active_1 = true;
@@ -1115,7 +1242,7 @@ fn parseDcAndAcPair(
     task.error_message = null;
 }
 
-fn parseDcAndAcSingle(data: []u8, slice_data: []f32, num_blocks: u32, task: *DecodeTask) !void {
+fn parseDcAndAcSingle(data: []u8, slice_data: []f32, num_blocks: u32, task: *DecodeTask, scan_table: *const [64]u8) !void {
     // An empty scan carries no coefficients; the slice data is already zeroed, so there's nothing to do.
     if (data.len == 0) {
         @branchHint(.unlikely);
@@ -1145,6 +1272,7 @@ fn parseDcAndAcSingle(data: []u8, slice_data: []f32, num_blocks: u32, task: *Dec
         .log2_block_count = log2_block_count,
         .num_coefficients = @as(u32, 64) << log2_block_count,
         .block_mask = block_mask,
+        .scan_order = scan_table,
     };
 
     while (try ac_state.step()) {}
@@ -1232,6 +1360,7 @@ const AcState = struct {
     log2_block_count: u5,
     num_coefficients: u32,
     block_mask: u32,
+    scan_order: *const [64]u8,
     run: u32 = 4,
     level: i32 = 2,
 
@@ -1263,7 +1392,7 @@ const AcState = struct {
         const total_bits = run_result.bits + level_result.bits + 1;
         const sign = -@as(i32, @intCast((self.bit_reader.current >> @as(u6, @intCast(64 - total_bits))) & 1));
         self.bit_reader.consume(@intCast(total_bits));
-        self.slice_data[((self.pos & self.block_mask) << 6) + scan_order[j]] = @floatFromInt((self.level ^ sign) - sign);
+        self.slice_data[((self.pos & self.block_mask) << 6) + self.scan_order[j]] = @floatFromInt((self.level ^ sign) - sign);
 
         return true;
     }
@@ -1445,13 +1574,16 @@ fn transformAndStoreSliceData(
     target_log2_block_per_macroblock: u32,
     comptime is_chroma: bool,
     bytes_per_sample: u32,
+    row_stride_shift: u5,
 ) void {
     std.debug.assert(source_log2_blocks_per_macroblock == 1 or source_log2_blocks_per_macroblock == 2);
     std.debug.assert(if (is_chroma) true else source_log2_blocks_per_macroblock == target_log2_block_per_macroblock);
 
     const max_value = (@as(u16, 1) << @as(u4, @intCast(task.frame.bit_depth))) - 1;
     const dc_offset = task.decoder.dc_offset;
-    const frame_coded_width = task.frame.coded_width;
+
+    // Doubled for interlaced fields so consecutive field rows land two rows apart in the shared buffer
+    const frame_coded_width = task.frame.coded_width << row_stride_shift;
 
     switch (bytes_per_sample) {
         inline 1, 2 => |bytes_per_sample_captured| {

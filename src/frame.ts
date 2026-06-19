@@ -51,6 +51,12 @@ export const PIXEL_FORMATS = [
  */
 export type PixelFormat = typeof PIXEL_FORMATS[number];
 
+/**
+ * Describes how a frame's lines are scanned: `'progressive'` means all lines are stored in a single pass, while the
+ * interlaced types split the frame into two fields, with the suffix indicating which field comes first.
+ */
+export type ScanType = 'progressive' | 'interlaced-top-field-first' | 'interlaced-bottom-field-first';
+
 // For automatic freeing of the WASM side
 const frameRegistry = new FinalizationRegistry<{ runtime: SharedMemoryRuntime; ptr: number }>(({ runtime, ptr }) => {
     runtime.exports.closeFrame(ptr);
@@ -162,6 +168,11 @@ export class Frame implements Disposable {
      * is `false` whenever it is populated.
      */
     colorRangeFull: false | null = null;
+    /**
+     * How the frame's lines are scanned. `'progressive'` for a full-frame picture, or one of the interlaced types
+     * when the frame is split into two fields (the suffix indicates which field comes first).
+     */
+    scanType: ScanType | null = null;
 
     /**
      * The runtime the WASM Frame lives on (shared-memory path).
@@ -197,7 +208,8 @@ export class Frame implements Disposable {
             && this.colorPrimaries !== null
             && this.colorTransfer !== null
             && this.colorMatrix !== null
-            && this.colorRangeFull !== null;
+            && this.colorRangeFull !== null
+            && this.scanType !== null;
     }
 
     /** Returns this frame typed as a `FilledFrame` if it is filled, or `null` otherwise. */
@@ -275,6 +287,7 @@ export class Frame implements Disposable {
         this.colorTransfer = null;
         this.colorMatrix = null;
         this.colorRangeFull = null;
+        this.scanType = null;
     }
 
     /** @internal */
@@ -290,6 +303,7 @@ export class Frame implements Disposable {
         this.colorTransfer = contents.colorTransfer;
         this.colorMatrix = contents.colorMatrix;
         this.colorRangeFull = contents.colorRangeFull;
+        this.scanType = contents.scanType;
     }
 }
 
@@ -310,6 +324,7 @@ export type FrameContents = {
     colorTransfer: number;
     colorMatrix: number;
     colorRangeFull: false;
+    scanType: ScanType;
 };
 
 export const readFrameContents = (
@@ -328,6 +343,13 @@ export const readFrameContents = (
     const originalPixelFormat = PIXEL_FORMATS[exports.getOriginalPixelFormat(decoderPtr)];
     assert(originalPixelFormat !== undefined);
 
+    const scanType = ([
+        'progressive',
+        'interlaced-top-field-first',
+        'interlaced-bottom-field-first',
+    ] as const)[exports.getScanType(framePtr)];
+    assert(scanType !== undefined);
+
     return {
         frameData,
         codedWidth: exports.getCodedWidth(framePtr),
@@ -340,5 +362,6 @@ export const readFrameContents = (
         colorTransfer: exports.getColorTransfer(framePtr),
         colorMatrix: exports.getColorMatrix(framePtr),
         colorRangeFull: false, // Always limited range, but expose it for clarity
+        scanType,
     };
 };

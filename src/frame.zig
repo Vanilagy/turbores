@@ -1,3 +1,9 @@
+// Copyright (c) 2026-present, Vanilagy and contributors
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 const misc = @import("./misc.zig");
 const gpa = misc.gpa;
 
@@ -16,6 +22,13 @@ pub const Frame = struct {
     color_primaries: u32,
     color_transfer: u32,
     color_matrix: u32,
+    scan_type: ScanType,
+};
+
+pub const ScanType = enum(u8) {
+    progressive,
+    interlaced_top_field_first,
+    interlaced_bottom_field_first,
 };
 
 export fn createFrame() ?*Frame {
@@ -33,6 +46,7 @@ export fn createFrame() ?*Frame {
         .color_primaries = undefined,
         .color_transfer = undefined,
         .color_matrix = undefined,
+        .scan_type = undefined,
     };
 
     return result;
@@ -85,6 +99,10 @@ export fn getColorTransfer(frame: *Frame) u32 {
 
 export fn getColorMatrix(frame: *Frame) u32 {
     return frame.color_matrix;
+}
+
+export fn getScanType(frame: *Frame) u32 {
+    return @intFromEnum(frame.scan_type);
 }
 
 pub const PixelFormat = enum(u5) {
