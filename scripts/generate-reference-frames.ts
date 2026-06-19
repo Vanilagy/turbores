@@ -2,7 +2,7 @@
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { gzipSync } from 'node:zlib';
-import { Decoder, Frame, type DecoderOptions } from '../dist/index.js';
+import { Decoder, Frame, type DecoderOptions } from '../src/index.js';
 
 const [name, proresFourCc] = process.argv.slice(2);
 if (!name || !proresFourCc) {
