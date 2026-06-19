@@ -11,6 +11,8 @@ import type { FrameContents } from './frame.js';
 export enum MessageType {
     SharedMemoryInit,
     MessagePassingInit,
+    CreateDecoder,
+    CloseDecoder,
     Decode,
     Ready,
     InitOutOfMemoryError,
@@ -32,10 +34,20 @@ export type WorkerMessage =
         wasmBinary: Uint8Array<ArrayBuffer>;
     }
     | {
+        type: MessageType.CreateDecoder;
+        decoderId: number;
+        bitDepth: number;
+        allowedOutputFormats: number;
+    }
+    | {
+        type: MessageType.CloseDecoder;
+        decoderId: number;
+    }
+    | {
         type: MessageType.Decode;
         id: number;
+        decoderId: number;
         packet: Uint8Array;
-        bitDepth: number;
         frameBuffer: ArrayBuffer | null;
     };
 

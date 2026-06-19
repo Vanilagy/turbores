@@ -245,6 +245,35 @@ export class MessagePassingRuntime extends Runtime {
     // How many packets each worker currently has in flight
     workerLoad: number[] = [];
     nextRequestId = 0;
+    nextDecoderId = 0;
+    registeredDecoders = new Map<number, {
+        bitDepth: number;
+        allowedOutputFormats: number;
+    }>();
+
+    registerDecoder(decoderId: number, bitDepth: number, allowedOutputFormats: number) {
+        this.registeredDecoders.set(decoderId, { bitDepth, allowedOutputFormats });
+
+        for (const worker of this.workers) {
+            worker.postMessage({
+                type: MessageType.CreateDecoder,
+                decoderId,
+                bitDepth,
+                allowedOutputFormats,
+            } satisfies WorkerMessage);
+        }
+    }
+
+    unregisterDecoder(decoderId: number) {
+        this.registeredDecoders.delete(decoderId);
+
+        for (const worker of this.workers) {
+            worker.postMessage({
+                type: MessageType.CloseDecoder,
+                decoderId,
+            } satisfies WorkerMessage);
+        }
+    }
 
     async ensureWorkers(count: number) {
         const missing = count - this.workers.length;
@@ -287,6 +316,16 @@ export class MessagePassingRuntime extends Runtime {
         for (const worker of results as WorkerWrapper[]) {
             this.workers.push(worker);
             this.workerLoad.push(0);
+
+            // Bring the fresh worker up to speed with every decoder that already exists
+            for (const [decoderId, { bitDepth, allowedOutputFormats }] of this.registeredDecoders) {
+                worker.postMessage({
+                    type: MessageType.CreateDecoder,
+                    decoderId,
+                    bitDepth,
+                    allowedOutputFormats,
+                } satisfies WorkerMessage);
+            }
         }
     }
 

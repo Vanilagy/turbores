@@ -8,6 +8,8 @@ import {
     FrameLockedError,
     InvalidDataError,
     NotSupportedError,
+    PIXEL_FORMATS,
+    type PixelFormat,
     UnexpectedEofError,
 } from '../src/index.js';
 
@@ -146,6 +148,22 @@ describe('Decoding', () => {
 });
 
 describe('Invalid packets', () => {
+    const decodeMutated = async (mutate: (packet: Uint8Array, view: DataView) => void) => {
+        const packet = new Uint8Array(readFileSync(new URL('./public/buck-bunny.prores', import.meta.url)));
+        mutate(packet, new DataView(packet.buffer));
+
+        const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
+        if (decoder instanceof Error) {
+            throw decoder;
+        }
+        const result = await decoder.decode(packet, new Frame());
+        await decoder.close();
+
+        return result;
+    };
+
+    const picHeaderStart = (view: DataView) => 8 + view.getUint16(8);
+
     test('Frame size larger than packet', async () => {
         const result = await decodeMutated((packet, view) => view.setUint32(0, 0xffffff00));
         expect(result).toBeInstanceOf(InvalidDataError);
@@ -435,6 +453,12 @@ describe('Input validation', () => {
         // @ts-expect-error Intentionally invalid
         await expect(Decoder.create({ proresFourCc: 'apch' })).rejects.toThrow(TypeError);
         // @ts-expect-error Intentionally invalid
+        await expect(Decoder.create({ useSharedMemory: true })).rejects.toThrow(TypeError);
+        // @ts-expect-error Intentionally invalid
+        await expect(Decoder.create({ proresFourCc: 'xxxx', useSharedMemory: true })).rejects.toThrow(TypeError);
+        // @ts-expect-error Intentionally invalid
+        await expect(Decoder.create({ proresFourCc: 42, useSharedMemory: true })).rejects.toThrow(TypeError);
+        // @ts-expect-error Intentionally invalid
         await expect(Decoder.create({ proresFourCc: 'apch', useSharedMemory: 1 })).rejects.toThrow(TypeError);
         await expect(Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: -1 }))
             .rejects.toThrow(TypeError);
@@ -443,6 +467,17 @@ describe('Input validation', () => {
         // @ts-expect-error Intentionally invalid
         await expect(Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: '4' }))
             .rejects.toThrow(TypeError);
+        await expect(Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, allowedOutputFormats: [] }))
+            .rejects.toThrow(TypeError);
+        // @ts-expect-error Intentionally invalid
+        await expect(Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, allowedOutputFormats: 'I422P10' }))
+            .rejects.toThrow(TypeError);
+        await expect(Decoder.create({
+            proresFourCc: 'apch',
+            useSharedMemory: true,
+            // @ts-expect-error Intentionally invalid
+            allowedOutputFormats: ['I422P10', 'NOPE'],
+        })).rejects.toThrow(TypeError);
     });
 
     test('Decode arguments', async () => {
@@ -466,18 +501,163 @@ describe('Input validation', () => {
     });
 });
 
-const decodeMutated = async (mutate: (packet: Uint8Array, view: DataView) => void) => {
-    const packet = new Uint8Array(readFileSync(new URL('./public/buck-bunny.prores', import.meta.url)));
-    mutate(packet, new DataView(packet.buffer));
+describe('Multiple decoders', () => {
+    test('Shared memory', async () => {
+        const packet = new Uint8Array(readFileSync(new URL('./public/buck-bunny.prores', import.meta.url)));
 
-    const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
-    if (decoder instanceof Error) {
-        throw decoder;
+        // A synchronous and a multithreaded decoder sharing the same runtime, decoding into the same frame over many
+        // iterations. This path previously corrupted memory due to a stack oopsie.
+        const a = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
+        const b = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 4 });
+        if (a instanceof Error) {
+            throw a;
+        }
+        if (b instanceof Error) {
+            throw b;
+        }
+        using frame = new Frame();
+
+        for (let i = 0; i < 5; i++) {
+            await a.decode(packet, frame);
+            expect(frame.visibleWidth).toBe(1920);
+            expect(frame.pixelFormat).toBe('I422P10');
+
+            await b.decode(packet, frame);
+            expect(frame.visibleWidth).toBe(1920);
+            expect(frame.pixelFormat).toBe('I422P10');
+        }
+
+        await a.close();
+        await b.close();
+    });
+
+    test('Message passing', async () => {
+        const packet = new Uint8Array(readFileSync(new URL('./public/buck-bunny.prores', import.meta.url)));
+
+        // Two decoders sharing the message-passing worker pool, each with a different output format. Each
+        // worker must hold a distinct WASM decoder per main-thread decoder for this to come out right.
+        const a = await Decoder.create({
+            proresFourCc: 'apch',
+            useSharedMemory: false,
+            concurrency: 2,
+            allowedOutputFormats: ['I422P10'],
+        });
+        const b = await Decoder.create({
+            proresFourCc: 'apch',
+            useSharedMemory: false,
+            concurrency: 2,
+            allowedOutputFormats: ['I420'],
+        });
+        if (a instanceof Error) {
+            throw a;
+        }
+        if (b instanceof Error) {
+            throw b;
+        }
+        using frameA = new Frame();
+        using frameB = new Frame();
+
+        await Promise.all([a.decode(packet, frameA), b.decode(packet, frameB)]);
+
+        expect(frameA.pixelFormat).toBe('I422P10');
+        expect(frameB.pixelFormat).toBe('I420');
+        expect(frameA.visibleWidth).toBe(1920);
+        expect(frameB.visibleWidth).toBe(1920);
+
+        await a.close();
+        await b.close();
+    });
+});
+
+describe('Pixel format conversion', () => {
+    const expectedFrameByteLength = (format: PixelFormat, codedWidth: number, codedHeight: number) => {
+        const luma = codedWidth * codedHeight;
+        const chromaSubsampling = format.slice(0, 4); // 'I420', 'I422' or 'I444'
+        const chroma = chromaSubsampling === 'I420' ? luma / 2 : chromaSubsampling === 'I422' ? luma : 2 * luma;
+        const alpha = format[4] === 'A' ? luma : 0;
+        const bytesPerSample = format.endsWith('10') || format.endsWith('12') ? 2 : 1;
+
+        return (luma + chroma + alpha) * bytesPerSample;
+    };
+
+    const sources = [
+        { name: '422 frame', fourCc: 'apch', file: 'buck-bunny.prores', format: 'I422P10' },
+        { name: '444 frame', fourCc: 'apch', file: 'buck-bunny-444.prores', format: 'I444P10' },
+        { name: 'transparent frame', fourCc: 'apch', file: 'transparent-2.prores', format: 'I444AP10' },
+        { name: '12-bit transparent frame', fourCc: 'ap4h', file: '4444-12bit.prores', format: 'I444AP12' },
+    ] as const;
+
+    for (const source of sources) {
+        for (const target of PIXEL_FORMATS) {
+            test(`${source.name} -> ${target}`, async () => {
+                const decoder = await Decoder.create({
+                    proresFourCc: source.fourCc,
+                    useSharedMemory: true,
+                    concurrency: 0,
+                    allowedOutputFormats: [target],
+                });
+                if (decoder instanceof Error) {
+                    throw decoder;
+                }
+                using frame = new Frame();
+                const packet = new Uint8Array(readFileSync(new URL(`./public/${source.file}`, import.meta.url)));
+
+                const result = await decoder.decode(packet, frame);
+                expect(result).toBe(frame);
+                expect(frame.isFilled).toBe(true);
+                expect(frame.pixelFormat).toBe(target);
+                expect(frame.originalPixelFormat).toBe(source.format);
+                expect(frame.frameData!.byteLength).toBe(
+                    expectedFrameByteLength(target, frame.codedWidth!, frame.codedHeight!),
+                );
+
+                await decoder.close();
+            });
+        }
     }
-    const result = await decoder.decode(packet, new Frame());
-    await decoder.close();
+});
 
-    return result;
-};
+describe('Pixel format preference', () => {
+    // The source frame is I422P10. The array below is the decoder's exact order of preference: each entry
+    // is what it should fall back to once everything before it is unavailable. Each test slices one more
+    // format off the front (removing the previously-selected one) and asserts the choice changes accordingly.
+    const preferenceOrder: { format: PixelFormat; reason: string }[] = [
+        { format: 'I422P10', reason: 'picks the actual format when available' },
+        { format: 'I422P12', reason: 'prefers higher bit depth over higher chroma' },
+        { format: 'I444P10', reason: 'prefers higher chroma once bit depth cannot improve losslessly' },
+        { format: 'I422AP10', reason: 'adds an alpha plane when chroma and bit depth are preserved' },
+        { format: 'I420P12', reason: 'with no lossless option left, takes higher bit depth at lower chroma' },
+        { format: 'I420P10', reason: 'prefers lower chroma at the same bit depth' },
+        { format: 'I422', reason: 'prefers lower bit depth at the same chroma' },
+        { format: 'I420', reason: 'steps down both chroma and bit depth' },
+        {
+            format: 'I420A',
+            reason: 'steps down both chroma and bit depth and even adds unnecessary alpha channel, '
+                + 'landing at the worst format',
+        },
+    ];
 
-const picHeaderStart = (view: DataView) => 8 + view.getUint16(8);
+    for (let i = 0; i < preferenceOrder.length; i++) {
+        const { format, reason } = preferenceOrder[i]!;
+
+        test(`${i + 1}. ${reason}`, async () => {
+            const allowedOutputFormats = preferenceOrder.slice(i).map(entry => entry.format);
+            const decoder = await Decoder.create({
+                proresFourCc: 'apch',
+                useSharedMemory: true,
+                concurrency: 0,
+                allowedOutputFormats,
+            });
+            if (decoder instanceof Error) {
+                throw decoder;
+            }
+            using frame = new Frame();
+            const packet = new Uint8Array(readFileSync(new URL('./public/buck-bunny.prores', import.meta.url)));
+
+            await decoder.decode(packet, frame);
+            expect(frame.pixelFormat).toBe(format);
+
+            await decoder.close();
+        });
+    }
+});

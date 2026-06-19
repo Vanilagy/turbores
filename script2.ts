@@ -1,7 +1,7 @@
 import { ALL_FORMATS, EncodedPacketSink, FilePathSource, Input, UrlSource } from 'mediabunny';
 import { Decoder, Frame } from './src/index';
 
-const decoder = await Decoder.create({ useSharedMemory: false });
+const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: false });
 if (decoder instanceof Error) {
     throw decoder;
 }
@@ -26,7 +26,7 @@ for await (const packet of sink.packets()) {
 const start = performance.now();
 let total = 0;
 
-const fileIters = 200;
+const fileIters = 100;
 
 const frame = new Frame();
 
@@ -41,17 +41,21 @@ for (let i = 0; i < fileIters; i++) {
 
         total++;
 
-        //break;
+        break;
 
-        canvas.width = result.displayWidth;
-        canvas.height = result.displayHeight;
+        canvas.width = result.visibleWidth;
+        canvas.height = result.visibleHeight;
 
         const videoFrame = new VideoFrame(result.frameData, {
             format: result.pixelFormat,
             codedWidth: result.codedWidth,
             codedHeight: result.codedHeight,
-            displayWidth: result.displayWidth,
-            displayHeight: result.displayHeight,
+            visibleRect: {
+                x: 0,
+                y: 0,
+                width: result.visibleWidth,
+                height: result.visibleHeight,
+            },
             timestamp: 0,
             duration: 0,
         });
@@ -62,5 +66,5 @@ for (let i = 0; i < fileIters; i++) {
     }
 }
 
-console.log(packetDatas.length, (performance.now() - start) / total);
-//alert((performance.now() - start) / total);
+//console.log(packetDatas.length, (performance.now() - start) / total);
+alert((performance.now() - start) / total);

@@ -313,3 +313,41 @@ pub const BitReader = struct {
         self.bit_health -= bits;
     }
 };
+
+pub inline fn arrayReverse(arr: anytype) @TypeOf(arr) {
+    const len_min_one = arr.len - 1;
+    var reversed: @TypeOf(arr) = undefined;
+
+    for (arr, 0..) |item, i| {
+        reversed[len_min_one - i] = item;
+    }
+
+    return reversed;
+}
+
+// Needed because LLVM cannot be trusted
+pub inline fn wasmShuffle(
+    a: @Vector(16, u8),
+    b: @Vector(16, u8),
+    comptime mask: [16]u8,
+) @Vector(16, u8) {
+    @setEvalBranchQuota(1000000);
+
+    const lanes = comptime blk: {
+        var s: []const u8 = "i8x16.shuffle ";
+        for (mask, 0..) |idx, i| {
+            std.debug.assert(idx < 32);
+            s = s ++ (if (i == 0) "" else ", ") ++ std.fmt.comptimePrint("{d}", .{idx});
+        }
+        break :blk s;
+    };
+
+    return asm volatile ("local.get %[a]\n" ++
+            "local.get %[b]\n" ++
+            lanes ++ "\n" ++
+            "local.set %[ret]"
+        : [ret] "=r" (-> @Vector(16, u8)),
+        : [a] "r" (a),
+          [b] "r" (b),
+    );
+}

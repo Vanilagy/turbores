@@ -14,7 +14,8 @@ const executeDecodeTask = @import("./decoder.zig").executeDecodeTask;
 export fn allocateWorkerStack() ?[*]u8 {
     // 512 KiB per worker should be plenty
     const stack = gpa.alloc(u8, 512 * 1024) catch return null;
-    return stack.ptr;
+    // The WASM stack grows downward, so the stack pointer must start at the TOP of the buffer
+    return stack.ptr + stack.len;
 }
 
 export fn allocateThreadLocalState(size: usize, alignment: u8) ?[*]u8 {

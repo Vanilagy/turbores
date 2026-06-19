@@ -17,11 +17,39 @@ Symbol.dispose ??= Symbol('dispose');
 // @ts-expect-error Readonly
 Symbol.asyncDispose ??= Symbol('asyncDispose');
 
+/** List of supported frame pixel formats. */
+export const PIXEL_FORMATS = [
+    // 4:2:0 Y, U, V
+    'I420',
+    'I420P10',
+    'I420P12',
+    // 4:2:0 Y, U, V, A
+    'I420A',
+    'I420AP10',
+    'I420AP12',
+    // 4:2:2 Y, U, V
+    'I422',
+    'I422P10',
+    'I422P12',
+    // 4:2:2 Y, U, V, A
+    'I422A',
+    'I422AP10',
+    'I422AP12',
+    // 4:4:4 Y, U, V
+    'I444',
+    'I444P10',
+    'I444P12',
+    // 4:4:4 Y, U, V, A
+    'I444A',
+    'I444AP10',
+    'I444AP12',
+] as const;
+
 /**
  * Describes the pixel format of a decoded frame, including YUV chroma subsampling, bit depth, and alpha presence. The
  * strings are compatible with the WebCodecs API's `VideoPixelFormat`.
  */
-export type PixelFormat = `I${'422' | '444'}${'' | 'A'}P${'10' | '12'}`;
+export type PixelFormat = typeof PIXEL_FORMATS[number];
 
 // For automatic freeing of the WASM side
 const frameRegistry = new FinalizationRegistry<{ runtime: SharedMemoryRuntime; ptr: number }>(({ runtime, ptr }) => {
@@ -56,8 +84,13 @@ export class Frame implements Disposable {
      * always starts in the top-left corner of the coded rectangle.
      */
     visibleHeight: number | null = null;
-    /** The pixel format of the decoded frame. */
+    /** The pixel format of this frame's data. */
     pixelFormat: PixelFormat | null = null;
+    /**
+     * The original frame pixel format as specified by the packet. If no conversion has taken place, this will match
+     * {@link Frame.pixelFormat}.
+     */
+    originalPixelFormat: PixelFormat | null = null;
     /**
      * The color primaries of the decoded frame's color space. The values correspond to those defined in
      * ISO/IEC 23091-4:
@@ -252,6 +285,7 @@ export class Frame implements Disposable {
         this.visibleWidth = contents.visibleWidth;
         this.visibleHeight = contents.visibleHeight;
         this.pixelFormat = contents.pixelFormat;
+        this.originalPixelFormat = contents.originalPixelFormat;
         this.colorPrimaries = contents.colorPrimaries;
         this.colorTransfer = contents.colorTransfer;
         this.colorMatrix = contents.colorMatrix;
@@ -271,32 +305,40 @@ export type FrameContents = {
     visibleWidth: number;
     visibleHeight: number;
     pixelFormat: PixelFormat;
+    originalPixelFormat: PixelFormat;
     colorPrimaries: number;
     colorTransfer: number;
     colorMatrix: number;
     colorRangeFull: false;
 };
 
-export const readFrameContents = (exports: WasmExports, memory: WebAssembly.Memory, ptr: number): FrameContents => {
-    const frameDataPtr = exports.getFrameDataPtr(ptr);
-    const frameDataSize = exports.getFrameDataSize(ptr);
-    const frameData = new Uint8Array(memory.buffer, frameDataPtr, frameDataSize * 2);
+export const readFrameContents = (
+    exports: WasmExports,
+    memory: WebAssembly.Memory,
+    framePtr: number,
+    decoderPtr: number,
+): FrameContents => {
+    const frameDataPtr = exports.getFrameDataPtr(framePtr);
+    const frameDataSize = exports.getFrameDataSize(framePtr);
+    const frameData = new Uint8Array(memory.buffer, frameDataPtr, frameDataSize);
 
-    const chroma = exports.getChromaSubsampling(ptr);
-    const alpha = exports.getAlphaBitDepth(ptr) !== 0 ? 'A' : '';
-    const bitDepth = exports.getBitDepth(ptr);
-    const pixelFormat = `I${chroma}${alpha}P${bitDepth}` as PixelFormat;
+    const pixelFormat = PIXEL_FORMATS[exports.getFramePixelFormat(framePtr)];
+    assert(pixelFormat !== undefined);
+
+    const originalPixelFormat = PIXEL_FORMATS[exports.getOriginalPixelFormat(decoderPtr)];
+    assert(originalPixelFormat !== undefined);
 
     return {
         frameData,
-        codedWidth: exports.getCodedWidth(ptr),
-        codedHeight: exports.getCodedHeight(ptr),
-        visibleWidth: exports.getVisibleWidth(ptr),
-        visibleHeight: exports.getVisibleHeight(ptr),
+        codedWidth: exports.getCodedWidth(framePtr),
+        codedHeight: exports.getCodedHeight(framePtr),
+        visibleWidth: exports.getVisibleWidth(framePtr),
+        visibleHeight: exports.getVisibleHeight(framePtr),
         pixelFormat,
-        colorPrimaries: exports.getColorPrimaries(ptr),
-        colorTransfer: exports.getColorTransfer(ptr),
-        colorMatrix: exports.getColorMatrix(ptr),
+        originalPixelFormat,
+        colorPrimaries: exports.getColorPrimaries(framePtr),
+        colorTransfer: exports.getColorTransfer(framePtr),
+        colorMatrix: exports.getColorMatrix(framePtr),
         colorRangeFull: false, // Always limited range, but expose it for clarity
     };
 };

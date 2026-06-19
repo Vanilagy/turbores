@@ -15,8 +15,9 @@ import { initWasmModule, type WasmExports } from './wasm.js';
 let messagePassingState: {
     exports: WasmExports;
     memory: WebAssembly.Memory;
-    decoder: number;
-    // Each worker only ever allocates a single WASM Frame, which it decodes every packet into
+    // One WASM decoder per main-thread decoder, keyed by its id
+    decoders: Map<number, number>;
+    // A single Frame is enough: decodes within a worker are serialized, so they take turns using it
     frame: number;
 } | null = null;
 
@@ -35,7 +36,7 @@ const onMessage = async (message: WorkerMessage) => {
         }
 
         case MessageType.MessagePassingInit: {
-            // Since we only ever use one decoder, 512 MiB should be plenty
+            // We only keep one frame around, so 512 MiBs of memory is plenty
             const memory = new WebAssembly.Memory({ initial: 32, maximum: 8192, shared: true });
             const exports = await initWasmModule(message.wasmBinary, memory);
 
@@ -51,16 +52,6 @@ const onMessage = async (message: WorkerMessage) => {
             exports.__wasm_init_tls(tlsPointer);
             exports.setIsBrowserMainThread(Number(false));
 
-            const decoder = exports.createDecoder(0); // Concurrent 0 = decode synchronously
-            if (decoder === 0) {
-                sendMessage({
-                    type: MessageType.InitOutOfMemoryError,
-                    message: 'Failed to create decoder.',
-                });
-
-                return;
-            }
-
             const frame = exports.createFrame();
             if (frame === 0) {
                 sendMessage({
@@ -71,16 +62,57 @@ const onMessage = async (message: WorkerMessage) => {
                 return;
             }
 
-            messagePassingState = { exports, memory, decoder, frame };
+            messagePassingState = { exports, memory, decoders: new Map(), frame };
             sendMessage({ type: MessageType.Ready });
+
+            return;
+        }
+
+        case MessageType.CreateDecoder: {
+            assert(messagePassingState);
+            const { exports } = messagePassingState;
+            const { decoderId, bitDepth, allowedOutputFormats } = message;
+
+            // Concurrency 0 = decode synchronously, since each worker is itself one unit of parallelism
+            const decoder = exports.createDecoder(0, bitDepth, allowedOutputFormats);
+            if (decoder === 0) {
+                // Leave it unregistered and fail later
+                return;
+            }
+
+            messagePassingState.decoders.set(decoderId, decoder);
+
+            return;
+        }
+
+        case MessageType.CloseDecoder: {
+            assert(messagePassingState);
+            const { exports, decoders } = messagePassingState;
+
+            const decoder = decoders.get(message.decoderId);
+            if (decoder !== undefined) {
+                exports.closeDecoder(decoder);
+                decoders.delete(message.decoderId);
+            }
 
             return;
         }
 
         case MessageType.Decode: {
             assert(messagePassingState);
-            const { exports, memory, decoder, frame } = messagePassingState;
-            const { id, packet, bitDepth, frameBuffer: buffer } = message;
+            const { exports, memory, decoders, frame } = messagePassingState;
+            const { id, decoderId, packet, frameBuffer: buffer } = message;
+
+            const decoder = decoders.get(decoderId);
+            if (decoder === undefined) {
+                sendMessage({
+                    type: MessageType.DecodeError,
+                    id,
+                    code: ErrorCode.OutOfMemory,
+                });
+
+                return;
+            }
 
             const packetPtr = exports.allocatePacket(decoder, packet.byteLength);
             if (packetPtr === 0) {
@@ -94,7 +126,7 @@ const onMessage = async (message: WorkerMessage) => {
             }
             new Uint8Array(memory.buffer).set(packet, packetPtr);
 
-            const code = exports.decodePacket(decoder, frame, bitDepth);
+            const code = exports.decodePacket(decoder, frame);
             if (code < 0) {
                 let errorMessage: string | undefined = undefined;
                 const messagePtr = exports.getErrorMessagePtr(decoder);
@@ -113,11 +145,11 @@ const onMessage = async (message: WorkerMessage) => {
                 return;
             }
 
-            const contents = readFrameContents(exports, memory, frame);
+            const contents = readFrameContents(exports, memory, frame, decoder);
 
-            // Copy the frame data out of the WASM memory, reusing the buffer that was sent along
-            // if it has the right size. Frames of constant size therefore cause no allocations:
-            // their buffer just ping-pongs between this worker and the main thread.
+            // Copy the frame data out of the WASM memory, reusing the buffer that was sent along if it has the right
+            // size. Frames of constant size therefore cause no allocations: their buffer just ping-pongs between this
+            // worker and the main thread.
             const outBuffer = buffer && buffer.byteLength === contents.frameData.byteLength
                 ? buffer
                 : new ArrayBuffer(contents.frameData.byteLength);

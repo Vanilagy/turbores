@@ -16,7 +16,7 @@ import {
     OutOfMemoryError,
     UnexpectedEofError,
 } from './errors.js';
-import { Frame, readFrameContents, type FilledFrame } from './frame.js';
+import { Frame, PIXEL_FORMATS, PixelFormat, readFrameContents, type FilledFrame } from './frame.js';
 import { MessageType, type WorkerMessage, type WorkerReply } from './messages.js';
 import { assert, canUseSharedMemory, decodeUtf8 } from './misc.js';
 import {
@@ -26,16 +26,6 @@ import {
     type SharedMemoryRuntime,
     type MessagePassingRuntime,
 } from './runtime.js';
-
-/** Per-packet decode options. */
-export type DecodeOptions = {
-    /**
-     * Whether to transfer the `ArrayBuffer` that's backing the packet's data. There is no benefit to this when using
-     * `DecoderOptions.useSharedMemory: true`, but when using the fallback path, this provides a speedup as it doesn't
-     * need to copy the packet data to send it to the worker.
-     */
-    transfer?: boolean;
-};
 
 const PRORES_FOURCCS = [
     'ap4x', // ProRes 4444 XQ
@@ -72,6 +62,27 @@ export type DecoderOptions = {
      * `0` to use no workers and to enable synchronous decoding, which will block the thread.
      */
     concurrency?: number;
+    /**
+     * A non-empty list of frame pixel formats that, when provided, the decoder *must* output. Can be used to limit the
+     * pixel formats the decoder emits to only those formats that your downstream code can handle.
+     *
+     * When omitted, frames will always be emitted in their native pixel format as indicated in the ProRes packet.
+     *
+     * When the frame's native format is not present in this list, the decoder will first try to choose an alternative
+     * format that avoids data loss. If none are available, it will try to pick the best format with the least amount
+     * of loss, preferring maintaining bit depth over chroma resolution.
+     */
+    allowedOutputFormats?: PixelFormat[];
+};
+
+/** Per-packet decode options. */
+export type DecodeOptions = {
+    /**
+     * Whether to transfer the `ArrayBuffer` that's backing the packet's data. There is no benefit to this when using
+     * `DecoderOptions.useSharedMemory: true`, but when using the fallback path, this provides a speedup as it doesn't
+     * need to copy the packet data to send it to the worker.
+     */
+    transfer?: boolean;
 };
 
 /**
@@ -149,6 +160,16 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
         ) {
             throw new TypeError('options.concurrency, when provided, must be a non-negative integer.');
         }
+        if (options.allowedOutputFormats && !(
+            Array.isArray(options.allowedOutputFormats)
+            && options.allowedOutputFormats.length > 0
+            && options.allowedOutputFormats.every(x => PIXEL_FORMATS.includes(x))
+        )) {
+            throw new TypeError(
+                `options.allowedOutputFormats, when provided, must be a non-empty array containing any of: `
+                + `${PIXEL_FORMATS.join(', ')}.`,
+            );
+        }
 
         if (options.useSharedMemory && !canUseSharedMemory) {
             return new NotSupportedError(
@@ -159,6 +180,17 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
                 + 'supported by Safari).\nOtherwise, pass useSharedMemory: false to use a slower, '
                 + 'worker-based fallback.',
             );
+        }
+
+        // Build a bit field containing the list if allowed output formats
+        let allowedOutputFormatsBitfield: number;
+        if (options.allowedOutputFormats) {
+            allowedOutputFormatsBitfield = 0;
+            for (const format of options.allowedOutputFormats) {
+                allowedOutputFormatsBitfield |= 1 << PIXEL_FORMATS.indexOf(format);
+            }
+        } else {
+            allowedOutputFormatsBitfield = 0xffffffff;
         }
 
         const bitDepth = options.proresFourCc === 'ap4h' || options.proresFourCc === 'ap4x'
@@ -174,13 +206,13 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
 
             await runtime.ensureWorkers(concurrency);
 
-            const decoderPtr = runtime.exports.createDecoder(concurrency);
+            const decoderPtr = runtime.exports.createDecoder(concurrency, bitDepth, allowedOutputFormatsBitfield);
             if (decoderPtr === 0) {
                 runtime.unref();
                 return new OutOfMemoryError();
             }
 
-            return new SharedMemoryDecoder(runtime, decoderPtr, concurrency, bitDepth) as Decoder;
+            return new SharedMemoryDecoder(runtime, decoderPtr, concurrency) as Decoder;
         } else {
             // No shared memory: use the message-passing runtime
             const runtime = getMessagePassingRuntime();
@@ -192,7 +224,12 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
                 return failure;
             }
 
-            return new MessagePassingDecoder(runtime, concurrency, bitDepth) as Decoder;
+            return new MessagePassingDecoder(
+                runtime,
+                concurrency,
+                bitDepth,
+                allowedOutputFormatsBitfield,
+            ) as Decoder;
         }
     }
 
@@ -301,23 +338,20 @@ const sharedMemoryDecoderRegistry = new FinalizationRegistry<{ runtime: SharedMe
 // Used when proper shared memory is available
 class SharedMemoryDecoder extends Decoder {
     /** @internal */
-    _bitDepth: number;
-    /** @internal */
     _runtime: SharedMemoryRuntime | null;
     /** @internal */
-    _ptr: number;
+    _decoderPtr: number;
     /** @internal */
     _waitWordAddress: number;
 
     override readonly useSharedMemory = true;
     override readonly concurrency: number;
 
-    constructor(runtime: SharedMemoryRuntime, ptr: number, concurrency: number, bitDepth: number) {
+    constructor(runtime: SharedMemoryRuntime, ptr: number, concurrency: number) {
         super(false);
         this._runtime = runtime;
-        this._ptr = ptr;
+        this._decoderPtr = ptr;
         this._waitWordAddress = runtime.exports.getWaitWordAddress(ptr);
-        this._bitDepth = bitDepth;
         this.concurrency = concurrency;
 
         sharedMemoryDecoderRegistry.register(this, { runtime, ptr }, this);
@@ -327,7 +361,7 @@ class SharedMemoryDecoder extends Decoder {
         assert(this._runtime);
 
         sharedMemoryDecoderRegistry.unregister(this);
-        this._runtime.exports.closeDecoder(this._ptr);
+        this._runtime.exports.closeDecoder(this._decoderPtr);
         this._runtime.unref();
 
         this._runtime = null; // Allow it to get GCd if necessary
@@ -348,13 +382,13 @@ class SharedMemoryDecoder extends Decoder {
             packetData = structuredClone(packetData, { transfer: [packetData.buffer] });
         }
 
-        const packetPtr = exports.allocatePacket(this._ptr, packetData.byteLength);
+        const packetPtr = exports.allocatePacket(this._decoderPtr, packetData.byteLength);
         if (packetPtr === 0) {
             return new OutOfMemoryError();
         }
         new Uint8Array(memory.buffer).set(packetData, packetPtr);
 
-        let resultCode = exports.decodePacket(this._ptr, framePtr, this._bitDepth);
+        let resultCode = exports.decodePacket(this._decoderPtr, framePtr);
         if (resultCode < 0) {
             return this._createError(resultCode);
         }
@@ -363,14 +397,14 @@ class SharedMemoryDecoder extends Decoder {
             // Wait for all workers to finish
             await Atomics.waitAsync(new Int32Array(memory.buffer), this._waitWordAddress / 4, 0).value;
 
-            resultCode = exports.finalizePacketDecoding(this._ptr);
+            resultCode = exports.finalizePacketDecoding(this._decoderPtr);
             if (resultCode < 0) {
                 return this._createError(resultCode);
             }
         }
 
         // The frame data is not copied; it's a direct view into the WASM memory
-        frame._populate(readFrameContents(exports, memory, framePtr));
+        frame._populate(readFrameContents(exports, memory, framePtr, this._decoderPtr));
         return frame as FilledFrame;
     }
 
@@ -381,9 +415,9 @@ class SharedMemoryDecoder extends Decoder {
 
         let errorMessage: string | undefined = undefined;
 
-        const messagePtr = exports.getErrorMessagePtr(this._ptr);
+        const messagePtr = exports.getErrorMessagePtr(this._decoderPtr);
         if (messagePtr !== 0) {
-            const size = exports.getErrorMessageSize(this._ptr);
+            const size = exports.getErrorMessageSize(this._decoderPtr);
             errorMessage = decodeUtf8(new Uint8Array(memory.buffer, messagePtr, size));
         }
 
@@ -402,22 +436,32 @@ class MessagePassingDecoder extends Decoder {
     /** @internal */
     _runtime: MessagePassingRuntime | null;
     /** @internal */
-    _bitDepth: number;
+    _decoderId: number;
 
     override readonly useSharedMemory = false;
     override readonly concurrency: number;
 
-    constructor(runtime: MessagePassingRuntime, concurrency: number, bitDepth: number) {
+    constructor(
+        runtime: MessagePassingRuntime,
+        concurrency: number,
+        bitDepth: number,
+        allowedOutputFormats: number,
+    ) {
         super(true);
         this._runtime = runtime;
         this.concurrency = concurrency;
-        this._bitDepth = bitDepth;
+        this._decoderId = runtime.nextDecoderId++;
+
+        // Spin up our own decoder on every worker; the workers are shared across decoder instances
+        runtime.registerDecoder(this._decoderId, bitDepth, allowedOutputFormats);
 
         messagePassingDecoderRegistry.register(this, runtime, this);
     }
 
     protected _runClose() {
         assert(this._runtime);
+
+        this._runtime.unregisterDecoder(this._decoderId);
 
         messagePassingDecoderRegistry.unregister(this);
         this._runtime.unref();
@@ -457,8 +501,8 @@ class MessagePassingDecoder extends Decoder {
                 {
                     type: MessageType.Decode,
                     id,
+                    decoderId: this._decoderId,
                     packet,
-                    bitDepth: this._bitDepth,
                     frameBuffer,
                 } satisfies WorkerMessage,
                 frameBuffer ? [packet.buffer, frameBuffer] : [packet.buffer],

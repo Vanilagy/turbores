@@ -9,6 +9,9 @@ const misc = @import("./misc.zig");
 const gpa = misc.gpa;
 const io = misc.io;
 const worker = @import("./worker.zig");
+const Frame = @import("./frame.zig").Frame;
+const PixelFormat = @import("./frame.zig").PixelFormat;
+const getYuvPixelFormat = @import("./frame.zig").getYuvPixelFormat;
 
 const S = [_]f32{
     // The "8" bakes in three halving steps that we then don't need to do anymore in the IDCT
@@ -32,34 +35,35 @@ const A = [_]f32{
 };
 
 pub const Decoder = struct {
+    concurrency: u32,
+    allowed_output_formats: u32,
+
     packet: []u8,
+
     slice_width: u32,
     slice_info_in_row: std.MultiArrayList(SliceInfo),
     max_slice_width: u32,
     slice_sizes: []usize,
     slice_offsets: []usize,
+
+    log2_chroma_blocks_per_mb: u32,
+    bit_depth: u32,
+    alpha_bit_depth: u32,
+
     luma_scaling_matrix: [64]f32,
     chroma_scaling_matrix: [64]f32,
-    concurrency: u32,
+    dc_offset: f32,
+
     tasks: []DecodeTask,
     running_task_count: std.atomic.Value(u32),
     wait_word: u32,
     worker_error: std.atomic.Value(?*worker.WorkerError),
-    error_message: ?[]const u8,
-};
 
-pub const Frame = struct {
-    frame_data: []align(16) u16,
-    coded_width: u32,
-    coded_height: u32,
-    visible_width: u32,
-    visible_height: u32,
-    log2_chroma_blocks_per_mb: u5,
-    alpha_bit_depth: u32,
-    bit_depth: u32,
-    color_primaries: u32,
-    color_transfer: u32,
-    color_matrix: u32,
+    error_message: ?[]const u8,
+
+    inline fn pixelFormatIsAvailable(self: *Decoder, pixel_format: PixelFormat) bool {
+        return (self.allowed_output_formats & (@as(u32, 1) << @intFromEnum(pixel_format))) != 0;
+    }
 };
 
 const SliceInfo = struct {
@@ -80,100 +84,49 @@ pub const DecodeTask = struct {
     error_message: ?[]const u8,
 };
 
-export fn createDecoder(concurrency: u32) ?*Decoder {
+export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats: u32) ?*Decoder {
+    std.debug.assert(bit_depth == 10 or bit_depth == 12);
+    std.debug.assert(allowed_output_formats != 0); // Ensured by the caller
+
     const result = gpa.create(Decoder) catch return null;
 
     result.* = .{
+        .concurrency = concurrency,
+        .allowed_output_formats = allowed_output_formats,
+
         .packet = &.{},
+
         .slice_width = undefined,
         .slice_info_in_row = .empty,
         .max_slice_width = undefined,
         .slice_sizes = &.{},
         .slice_offsets = &.{},
+
+        .log2_chroma_blocks_per_mb = undefined,
+        .bit_depth = bit_depth,
+        .alpha_bit_depth = undefined,
+
         .luma_scaling_matrix = undefined,
         .chroma_scaling_matrix = undefined,
-        .concurrency = concurrency,
+        .dc_offset = undefined,
+
         .tasks = &.{},
         .running_task_count = .init(0),
         .wait_word = 0,
         .worker_error = .init(null),
+
         .error_message = null,
     };
 
     return result;
 }
 
-export fn createFrame() ?*Frame {
-    const result = gpa.create(Frame) catch return null;
-
-    result.* = .{
-        .frame_data = &.{},
-        .coded_width = undefined,
-        .coded_height = undefined,
-        .visible_width = undefined,
-        .visible_height = undefined,
-        .log2_chroma_blocks_per_mb = undefined,
-        .alpha_bit_depth = undefined,
-        .bit_depth = undefined,
-        .color_primaries = undefined,
-        .color_transfer = undefined,
-        .color_matrix = undefined,
-    };
-
-    return result;
-}
-
-export fn closeFrame(frame: *Frame) void {
-    gpa.free(frame.frame_data);
-    gpa.destroy(frame);
-}
-
-export fn getVisibleWidth(frame: *Frame) u32 {
-    return frame.visible_width;
-}
-
-export fn getVisibleHeight(frame: *Frame) u32 {
-    return frame.visible_height;
-}
-
-export fn getCodedWidth(frame: *Frame) u32 {
-    return frame.coded_width;
-}
-
-export fn getCodedHeight(frame: *Frame) u32 {
-    return frame.coded_height;
-}
-
-export fn getFrameDataPtr(frame: *Frame) [*]u16 {
-    return frame.frame_data.ptr;
-}
-
-export fn getFrameDataSize(frame: *Frame) usize {
-    return frame.frame_data.len;
-}
-
-export fn getChromaSubsampling(frame: *Frame) u32 {
-    return if (frame.log2_chroma_blocks_per_mb == 2) 444 else 422;
-}
-
-export fn getBitDepth(frame: *Frame) u32 {
-    return frame.bit_depth;
-}
-
-export fn getAlphaBitDepth(frame: *Frame) u32 {
-    return frame.alpha_bit_depth;
-}
-
-export fn getColorPrimaries(frame: *Frame) u32 {
-    return frame.color_primaries;
-}
-
-export fn getColorTransfer(frame: *Frame) u32 {
-    return frame.color_transfer;
-}
-
-export fn getColorMatrix(frame: *Frame) u32 {
-    return frame.color_matrix;
+export fn getOriginalPixelFormat(decoder: *Decoder) u32 {
+    return @intFromEnum(getYuvPixelFormat(
+        decoder.log2_chroma_blocks_per_mb,
+        decoder.bit_depth,
+        decoder.alpha_bit_depth != 0,
+    ));
 }
 
 export fn getErrorMessagePtr(decoder: *Decoder) ?[*]const u8 {
@@ -202,16 +155,14 @@ export fn getWaitWordAddress(decoder: *Decoder) *u32 {
     return &decoder.wait_word;
 }
 
-export fn decodePacket(decoder: *Decoder, frame: *Frame, bit_depth: u32) i32 {
-    decodePacketInternal(decoder, frame, bit_depth) catch |err| return misc.toErrorCode(err);
+export fn decodePacket(decoder: *Decoder, frame: *Frame) i32 {
+    decodePacketInternal(decoder, frame) catch |err| return misc.toErrorCode(err);
     return 0;
 }
 
 threadlocal var error_print_buffer: [1024]u8 = undefined;
 
-inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame, bit_depth: u32) misc.ConvertibleError!void {
-    std.debug.assert(bit_depth == 10 or bit_depth == 12);
-
+inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.ConvertibleError!void {
     decoder.error_message = null;
     decoder.worker_error.store(null, .seq_cst);
 
@@ -267,6 +218,10 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame, bit_depth: u32)
         return error.NotSupported;
     }
 
+    const chrominance_flag = (frame_flags >> 6) & 1;
+    const log2_chroma_blocks_per_mb: u32 = @intCast(chrominance_flag + 1); // 1 => 422, 2 => 444
+    decoder.log2_chroma_blocks_per_mb = log2_chroma_blocks_per_mb;
+
     reader.toss(1); // Reserved
     frame.color_primaries = try reader.takeInt(u8);
     frame.color_transfer = try reader.takeInt(u8);
@@ -281,6 +236,9 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame, bit_depth: u32)
         return error.InvalidData;
     }
 
+    const alpha_bit_depth = alpha_info << 3;
+    decoder.alpha_bit_depth = alpha_bit_depth;
+
     reader.toss(1);
     const q_mat_flags = try reader.takeInt(u8);
 
@@ -289,20 +247,95 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame, bit_depth: u32)
     else
         @splat(4);
 
-    // Fold the dequantization and AAN scaling factors into a single matrix
+    const q_mat_chroma: [64]u8 = if (q_mat_flags & 0b01 != 0)
+        (try reader.takeArray(64)).*
+    else
+        q_mat_luma; // When no chroma matrix is sent, the luma matrix is reused for chroma
+
+    const has_alpha = alpha_bit_depth != 0;
+    const actual_pixel_format = getYuvPixelFormat(
+        log2_chroma_blocks_per_mb,
+        decoder.bit_depth,
+        has_alpha,
+    );
+
+    frame.log2_chroma_blocks_per_mb = log2_chroma_blocks_per_mb;
+    frame.bit_depth = decoder.bit_depth;
+    frame.alpha_bit_depth = alpha_bit_depth;
+
+    if (!decoder.pixelFormatIsAvailable(actual_pixel_format)) blk: {
+        const alpha_states = [_]bool{ false, true };
+        const chroma_subsamplings = [_]u32{ 0, 1, 2 };
+        const bit_depths = [_]u32{ 8, 10, 12 };
+        const new_alpha_bit_depth: i32 = if (alpha_bit_depth != 0) alpha_bit_depth else -1;
+
+        // Try to find a *better* format to convert to, losslessly
+        for (alpha_states) |has_alpha_2| {
+            for (chroma_subsamplings) |log2_chroma_blocks_per_mb_2| {
+                for (bit_depths) |bit_depth_2| {
+                    const is_worse = @intFromBool(has_alpha_2) < @intFromBool(has_alpha) or
+                        log2_chroma_blocks_per_mb_2 < log2_chroma_blocks_per_mb or
+                        bit_depth_2 < decoder.bit_depth;
+                    if (is_worse) {
+                        continue;
+                    }
+
+                    const pixel_format = getYuvPixelFormat(
+                        log2_chroma_blocks_per_mb_2,
+                        bit_depth_2,
+                        has_alpha_2,
+                    );
+                    if (decoder.pixelFormatIsAvailable(pixel_format)) {
+                        frame.log2_chroma_blocks_per_mb = log2_chroma_blocks_per_mb_2;
+                        frame.alpha_bit_depth = if (has_alpha_2) new_alpha_bit_depth else 0;
+                        frame.bit_depth = bit_depth_2;
+
+                        break :blk;
+                    }
+                }
+            }
+        }
+
+        // We must throw away some data, so find the least-bad worse format
+        for ([_]bool{ false, true }) |has_alpha_is_different| {
+            const has_alpha_2 = has_alpha != has_alpha_is_different; // != is xor here
+
+            for (misc.arrayReverse(bit_depths)) |bit_depth_2| {
+                for (misc.arrayReverse(chroma_subsamplings)) |log2_chroma_blocks_per_mb_2| {
+                    const pixel_format = getYuvPixelFormat(
+                        log2_chroma_blocks_per_mb_2,
+                        bit_depth_2,
+                        has_alpha_2,
+                    );
+                    if (decoder.pixelFormatIsAvailable(pixel_format)) {
+                        frame.log2_chroma_blocks_per_mb = log2_chroma_blocks_per_mb_2;
+                        frame.alpha_bit_depth = if (has_alpha_2) new_alpha_bit_depth else 0;
+                        frame.bit_depth = bit_depth_2;
+
+                        break :blk;
+                    }
+                }
+            }
+        }
+    }
+
+    // To achieve the desired output bit depth, we must derive a scaling factor for it
+    const output_value_scaling = if (frame.bit_depth >= decoder.bit_depth)
+        @as(f32, @floatFromInt(@as(u32, 1) << @as(u5, @intCast(frame.bit_depth - decoder.bit_depth))))
+    else
+        1 / @as(f32, @floatFromInt(@as(u32, 1) << @as(u5, @intCast(decoder.bit_depth - frame.bit_depth))));
+    decoder.dc_offset = output_value_scaling * (comptime 4096 / (S[0] * S[0]));
+
+    // Fold the dequantization, AAN scaling factors and bit depth scaling into a single matrix
     inline for (0..8) |x| {
         inline for (0..8) |y| {
             const i = 8 * y + x;
             decoder.luma_scaling_matrix[i] = @floatFromInt(q_mat_luma[8 * x + y]); // Read the matrix transposed-ly
             decoder.luma_scaling_matrix[i] *= 0.25; // >> 2
             decoder.luma_scaling_matrix[i] *= comptime 1 / (S[x] * S[y]);
+            decoder.luma_scaling_matrix[i] *= output_value_scaling;
         }
     }
-
-    const q_mat_chroma: [64]u8 = if (q_mat_flags & 0b01 != 0)
-        (try reader.takeArray(64)).*
-    else
-        q_mat_luma; // When no chroma matrix is sent, the luma matrix is reused for chroma
 
     inline for (0..8) |x| {
         inline for (0..8) |y| {
@@ -310,26 +343,30 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame, bit_depth: u32)
             decoder.chroma_scaling_matrix[i] = @floatFromInt(q_mat_chroma[8 * x + y]); // Read the matrix transposed-ly
             decoder.chroma_scaling_matrix[i] *= 0.25; // >> 2
             decoder.chroma_scaling_matrix[i] *= comptime 1 / (S[x] * S[y]);
+            decoder.chroma_scaling_matrix[i] *= output_value_scaling;
         }
     }
-
-    const chrominance_flag = (frame_flags >> 6) & 1;
-    frame.log2_chroma_blocks_per_mb = @intCast(chrominance_flag + 1); // 0 => 422, 1 => 444
-
-    frame.alpha_bit_depth = alpha_info << 3;
-    frame.bit_depth = bit_depth;
 
     frame.visible_width = frame_width;
     frame.visible_height = frame_height;
     frame.coded_width = (frame_width + 15) & ~@as(u32, 15);
     frame.coded_height = (frame_height + 15) & ~@as(u32, 15);
 
-    var multiplier = frame.log2_chroma_blocks_per_mb + 1;
-    if (alpha_info != 0) {
-        multiplier += 1;
+    const luma_data_size = frame.coded_width * frame.coded_height;
+    var frame_data_size = luma_data_size;
+    if (frame.log2_chroma_blocks_per_mb == 0) {
+        frame_data_size += frame_data_size >> 1;
+    } else {
+        frame_data_size *= frame.log2_chroma_blocks_per_mb + 1;
     }
 
-    const frame_data_size = multiplier * (frame.coded_width * frame.coded_height);
+    if (frame.alpha_bit_depth != 0) {
+        frame_data_size += luma_data_size;
+    }
+
+    const bytes_per_sample = (frame.bit_depth + 7) >> 3;
+    frame_data_size *= bytes_per_sample;
+
     frame.frame_data = try gpa.realloc(frame.frame_data, frame_data_size);
 
     if (8 + hdr_size < reader.pos) {
@@ -452,15 +489,17 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame, bit_depth: u32)
 
     if (task_count == 0) {
         // Synchronous, just decode right here right now
-        var task = DecodeTask{
+        decoder.tasks = try gpa.realloc(decoder.tasks, 1);
+        decoder.tasks[0] = .{
             .decoder = decoder,
             .frame = frame,
             .slice_start = 0,
             .slice_count = total_slices,
             .error_message = null,
         };
+        const task = &decoder.tasks[0];
 
-        executeDecodeTask(&task) catch |err| {
+        executeDecodeTask(task) catch |err| {
             decoder.error_message = task.error_message;
             return err;
         };
@@ -555,7 +594,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     var reader = misc.ByteReader.init(decoder.packet);
 
     const max_num_luma_blocks = decoder.max_slice_width << 2;
-    const max_num_chroma_blocks = decoder.max_slice_width << frame.log2_chroma_blocks_per_mb;
+    const max_num_chroma_blocks = decoder.max_slice_width << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
 
     const max_luma_slice_len = max_num_luma_blocks << 6;
     const max_chroma_slice_len = max_num_chroma_blocks << 6;
@@ -564,11 +603,18 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     const chroma_scaling_matrix = decoder.chroma_scaling_matrix;
 
     const frame_data = frame.frame_data;
+    const bytes_per_sample = (frame.bit_depth + 7) >> 3;
     const chroma_entries = (frame.coded_width * frame.coded_height) >> @as(u5, @intCast(2 - frame.log2_chroma_blocks_per_mb));
-    const luma_frame_data = frame_data[0 .. frame.coded_width * frame.coded_height];
-    const u_frame_data = frame_data[frame.coded_width * frame.coded_height ..][0..chroma_entries];
-    const v_frame_data = frame_data[frame.coded_width * frame.coded_height + chroma_entries ..][0..chroma_entries];
-    const alpha_frame_data = frame_data[frame.coded_width * frame.coded_height + (chroma_entries << 1) ..];
+
+    // The alignment guarantees are provided by the coded dimensions always being a multiple of 16
+    const luma_frame_data =
+        frame_data[0 .. bytes_per_sample * frame.coded_width * frame.coded_height];
+    const u_frame_data: []align(2) u8 =
+        @alignCast(frame_data[bytes_per_sample * frame.coded_width * frame.coded_height ..][0 .. bytes_per_sample * chroma_entries]);
+    const v_frame_data: []align(2) u8 =
+        @alignCast(frame_data[bytes_per_sample * (frame.coded_width * frame.coded_height + chroma_entries) ..][0 .. bytes_per_sample * chroma_entries]);
+    const alpha_frame_data: []align(2) u8 =
+        @alignCast(frame_data[bytes_per_sample * (frame.coded_width * frame.coded_height + (chroma_entries << 1)) ..]);
 
     // Aligned for SIMD access
     const slice_data = try gpa.alignedAlloc(f32, .@"16", (max_luma_slice_len + (max_chroma_slice_len << 1)) << 1);
@@ -581,7 +627,41 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     const slice_1_v_data = slice_data[(max_luma_slice_len << 1) + 2 * max_chroma_slice_len ..][0..max_chroma_slice_len];
     const slice_2_v_data = slice_data[(max_luma_slice_len << 1) + 3 * max_chroma_slice_len ..][0..max_chroma_slice_len];
 
-    const has_alpha = frame.alpha_bit_depth != 0;
+    const has_alpha_to_parse = frame.alpha_bit_depth > 0;
+
+    if (frame.alpha_bit_depth == -1 and &decoder.tasks[decoder.tasks.len - 1] == task) {
+        // We need to fill the alpha data with the opaque value. This only need to be done once, so arbitrarily, we
+        // delegate this job to the last decode task (in the assumption that it usually has the least work to do).
+        switch (frame.bit_depth) {
+            8 => {
+                @memset(alpha_frame_data, 255);
+            },
+            10, 12 => {
+                // @memset would be terribly slow here since it's a two-byte pattern, so do some @memcpy-ing instead
+                const chunk_size = 8192;
+
+                // memset-fill a short initial segment with the byte pattern
+                const shorts = std.mem.bytesAsSlice(u16, alpha_frame_data);
+                const start = shorts[0..@min(chunk_size, shorts.len)];
+                const fill_value = (@as(u16, 1) << @as(u4, @intCast(frame.bit_depth))) - 1;
+                @memset(start, fill_value);
+
+                // Copy the initial segment to fill the rest of the bytes
+                var offset: usize = chunk_size;
+                while (offset + (chunk_size - 1) < shorts.len) : (offset += chunk_size) {
+                    const chunk = shorts[offset..][0..chunk_size];
+                    @memcpy(chunk, start);
+                }
+
+                // Take care of any remainder
+                if (offset < shorts.len) {
+                    const chunk = shorts[offset..];
+                    @memcpy(chunk, start[0..chunk.len]);
+                }
+            },
+            else => unreachable,
+        }
+    }
 
     var i: usize = 0;
     while (i + 1 < slice_count) : (i += 2) {
@@ -615,8 +695,8 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
 
         const num_luma_blocks_1 = header_1.width_mb << 2;
         const num_luma_blocks_2 = header_2.width_mb << 2;
-        const num_chroma_blocks_1 = header_1.width_mb << frame.log2_chroma_blocks_per_mb;
-        const num_chroma_blocks_2 = header_2.width_mb << frame.log2_chroma_blocks_per_mb;
+        const num_chroma_blocks_1 = header_1.width_mb << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
+        const num_chroma_blocks_2 = header_2.width_mb << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
 
         // Luma for slice 1 and 2
         try parseDcAndAcPair(
@@ -636,7 +716,9 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             pos_1,
             num_luma_blocks_1,
             2,
+            2,
             false,
+            bytes_per_sample,
         );
         transformAndStoreSliceData(
             task,
@@ -646,7 +728,9 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             pos_2,
             num_luma_blocks_2,
             2,
+            2,
             false,
+            bytes_per_sample,
         );
 
         // U for slice 1 and 2
@@ -666,8 +750,10 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             chroma_vec_1,
             pos_1,
             num_chroma_blocks_1,
+            decoder.log2_chroma_blocks_per_mb,
             frame.log2_chroma_blocks_per_mb,
             true,
+            bytes_per_sample,
         );
         transformAndStoreSliceData(
             task,
@@ -676,8 +762,10 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             chroma_vec_2,
             pos_2,
             num_chroma_blocks_2,
+            decoder.log2_chroma_blocks_per_mb,
             frame.log2_chroma_blocks_per_mb,
             true,
+            bytes_per_sample,
         );
 
         // V for slice 1 and 2
@@ -697,8 +785,10 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             chroma_vec_1,
             pos_1,
             num_chroma_blocks_1,
+            decoder.log2_chroma_blocks_per_mb,
             frame.log2_chroma_blocks_per_mb,
             true,
+            bytes_per_sample,
         );
         transformAndStoreSliceData(
             task,
@@ -707,15 +797,17 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             chroma_vec_2,
             pos_2,
             num_chroma_blocks_2,
+            decoder.log2_chroma_blocks_per_mb,
             frame.log2_chroma_blocks_per_mb,
             true,
+            bytes_per_sample,
         );
 
-        if (has_alpha) {
+        if (has_alpha_to_parse) {
             switch (frame.alpha_bit_depth) {
                 inline 8, 16 => |source_bit_depth| {
                     switch (frame.bit_depth) {
-                        inline 10, 12 => |target_bit_depth| {
+                        inline 8, 10, 12 => |target_bit_depth| {
                             // Alpha is not decoded in an interleaved fashion, because it was slower than the
                             // naive approach
 
@@ -759,7 +851,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
         const header = try parseSliceHeader(task, &reader, index);
 
         const num_luma_blocks = header.width_mb << 2;
-        const num_chroma_blocks = header.width_mb << frame.log2_chroma_blocks_per_mb;
+        const num_chroma_blocks = header.width_mb << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
         const luma_slice_len = num_luma_blocks << 6;
         const chroma_slice_len = num_chroma_blocks << 6;
 
@@ -788,7 +880,9 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             pos,
             num_luma_blocks,
             2,
+            2,
             false,
+            bytes_per_sample,
         );
 
         // U
@@ -800,8 +894,10 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             chroma_vec,
             pos,
             num_chroma_blocks,
+            decoder.log2_chroma_blocks_per_mb,
             frame.log2_chroma_blocks_per_mb,
             true,
+            bytes_per_sample,
         );
 
         // V
@@ -813,15 +909,17 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             chroma_vec,
             pos,
             num_chroma_blocks,
+            decoder.log2_chroma_blocks_per_mb,
             frame.log2_chroma_blocks_per_mb,
             true,
+            bytes_per_sample,
         );
 
-        if (has_alpha) {
+        if (has_alpha_to_parse) {
             switch (frame.alpha_bit_depth) {
                 inline 8, 16 => |source_bit_depth| {
                     switch (frame.bit_depth) {
-                        inline 10, 12 => |target_bit_depth| {
+                        inline 8, 10, 12 => |target_bit_depth| {
                             parseAndStoreAlpha(
                                 header.alpha_data,
                                 alpha_frame_data,
@@ -1173,7 +1271,7 @@ const AcState = struct {
 
 fn parseAndStoreAlpha(
     data: []u8,
-    frame_data: []u16,
+    frame_data: []align(2) u8,
     x: usize,
     y: usize,
     slice_width: usize,
@@ -1198,10 +1296,11 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
     const mask = comptime (@as(i64, 1) << @as(u6, @intCast(source_bit_depth))) - 1;
     const signed_code_length = comptime if (source_bit_depth == 16) 7 else 4;
     const bit_difference = target_bit_depth - source_bit_depth;
+    const ElementType = if (target_bit_depth == 8) u8 else u16;
 
     return struct {
         bit_reader: misc.BitReader,
-        frame_data: []u16,
+        frame_data: []ElementType,
         x: usize,
         y_offset: usize,
         slice_width: usize,
@@ -1212,10 +1311,10 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
         x_mask: usize,
         log2_slice_width: u5,
 
-        inline fn init(data: []u8, frame_data: []u16, x: usize, y: usize, slice_width: usize, num_values: usize, coded_width: usize) @This() {
+        inline fn init(data: []u8, frame_data: []align(2) u8, x: usize, y: usize, slice_width: usize, num_values: usize, coded_width: usize) @This() {
             return .{
                 .bit_reader = misc.BitReader.fromData(data),
-                .frame_data = frame_data,
+                .frame_data = std.mem.bytesAsSlice(ElementType, frame_data),
                 .x = x,
                 .y_offset = y * coded_width,
                 .slice_width = slice_width,
@@ -1254,7 +1353,7 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
             var final_value: u16 = @intCast(self.alpha_val);
             if (bit_difference < 0) {
                 final_value >>= comptime -bit_difference;
-            } else {
+            } else if (bit_difference > 0) {
                 // Upscale by bit replication: OR the top bits back into the freed low bits so that a full-scale
                 // source maps to a full-scale target
                 final_value = (final_value << bit_difference) | (final_value >> comptime (source_bit_depth - bit_difference));
@@ -1295,7 +1394,7 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
             self.frame_data[
                 self.y_offset + self.coded_width * (pos >> self.log2_slice_width) +
                     self.x + (pos & self.x_mask)
-            ] = value;
+            ] = @intCast(value);
         }
     };
 }
@@ -1338,106 +1437,464 @@ inline fn parseCode(word: u64, params: u64) !ParsedCode {
 fn transformAndStoreSliceData(
     task: *DecodeTask,
     slice_data: []const f32,
-    frame_data: []u16,
+    frame_data: []align(2) u8,
     scaling_matrix_vec: @Vector(64, f32),
     slice_pos: SlicePos,
     num_blocks: u32,
-    log2_blocks_per_macroblock: u32,
+    source_log2_blocks_per_macroblock: u32,
+    target_log2_block_per_macroblock: u32,
     comptime is_chroma: bool,
+    bytes_per_sample: u32,
 ) void {
-    std.debug.assert(log2_blocks_per_macroblock == 1 or log2_blocks_per_macroblock == 2);
+    std.debug.assert(source_log2_blocks_per_macroblock == 1 or source_log2_blocks_per_macroblock == 2);
+    std.debug.assert(if (is_chroma) true else source_log2_blocks_per_macroblock == target_log2_block_per_macroblock);
 
     const max_value = (@as(u16, 1) << @as(u4, @intCast(task.frame.bit_depth))) - 1;
+    const dc_offset = task.decoder.dc_offset;
+    const frame_coded_width = task.frame.coded_width;
 
-    if (log2_blocks_per_macroblock == 2) {
-        const coded_width = task.frame.coded_width;
+    switch (bytes_per_sample) {
+        inline 1, 2 => |bytes_per_sample_captured| {
+            const ElementType = if (bytes_per_sample_captured == 1) u8 else u16;
+            const cast_frame_data = std.mem.bytesAsSlice(ElementType, frame_data);
 
-        var j: u32 = 0;
-        while (j < num_blocks) : (j += 4) {
-            const result_0 = idct_8x8(
-                slice_data[(j << 6)..][0..64].*,
-                scaling_matrix_vec,
-                max_value,
-            );
-            const result_1 = idct_8x8(
-                slice_data[(j << 6) + 64 ..][0..64].*,
-                scaling_matrix_vec,
-                max_value,
-            );
-            const result_2 = idct_8x8(
-                slice_data[(j << 6) + 128 ..][0..64].*,
-                scaling_matrix_vec,
-                max_value,
-            );
-            const result_3 = idct_8x8(
-                slice_data[(j << 6) + 192 ..][0..64].*,
-                scaling_matrix_vec,
-                max_value,
-            );
+            if (source_log2_blocks_per_macroblock == 2) {
+                const coded_width = frame_coded_width;
 
-            const mb_x = slice_pos.x + ((j >> 2) << 4);
-            const mb_y = slice_pos.y;
+                var j: u32 = 0;
+                while (j < num_blocks) : (j += 4) {
+                    const result_1 = idct_8x8(
+                        slice_data[(j << 6)..][0..64].*,
+                        scaling_matrix_vec,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
+                    const result_2 = idct_8x8(
+                        slice_data[(j << 6) + 64 ..][0..64].*,
+                        scaling_matrix_vec,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
+                    const result_3 = idct_8x8(
+                        slice_data[(j << 6) + 128 ..][0..64].*,
+                        scaling_matrix_vec,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
+                    const result_4 = idct_8x8(
+                        slice_data[(j << 6) + 192 ..][0..64].*,
+                        scaling_matrix_vec,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
 
-            // Top-left
-            storeBlock(frame_data, coded_width, result_0, mb_x, mb_y);
+                    if (is_chroma) {
+                        switch (target_log2_block_per_macroblock) {
+                            0 => {
+                                // 444->420, drop every even column and even row
+                                const chroma_width = frame_coded_width >> 1;
+                                const block_x = (slice_pos.x >> 1) + ((j >> 2) << 3);
+                                const block_y = slice_pos.y >> 1;
 
-            // The block order is DIFFERENT for luma and chroma!! Fucky, but it is:
-            if (is_chroma) {
-                // Bottom-left
-                storeBlock(frame_data, coded_width, result_1, mb_x, mb_y + 8);
-                // Top-right
-                storeBlock(frame_data, coded_width, result_2, mb_x + 8, mb_y);
+                                // Top half
+                                storeBlockOddColumns(
+                                    ElementType,
+                                    cast_frame_data,
+                                    chroma_width,
+                                    result_1,
+                                    result_3,
+                                    block_x,
+                                    block_y,
+                                    true,
+                                );
+                                // Bottom half
+                                storeBlockOddColumns(
+                                    ElementType,
+                                    cast_frame_data,
+                                    chroma_width,
+                                    result_2,
+                                    result_4,
+                                    block_x,
+                                    block_y + 4,
+                                    true,
+                                );
+                            },
+                            1 => {
+                                // 444->422, drop every even column
+                                const chroma_width = frame_coded_width >> 1;
+                                const block_x = (slice_pos.x >> 1) + ((j >> 2) << 3);
+                                const block_y = slice_pos.y;
+
+                                // Top
+                                storeBlockOddColumns(
+                                    ElementType,
+                                    cast_frame_data,
+                                    chroma_width,
+                                    result_1,
+                                    result_3,
+                                    block_x,
+                                    block_y,
+                                    false,
+                                );
+                                // Bottom
+                                storeBlockOddColumns(
+                                    ElementType,
+                                    cast_frame_data,
+                                    chroma_width,
+                                    result_2,
+                                    result_4,
+                                    block_x,
+                                    block_y + 8,
+                                    false,
+                                );
+                            },
+                            2 => {
+                                // 444->444, keep as-is
+                                const block_x = slice_pos.x + ((j >> 2) << 4);
+                                const block_y = slice_pos.y;
+
+                                // Order is different here than for luma!!
+                                // Top-left
+                                storeBlock(
+                                    ElementType,
+                                    cast_frame_data,
+                                    coded_width,
+                                    result_1,
+                                    block_x,
+                                    block_y,
+                                );
+                                // Bottom-left
+                                storeBlock(
+                                    ElementType,
+                                    cast_frame_data,
+                                    coded_width,
+                                    result_2,
+                                    block_x,
+                                    block_y + 8,
+                                );
+                                // Top-right
+                                storeBlock(
+                                    ElementType,
+                                    cast_frame_data,
+                                    coded_width,
+                                    result_3,
+                                    block_x + 8,
+                                    block_y,
+                                );
+                                // Bottom-right
+                                storeBlock(
+                                    ElementType,
+                                    cast_frame_data,
+                                    coded_width,
+                                    result_4,
+                                    block_x + 8,
+                                    block_y + 8,
+                                );
+                            },
+
+                            else => unreachable,
+                        }
+                    } else {
+                        // Luma case, always 444
+                        const block_x = slice_pos.x + ((j >> 2) << 4);
+                        const block_y = slice_pos.y;
+
+                        // Top-left
+                        storeBlock(
+                            ElementType,
+                            cast_frame_data,
+                            coded_width,
+                            result_1,
+                            block_x,
+                            block_y,
+                        );
+                        // Top-right
+                        storeBlock(
+                            ElementType,
+                            cast_frame_data,
+                            coded_width,
+                            result_2,
+                            block_x + 8,
+                            block_y,
+                        );
+                        // Bottom-left
+                        storeBlock(
+                            ElementType,
+                            cast_frame_data,
+                            coded_width,
+                            result_3,
+                            block_x,
+                            block_y + 8,
+                        );
+                        // Bottom-right
+                        storeBlock(
+                            ElementType,
+                            cast_frame_data,
+                            coded_width,
+                            result_4,
+                            block_x + 8,
+                            block_y + 8,
+                        );
+                    }
+                }
             } else {
-                // Top-right
-                storeBlock(frame_data, coded_width, result_1, mb_x + 8, mb_y);
-                // Bottom-left
-                storeBlock(frame_data, coded_width, result_2, mb_x, mb_y + 8);
-            }
+                std.debug.assert(is_chroma);
 
-            // Bottom-right
-            storeBlock(frame_data, coded_width, result_3, mb_x + 8, mb_y + 8);
+                var j: u32 = 0;
+                while (j < num_blocks) : (j += 2) {
+                    const result_t = idct_8x8(
+                        slice_data[(j << 6)..][0..64].*,
+                        scaling_matrix_vec,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
+                    const result_b = idct_8x8(
+                        slice_data[(j << 6) + 64 ..][0..64].*,
+                        scaling_matrix_vec,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
+
+                    switch (target_log2_block_per_macroblock) {
+                        0 => {
+                            // 422->420, drop every even row
+                            const coded_width = frame_coded_width >> 1;
+                            const block_x = (slice_pos.x >> 1) + ((j >> 1) << 3);
+                            const block_y = slice_pos.y >> 1;
+
+                            // Top half
+                            storeBlockOddRows(
+                                ElementType,
+                                cast_frame_data,
+                                coded_width,
+                                result_t,
+                                block_x,
+                                block_y,
+                            );
+                            // Bottom half
+                            storeBlockOddRows(
+                                ElementType,
+                                cast_frame_data,
+                                coded_width,
+                                result_b,
+                                block_x,
+                                block_y + 4,
+                            );
+                        },
+                        1 => {
+                            // 422->422, keep as-is
+                            const coded_width = frame_coded_width >> 1;
+                            const block_x = (slice_pos.x >> 1) + ((j >> 1) << 3);
+                            const block_y = slice_pos.y;
+
+                            // Top
+                            storeBlock(
+                                ElementType,
+                                cast_frame_data,
+                                coded_width,
+                                result_t,
+                                block_x,
+                                block_y,
+                            );
+                            // Bottom
+                            storeBlock(
+                                ElementType,
+                                cast_frame_data,
+                                coded_width,
+                                result_b,
+                                block_x,
+                                block_y + 8,
+                            );
+                        },
+                        2 => {
+                            // 422->444, upsample by duplicating columns
+                            const coded_width = frame_coded_width;
+                            const block_x = slice_pos.x + ((j >> 1) << 4);
+                            const block_y = slice_pos.y;
+
+                            // Top
+                            storeUpsampledBlock(
+                                ElementType,
+                                cast_frame_data,
+                                coded_width,
+                                result_t,
+                                block_x,
+                                block_y,
+                            );
+                            // Bottom
+                            storeUpsampledBlock(
+                                ElementType,
+                                cast_frame_data,
+                                coded_width,
+                                result_b,
+                                block_x,
+                                block_y + 8,
+                            );
+                        },
+                        else => unreachable,
+                    }
+                }
+            }
+        },
+        else => unreachable,
+    }
+}
+
+inline fn storeBlock(
+    ElementType: type,
+    frame_data: []ElementType,
+    coded_width: u32,
+    result: IdctReturnValue(ElementType),
+    x: u32,
+    y: u32,
+) void {
+    if (ElementType == u8) {
+        inline for (0..4) |i| {
+            const longs: @Vector(2, u64) = @bitCast(result[i]);
+            frame_data[coded_width * (y + (i << 1) + 0) + x ..][0..8].* = @bitCast(longs[0]);
+            frame_data[coded_width * (y + (i << 1) + 1) + x ..][0..8].* = @bitCast(longs[1]);
         }
     } else {
-        std.debug.assert(is_chroma);
-        const coded_width = task.frame.coded_width >> 1;
-
-        var j: u32 = 0;
-        while (j < num_blocks) : (j += 2) {
-            const result_a = idct_8x8(
-                slice_data[(j << 6)..][0..64].*,
-                scaling_matrix_vec,
-                max_value,
-            );
-            const result_b = idct_8x8(
-                slice_data[(j << 6) + 64 ..][0..64].*,
-                scaling_matrix_vec,
-                max_value,
-            );
-
-            const block_x = (slice_pos.x >> 1) + ((j >> 1) << 3);
-
-            // Top
-            storeBlock(frame_data, coded_width, result_a, block_x, slice_pos.y);
-            // Bottom
-            storeBlock(frame_data, coded_width, result_b, block_x, slice_pos.y + 8);
+        inline for (0..8) |row| {
+            frame_data[coded_width * (y + row) + x ..][0..8].* = result[row];
         }
     }
 }
 
-inline fn storeBlock(frame_data: []u16, coded_width: u32, result: [64]u16, x: u32, y: u32) void {
-    inline for (0..8) |row| {
-        @memcpy(
-            frame_data[coded_width * (y + row) + x ..][0..8],
-            result[8 * row ..][0..8],
-        );
+/// Columns are duplicated
+inline fn storeUpsampledBlock(
+    ElementType: type,
+    frame_data: []ElementType,
+    coded_width: u32,
+    result: IdctReturnValue(ElementType),
+    x: u32,
+    y: u32,
+) void {
+    // In here, we rearrange the bytes such that each column is duplicated
+
+    if (ElementType == u8) {
+        inline for (0..4) |i| {
+            const source = result[i];
+
+            const row_a = misc.wasmShuffle(source, undefined, .{
+                0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7,
+            });
+            const row_b = misc.wasmShuffle(source, undefined, .{
+                8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15,
+            });
+
+            frame_data[coded_width * (y + (i << 1)) + x ..][0..16].* = row_a;
+            frame_data[coded_width * (y + (i << 1) + 1) + x ..][0..16].* = row_b;
+        }
+    } else {
+        inline for (0..8) |row| {
+            const source: @Vector(16, u8) = @bitCast(result[row]);
+
+            // Each value is two bytes long
+            const row_l = misc.wasmShuffle(source, undefined, .{
+                0, 1, 0, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, // six seven
+            });
+            const row_r = misc.wasmShuffle(source, undefined, .{
+                8, 9, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15, 14, 15,
+            });
+
+            frame_data[coded_width * (y + row) + x ..][0..8].* = @bitCast(row_l);
+            frame_data[coded_width * (y + row) + x + 8 ..][0..8].* = @bitCast(row_r);
+        }
     }
 }
 
-inline fn idct_8x8(block: [64]f32, scaling_matrix: @Vector(64, f32), max_value: u16) [64]u16 {
+/// By "odd" we mean the first, third, fifth, etc.
+inline fn storeBlockOddRows(
+    ElementType: type,
+    frame_data: []ElementType,
+    coded_width: u32,
+    result: IdctReturnValue(ElementType),
+    x: u32,
+    y: u32,
+) void {
+    if (ElementType == u8) {
+        inline for (0..4) |i| {
+            const source: @Vector(2, u64) = @bitCast(result[i]);
+            frame_data[coded_width * (y + i) + x ..][0..8].* = @bitCast(source[0]);
+        }
+    } else {
+        inline for (0..4) |i| {
+            const source = result[i << 1];
+            frame_data[coded_width * (y + i) + x ..][0..8].* = source;
+        }
+    }
+}
+
+/// By "odd" we mean the first, third, fifth, etc.
+inline fn storeBlockOddColumns(
+    ElementType: type,
+    frame_data: []ElementType,
+    coded_width: u32,
+    left: IdctReturnValue(ElementType),
+    right: IdctReturnValue(ElementType),
+    x: u32,
+    y: u32,
+    comptime drop_even_rows: bool,
+) void {
+    if (ElementType == u8) {
+        inline for (0..4) |i| {
+            const shuffled = misc.wasmShuffle(left[i], right[i], .{
+                0, 2,  4,  6,  16, 18, 20, 22,
+                8, 10, 12, 14, 24, 26, 28, 30,
+            });
+            const longs: @Vector(2, u64) = @bitCast(shuffled);
+
+            if (drop_even_rows) {
+                frame_data[coded_width * (y + i) + x ..][0..8].* = @bitCast(longs[0]);
+            } else {
+                frame_data[coded_width * (y + (i << 1) + 0) + x ..][0..8].* = @bitCast(longs[0]);
+                frame_data[coded_width * (y + (i << 1) + 1) + x ..][0..8].* = @bitCast(longs[1]);
+            }
+        }
+    } else {
+        const rows = if (drop_even_rows)
+            [_]u32{ 0, 2, 4, 6 }
+        else
+            [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+
+        inline for (rows, 0..) |row, i| {
+            const a: @Vector(16, u8) = @bitCast(left[row]);
+            const b: @Vector(16, u8) = @bitCast(right[row]);
+
+            const shuffled = misc.wasmShuffle(a, b, .{
+                0,  1,  4,  5,  8,  9,  12, 13,
+                16, 17, 20, 21, 24, 25, 28, 29,
+            });
+
+            frame_data[coded_width * (y + i) + x ..][0..8].* = @bitCast(shuffled);
+        }
+    }
+}
+
+fn IdctReturnValue(ElementType: type) type {
+    return if (ElementType == u8) [4]@Vector(16, u8) else [8]@Vector(8, u16);
+}
+
+inline fn idct_8x8(
+    block: [64]f32,
+    scaling_matrix: @Vector(64, f32),
+    dc_offset: f32,
+    max_value: u16,
+    ElementType: type,
+) IdctReturnValue(ElementType) {
+    comptime std.debug.assert(ElementType == u8 or ElementType == u16);
+
     const Vec = @Vector(64, f32);
     var float_vec: Vec = block;
     float_vec *= scaling_matrix;
-    float_vec[0] += comptime 4096 / (S[0] * S[0]); // Add the DC dequant offset but pre-scaled
+    float_vec[0] += dc_offset; // Add the DC dequant offset (already pre-scaled)
 
     var rows: [8]V8 = @bitCast(float_vec);
     rows = idct_columns(rows);
@@ -1445,18 +1902,48 @@ inline fn idct_8x8(block: [64]f32, scaling_matrix: @Vector(64, f32), max_value: 
     rows = idct_columns(rows);
 
     // WASM doesn't have a neat f32->u16 instruction, so we first do f32->u32, followed by u32->u16!
-    // f32->u32 already clamps the bottom at 0, so we only need to clamp the top (cheaper as int).
-    var result: [64]u16 = undefined;
-    inline for (0..8) |r| {
-        @setRuntimeSafety(false); // Since the f32->u32 clamp is actually intended here
+    // f32->u32 already clamps the bottom at 0, so we only need to clamp the top.
 
-        var as_u32: @Vector(8, u32) = @intFromFloat(rows[r]);
-        as_u32 = @min(as_u32, @as(@Vector(8, u32), @splat(max_value)));
+    if (ElementType == u8) {
+        const row_pairs: [4]@Vector(16, f32) = @bitCast(rows);
+        var result: [4]@Vector(16, u8) = undefined;
 
-        result[8 * r ..][0..8].* = @as(@Vector(8, u16), @intCast(as_u32));
+        // Iterate row pairs because 16 elements -> i8x16 vector type in WASM!
+        inline for (0..4) |r| {
+            @setRuntimeSafety(false); // Since the f32->u32 clamp is actually intended here
+
+            var as_u32: @Vector(16, u32) = @intFromFloat(row_pairs[r]);
+            as_u32 = @min(as_u32, @as(@Vector(16, u32), @splat(max_value)));
+
+            const as_u16: @Vector(16, u16) = @intCast(as_u32);
+            const as_u16_arr: [16]u16 = as_u16;
+            const low_u16: @Vector(16, u8) = @bitCast(as_u16_arr[0..8].*);
+            const high_u16: @Vector(16, u8) = @bitCast(as_u16_arr[8..16].*);
+
+            const shuffled = @shuffle(u8, low_u16, high_u16, [_]i32{
+                0,  2,  4,  6,  8,  10,  12,  14,
+                -1, -3, -5, -7, -9, -11, -13, -15,
+            });
+
+            result[r] = shuffled;
+        }
+
+        return result;
+    } else {
+        // Iterate rows because 8 elements -> i16x8 vector type in WASM!
+        var result: [8]@Vector(8, u16) = undefined;
+
+        inline for (0..8) |r| {
+            @setRuntimeSafety(false); // Since the f32->u32 clamp is actually intended here
+
+            var as_u32: @Vector(8, u32) = @intFromFloat(rows[r]);
+            as_u32 = @min(as_u32, @as(@Vector(8, u32), @splat(max_value)));
+
+            result[r] = @as(@Vector(8, u16), @intCast(as_u32));
+        }
+
+        return result;
     }
-
-    return result;
 }
 
 // Based on https://www.nayuki.io/res/fast-discrete-cosine-transform-algorithms/fast-dct-8.c
