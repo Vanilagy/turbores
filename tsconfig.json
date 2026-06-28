@@ -18,5 +18,5 @@
 
     "types": ["node", "vite/client"],
   },
-  "include": ["scripts/**/*.ts", "vite.config.ts", "vitest.config.ts", "env.d.ts"],
+  "include": ["scripts/**/*.ts", "vite.config.ts", "vitest.config.ts", "demo.vite.config.ts", "env.d.ts"],
 }

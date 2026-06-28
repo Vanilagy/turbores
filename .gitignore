@@ -10,5 +10,6 @@ interlaced-buck-bunny.mov
 
 build
 dist
+demo-dist
 
 .DS_Store

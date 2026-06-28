@@ -32,7 +32,9 @@
     "check": "tsc --noEmit -p src && tsc -p tests",
     "check-docblocks": "tsx scripts/check-docblocks.ts dist/index.d.ts",
     "lint": "zig fmt --check src/index.zig && eslint .",
-    "test": "./scripts/build-zig.sh && vitest run"
+    "test": "./scripts/build-zig.sh && vitest run",
+    "demo:dev": "vite --config demo.vite.config.ts",
+    "demo:build": "vite build --config demo.vite.config.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.22.0",

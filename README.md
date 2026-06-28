@@ -243,7 +243,7 @@ TurboRes is licensed under the [Mozilla Public License 2.0](https://www.mozilla.
 
 This project requires Zig 0.16 and a modern version of Node and npm. To set it up locally, clone the repo, then run `npm install`.
 
-Use `npm run dev` to start the Vite development server.
+Use `npm run dev` to start the Vite development server, which you can then use to serve any HTML files in this project.
 
 Use `./scripts/build-zig.sh` to compile the Zig code into a debug build, or use `./scripts/build-zig.sh --release` to create an optimized release build.
 
@@ -252,3 +252,5 @@ Use `npm run build` to build the final library.
 Use `npm run check` and `npm run lint` to perform typechecking and linting on the project.
 
 Use `npm test` to run the full test suite using the Zig debug build.
+
+Use `npm run demo:dev` and `npm run demo:build` to run and build the demo.

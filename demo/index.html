@@ -33,6 +33,14 @@
             color: #555;
         }
 
+        #error {
+            color: #c00;
+        }
+
+        #error:empty {
+            display: none;
+        }
+
         #player {
             display: flex;
             flex-direction: column;
@@ -83,6 +91,7 @@
     <h1>TurboRes Demo</h1>
     <p>Select a video file containing Apple ProRes video, then drag the scrubber to seek through it.</p>
     <input type="file" id="file">
+    <p id="error"></p>
     <div id="player">
         <div id="canvas-container">
             <canvas id="canvas"></canvas>
@@ -97,8 +106,13 @@
         const fileInput = document.querySelector('#file');
         const canvas = document.querySelector('#canvas');
         const scrubber = document.querySelector('#scrubber');
+        const errorField = document.querySelector('#error');
         const ctx = canvas.getContext('2d');
         const frame = new Frame();
+
+        const showError = (error) => {
+            errorField.textContent = String(error);
+        };
 
         let decoder = null;
         let sink = null;
@@ -107,10 +121,20 @@
         let nextTime = null;
 
         fileInput.addEventListener('change', async () => {
+            try {
+                await loadFile();
+            } catch (error) {
+                showError(error);
+            }
+        });
+
+        const loadFile = async () => {
             const file = fileInput.files[0];
             if (!file) {
                 return;
             }
+
+            errorField.textContent = '';
 
             // Tear down any previous session
             await decoder?.close();
@@ -150,62 +174,66 @@
             scrubber.disabled = false;
 
             showFrame(firstTimestamp);
-        });
+        };
 
         scrubber.addEventListener('input', () => {
             showFrame(Number(scrubber.value));
         });
 
         const showFrame = async (time) => {
-            if (decoding) {
-                // There's an ongoing decode, so remember it for later instead of decoding it now
-                nextTime = time;
-                return;
-            }
-
-            decoding = true;
-
-            // Grab the packet covering this timestamp on demand, and only decode if it's a different one
-            const packet = await sink.getPacket(time);
-            if (packet && packet.timestamp !== currentTimestamp) {
-                currentTimestamp = packet.timestamp;
-
-                const result = await decoder.decode(packet.data, frame);
-                if (result instanceof Error) {
-                    throw result;
+            try {
+                if (decoding) {
+                    // There's an ongoing decode, so remember it for later instead of decoding it now
+                    nextTime = time;
+                    return;
                 }
 
-                const videoFrame = new VideoFrame(result.frameData, {
-                    format: result.pixelFormat,
-                    codedWidth: result.codedWidth,
-                    codedHeight: result.codedHeight,
-                    visibleRect: {
-                        x: 0,
-                        y: 0,
-                        width: result.visibleWidth,
-                        height: result.visibleHeight,
-                    },
-                    colorSpace: {
-                        primaries: result.colorPrimariesString ?? null,
-                        transfer: result.colorTransferString ?? null,
-                        matrix: result.colorMatrixString ?? null,
-                        fullRange: result.colorRangeFull,
-                    },
-                    timestamp: packet.microsecondTimestamp,
-                    duration: packet.microsecondDuration,
-                });
-                ctx.drawImage(videoFrame, 0, 0);
-                videoFrame.close();
-            }
-            
+                decoding = true;
 
-            decoding = false;
+                // Grab the packet covering this timestamp on demand, and only decode if it's a different one
+                const packet = await sink.getPacket(time);
+                if (packet && packet.timestamp !== currentTimestamp) {
+                    currentTimestamp = packet.timestamp;
 
-            // Catch up to the most recent time requested while we were busy
-            if (nextTime !== null) {
-                const time = nextTime;
-                nextTime = null;
-                showFrame(time);
+                    const result = await decoder.decode(packet.data, frame);
+                    if (result instanceof Error) {
+                        throw result;
+                    }
+
+                    const videoFrame = new VideoFrame(result.frameData, {
+                        format: result.pixelFormat,
+                        codedWidth: result.codedWidth,
+                        codedHeight: result.codedHeight,
+                        visibleRect: {
+                            x: 0,
+                            y: 0,
+                            width: result.visibleWidth,
+                            height: result.visibleHeight,
+                        },
+                        colorSpace: {
+                            primaries: result.colorPrimariesString ?? null,
+                            transfer: result.colorTransferString ?? null,
+                            matrix: result.colorMatrixString ?? null,
+                            fullRange: result.colorRangeFull,
+                        },
+                        timestamp: packet.microsecondTimestamp,
+                        duration: packet.microsecondDuration,
+                    });
+                    ctx.drawImage(videoFrame, 0, 0);
+                    videoFrame.close();
+                }
+
+                decoding = false;
+
+                // Catch up to the most recent time requested while we were busy
+                if (nextTime !== null) {
+                    const time = nextTime;
+                    nextTime = null;
+                    showFrame(time);
+                }
+            } catch (error) {
+                decoding = false;
+                showError(error);
             }
         };
     </script>
