@@ -83,6 +83,19 @@ frame.clear();
 decoder.close();
 ```
 
+### Errors
+
+TurboRes uses _errors as values_, meaning functions return either the result or an error. The following errors may occur during operation:
+- `OutOfMemoryError`: The decoder ran out of memory.
+- `UnexpectedEofError`: The packet ended before the decoder expected it to.
+- `InvalidDataError`: The packet contains invalid or corrupted data.
+- `NotSupportedError`: The packet uses a feature that the decoder doesn't support.
+- `InvalidStateError`: The decoder is in an invalid internal state. This should never happen and should be reported.
+- `DecoderClosedError`: An operation was attempted on a decoder that has already been closed.
+- `FrameLockedError`: A frame was used while it is locked by an in-flight decoding operation.
+
+Since errors are returned plainly, you can check for them using a simple `instanceof` check.
+
 ### Multithreading
 
 TurboRes can use multiple threads to run faster. It has two systems for doing this:
@@ -183,7 +196,7 @@ Decoding jobs will always resolve in the order in which they were queued, meanin
 
 ## Performance
 
-As the name suggests, TurboRes is extremely performant. The following benchmarks compared it to native FFmpeg CLI and ffmpeg.wasm:
+As the name suggests, TurboRes is extremely performant and can decode ProRes at speeds exceeding 1 GB/s. The following benchmarks compare it to native FFmpeg CLI and ffmpeg.wasm:
 
 | | ProRes 422 HQ @ 4K | ProRes 4444 @ 1080p | ProRes 422 HQ @ 1080p | ProRes 422 Proxy @ 1080p |
 | - | - | - | - | - |
@@ -197,7 +210,7 @@ As the name suggests, TurboRes is extremely performant. The following benchmarks
 | ffmpeg.wasm, singlethreaded | 13 FPS | 50 FPS | 48 FPS | 131 FPS |
 
 > Averaged over 10 runs. Higher is better. Measured on an M4 (4P+6E) MacBook Air. \
-> To reproduce these benchmarks, check out the `benchmark` folder.
+> To reproduce these benchmarks, check out [`benchmark/README.md`](./benchmark/README.md).
 
 ## Under the hood
 
