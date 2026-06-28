@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>ffmpeg wasm benchmark (MT)</title>
+
+<input type="file" id="file">
+<button id="run" disabled>run benchmark</button>
+<pre id="log"></pre>
+
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+<script>
+const { createFFmpeg } = FFmpeg;
+const logEl = document.getElementById("log");
+const runBtn = document.getElementById("run");
+const fileInput = document.getElementById("file");
+const print = (s) => { logEl.textContent += s + "\n"; };
+
+const ffmpeg = createFFmpeg({
+  log: true,
+  logger: ({ message }) => print(message),
+  // default @ffmpeg/core is the MULTI-THREADED build
+  corePath: "https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js",
+});
+
+(async () => {
+  if (!self.crossOriginIsolated) {
+    print("NOT cross-origin isolated -> no SharedArrayBuffer -> MT won't work.");
+    print("serve this page with COOP: same-origin + COEP: require-corp headers.");
+    return;
+  }
+  print("loading ffmpeg core (MT)...");
+  await ffmpeg.load();
+  print("ready. pick a file.");
+  runBtn.disabled = false;
+})();
+
+runBtn.addEventListener("click", async () => {
+  const file = fileInput.files[0];
+  if (!file) { print("no file selected"); return; }
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  ffmpeg.FS("writeFile", file.name, bytes);
+
+  print(`\nrunning on ${file.name} (${bytes.length} bytes)...\n`);
+
+  const threads = 10;
+
+  await ffmpeg.run(
+    "-threads", threads.toString(),
+    "-benchmark",
+    "-stream_loop", "0",
+    "-i", file.name,
+    "-f", "null",
+    "-"
+  );
+
+  await ffmpeg.run(
+    "-threads", threads.toString(),
+    "-benchmark",
+    "-stream_loop", "9",
+    "-i", file.name,
+    "-f", "null",
+    "-"
+  );
+
+  print("\ndone. Check console output.");
+});
+</script>

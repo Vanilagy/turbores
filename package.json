@@ -13,6 +13,7 @@
   "license": "MPL-2.0",
   "sideEffects": false,
   "scripts": {
+    "dev": "vite",
     "build": "./scripts/build.sh",
     "check": "tsc --noEmit -p src && tsc -p tests",
     "check-docblocks": "tsx scripts/check-docblocks.ts dist/index.d.ts",

@@ -72,6 +72,9 @@ const Picture = struct {
     slice_count: u32,
     total_slice_size: usize,
 
+    // Workers grab slices from here at runtime, so the work self-balances across them
+    next_slice_index: std.atomic.Value(u32),
+
     // How this picture maps into the shared frame buffer (needed for interlaced)
     field_offset_rows: u32,
     row_stride_shift: u5,
@@ -84,6 +87,7 @@ const Picture = struct {
         .slice_offsets = &.{},
         .slice_count = undefined,
         .total_slice_size = undefined,
+        .next_slice_index = .init(0),
         .field_offset_rows = undefined,
         .row_stride_shift = undefined,
     };
@@ -103,8 +107,6 @@ pub const DecodeTask = struct {
     decoder: *Decoder,
     frame: *Frame,
     picture: *Picture,
-    slice_start: usize,
-    slice_count: usize,
     error_message: ?[]const u8,
 };
 
@@ -428,19 +430,17 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         );
     }
 
-    const fixed_cost_per_slice = 100;
-
     if (decoder.concurrency == 0) {
         // Synchronous, just decode right here right now
         decoder.tasks = try gpa.realloc(decoder.tasks, picture_count);
         for (0..picture_count) |p| {
             const picture = &decoder.pictures[p];
+            picture.next_slice_index.store(0, .seq_cst);
+
             decoder.tasks[p] = .{
                 .decoder = decoder,
                 .frame = frame,
                 .picture = picture,
-                .slice_start = 0,
-                .slice_count = picture.slice_count,
                 .error_message = null,
             };
 
@@ -464,54 +464,13 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     var task_index: usize = 0;
     for (0..picture_count) |p| {
         const picture = &decoder.pictures[p];
-        const total_slices = picture.slice_count;
+        picture.next_slice_index.store(0, .seq_cst);
 
-        var slice_start_index: usize = 0;
-        var remaining_size = picture.total_slice_size + total_slices * fixed_cost_per_slice;
-
-        // Split each picture's work into `task_count` jobs, distributed mostly evenly by slice size: larger slices
-        // (with more bytes) take longer to decode, so this aims to give every job roughly the same amount of work.
-        // The jobs are dispatched to the worker pool, which is assumed to exist (or come online) to eat through them.
-        for (0..task_count_per_picture) |i| {
-            const start_index = slice_start_index;
-
-            if (i == task_count_per_picture - 1) {
-                // Last job takes everything left
-                slice_start_index = total_slices;
-            } else {
-                const target = remaining_size / (task_count_per_picture - i);
-                var current_size: usize = 0;
-
-                // Slices are distributed in pairs because the pair path is the fast path
-                while (slice_start_index + 1 < total_slices) {
-                    const slice_size_1 = picture.slice_sizes[slice_start_index] + fixed_cost_per_slice;
-                    const slice_size_2 = picture.slice_sizes[slice_start_index + 1] + fixed_cost_per_slice;
-                    const new_size = current_size + slice_size_1 + slice_size_2;
-
-                    if (new_size > target) {
-                        // We now overshot the target. Check if we're now closer to the target than before. If yes, take
-                        // one more slice pair, if no, don't.
-                        if (new_size - target <= target - current_size) {
-                            current_size = new_size;
-                            slice_start_index += 2;
-                        }
-
-                        break;
-                    }
-
-                    current_size = new_size;
-                    slice_start_index += 2;
-                }
-
-                remaining_size -= current_size;
-            }
-
+        for (0..task_count_per_picture) |_| {
             decoder.tasks[task_index] = .{
                 .decoder = decoder,
                 .frame = frame,
                 .picture = picture,
-                .slice_start = start_index,
-                .slice_count = slice_start_index - start_index,
                 .error_message = null,
             };
 
@@ -673,8 +632,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     const decoder = task.decoder;
     const frame = task.frame;
     const picture = task.picture;
-    const slice_count = task.slice_count;
-    const slice_start = task.slice_start;
+    const slice_count = picture.slice_count;
 
     const field_offset_rows = picture.field_offset_rows;
     const row_stride_shift = picture.row_stride_shift;
@@ -767,14 +725,117 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
         }
     }
 
-    var i: usize = 0;
-    while (i + 1 < slice_count) : (i += 2) {
-        const index_1 = slice_start + i;
-        const index_2 = slice_start + i + 1;
-        reader.pos = picture.slice_offsets[index_1];
-        const header_1 = try parseSliceHeader(task, &reader, index_1);
-        reader.pos = picture.slice_offsets[index_2];
-        const header_2 = try parseSliceHeader(task, &reader, index_2);
+    // Grab slice pairs from the picture's shared cursor until it's drained. Pairs are always (even, even+1), so an odd
+    while (true) {
+        const base = picture.next_slice_index.fetchAdd(2, .seq_cst);
+        if (base >= slice_count) {
+            break;
+        }
+
+        if (base + 1 == slice_count) {
+            // Only a single slice left; decode it on its own
+            reader.pos = picture.slice_offsets[base];
+            const header = try parseSliceHeader(task, &reader, base);
+
+            const num_luma_blocks = header.width_mb << 2;
+            const num_chroma_blocks = header.width_mb << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
+            const luma_slice_len = num_luma_blocks << 6;
+            const chroma_slice_len = num_chroma_blocks << 6;
+
+            @memset(slice_data[0 .. luma_slice_len + (chroma_slice_len << 1)], 0);
+
+            const luma_data = slice_data[0..luma_slice_len];
+            const u_data = slice_data[luma_slice_len..][0..chroma_slice_len];
+            const v_data = slice_data[luma_slice_len + chroma_slice_len ..][0..chroma_slice_len];
+
+            const pos = SlicePos{
+                .x = header.pos_x_mb << 4,
+                .y = header.pos_y_mb << 4,
+            };
+
+            const scale: @Vector(64, f32) = @splat(@floatFromInt(header.scale_factor));
+            const luma_vec = @as(@Vector(64, f32), luma_scaling_matrix) * scale;
+            const chroma_vec = @as(@Vector(64, f32), chroma_scaling_matrix) * scale;
+
+            // Luma
+            try parseDcAndAcSingle(header.luma_data, luma_data, num_luma_blocks, task, scan_table);
+            transformAndStoreSliceData(
+                task,
+                luma_data,
+                luma_frame_data,
+                luma_vec,
+                pos,
+                num_luma_blocks,
+                2,
+                2,
+                false,
+                bytes_per_sample,
+                row_stride_shift,
+            );
+
+            // U
+            try parseDcAndAcSingle(header.u_data, u_data, num_chroma_blocks, task, scan_table);
+            transformAndStoreSliceData(
+                task,
+                u_data,
+                u_frame_data,
+                chroma_vec,
+                pos,
+                num_chroma_blocks,
+                decoder.log2_chroma_blocks_per_mb,
+                frame.log2_chroma_blocks_per_mb,
+                true,
+                bytes_per_sample,
+                row_stride_shift,
+            );
+
+            // V
+            try parseDcAndAcSingle(header.v_data, v_data, num_chroma_blocks, task, scan_table);
+            transformAndStoreSliceData(
+                task,
+                v_data,
+                v_frame_data,
+                chroma_vec,
+                pos,
+                num_chroma_blocks,
+                decoder.log2_chroma_blocks_per_mb,
+                frame.log2_chroma_blocks_per_mb,
+                true,
+                bytes_per_sample,
+                row_stride_shift,
+            );
+
+            if (has_alpha_to_parse) {
+                switch (frame.alpha_bit_depth) {
+                    inline 8, 16 => |source_bit_depth| {
+                        switch (frame.bit_depth) {
+                            inline 8, 10, 12 => |target_bit_depth| {
+                                parseAndStoreAlpha(
+                                    header.alpha_data,
+                                    alpha_frame_data,
+                                    pos.x,
+                                    pos.y,
+                                    header.width_mb << 4,
+                                    num_luma_blocks << 6,
+                                    frame.coded_width << row_stride_shift,
+                                    source_bit_depth,
+                                    target_bit_depth,
+                                );
+                            },
+                            else => unreachable,
+                        }
+                    },
+                    else => unreachable,
+                }
+            }
+
+            break;
+        }
+
+        reader.pos = picture.slice_offsets[base];
+        const header_1 = try parseSliceHeader(task, &reader, base);
+        reader.pos = picture.slice_offsets[base + 1];
+        const header_2 = try parseSliceHeader(task, &reader, base + 1);
 
         // AC parameters are sparse, so we must memset them all to zero
         @memset(slice_data, 0);
@@ -944,105 +1005,6 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                                 pos_2.y,
                                 header_2.width_mb << 4,
                                 num_luma_blocks_2 << 6,
-                                frame.coded_width << row_stride_shift,
-                                source_bit_depth,
-                                target_bit_depth,
-                            );
-                        },
-                        else => unreachable,
-                    }
-                },
-                else => unreachable,
-            }
-        }
-    }
-
-    // Odd slice count leaves one slice over; decode it on its own
-    if (i < slice_count) {
-        const index = slice_start + i;
-        reader.pos = picture.slice_offsets[index];
-        const header = try parseSliceHeader(task, &reader, index);
-
-        const num_luma_blocks = header.width_mb << 2;
-        const num_chroma_blocks = header.width_mb << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
-        const luma_slice_len = num_luma_blocks << 6;
-        const chroma_slice_len = num_chroma_blocks << 6;
-
-        @memset(slice_data[0 .. luma_slice_len + (chroma_slice_len << 1)], 0);
-
-        const luma_data = slice_data[0..luma_slice_len];
-        const u_data = slice_data[luma_slice_len..][0..chroma_slice_len];
-        const v_data = slice_data[luma_slice_len + chroma_slice_len ..][0..chroma_slice_len];
-
-        const pos = SlicePos{
-            .x = header.pos_x_mb << 4,
-            .y = header.pos_y_mb << 4,
-        };
-
-        const scale: @Vector(64, f32) = @splat(@floatFromInt(header.scale_factor));
-        const luma_vec = @as(@Vector(64, f32), luma_scaling_matrix) * scale;
-        const chroma_vec = @as(@Vector(64, f32), chroma_scaling_matrix) * scale;
-
-        // Luma
-        try parseDcAndAcSingle(header.luma_data, luma_data, num_luma_blocks, task, scan_table);
-        transformAndStoreSliceData(
-            task,
-            luma_data,
-            luma_frame_data,
-            luma_vec,
-            pos,
-            num_luma_blocks,
-            2,
-            2,
-            false,
-            bytes_per_sample,
-            row_stride_shift,
-        );
-
-        // U
-        try parseDcAndAcSingle(header.u_data, u_data, num_chroma_blocks, task, scan_table);
-        transformAndStoreSliceData(
-            task,
-            u_data,
-            u_frame_data,
-            chroma_vec,
-            pos,
-            num_chroma_blocks,
-            decoder.log2_chroma_blocks_per_mb,
-            frame.log2_chroma_blocks_per_mb,
-            true,
-            bytes_per_sample,
-            row_stride_shift,
-        );
-
-        // V
-        try parseDcAndAcSingle(header.v_data, v_data, num_chroma_blocks, task, scan_table);
-        transformAndStoreSliceData(
-            task,
-            v_data,
-            v_frame_data,
-            chroma_vec,
-            pos,
-            num_chroma_blocks,
-            decoder.log2_chroma_blocks_per_mb,
-            frame.log2_chroma_blocks_per_mb,
-            true,
-            bytes_per_sample,
-            row_stride_shift,
-        );
-
-        if (has_alpha_to_parse) {
-            switch (frame.alpha_bit_depth) {
-                inline 8, 16 => |source_bit_depth| {
-                    switch (frame.bit_depth) {
-                        inline 8, 10, 12 => |target_bit_depth| {
-                            parseAndStoreAlpha(
-                                header.alpha_data,
-                                alpha_frame_data,
-                                pos.x,
-                                pos.y,
-                                header.width_mb << 4,
-                                num_luma_blocks << 6,
                                 frame.coded_width << row_stride_shift,
                                 source_bit_depth,
                                 target_bit_depth,

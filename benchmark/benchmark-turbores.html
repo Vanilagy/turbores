@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>turbores benchmark (MT)</title>
+
+<button>Select file and run benchmark</button>
+<p></p>
+
+<script type="module">
+import { Input, BlobSource, ALL_FORMATS, EncodedPacketSink } from 'mediabunny';
+import { Decoder, Frame } from '../src/index';
+
+const p = document.querySelector('p');
+
+document.querySelector('button').addEventListener('click', () => {
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.onchange = async (event) => {
+        p.textContent = 'Benchmarking... (may take a while)';
+    
+        try {
+            const file = event.target.files[0];
+            const input = new Input({
+                source: new BlobSource(file),
+                formats: ALL_FORMATS,
+            });
+    
+            const track = await input.getPrimaryVideoTrack();
+            const sink = new EncodedPacketSink(track);
+    
+            const packets = [];
+            for await (const packet of sink.packets()) {
+                packets.push(packet);
+            }
+    
+            const decoder = await Decoder.create({
+                proresFourCc: 'apch',
+                useSharedMemory: true,
+            });
+            const frame = new Frame();
+    
+            for (let i = 0; i < 3; i++) {
+                for (const packet of packets) {
+                    await decoder.decode(packet.data, frame);
+                }
+            }
+    
+            const start = performance.now();
+    
+            const iters = 2;
+            for (let i = 0; i < iters; i++) {
+                for (const packet of packets) {
+                    await decoder.decode(packet.data, frame);
+                }
+            }
+    
+            const elapsed = performance.now() - start;
+    
+            p.textContent = `Done. ${elapsed / iters} ms per full-file decode, ${(iters * packets.length) / (elapsed / 1000)} FPS`;
+        } catch (error) {
+            p.textContent = 'Errored.';
+            throw error;
+        }
+    };
+
+    fileInput.click();
+});
+</script>
