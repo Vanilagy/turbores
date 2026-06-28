@@ -1,5 +1,10 @@
 # TurboRes
 
+[![](https://img.shields.io/npm/v/turbores)](https://www.npmjs.com/package/turbores)
+[![](https://img.shields.io/bundlephobia/minzip/turbores)](https://bundlephobia.com/package/turbores)
+[![](https://img.shields.io/npm/dm/turbores)](https://www.npmjs.com/package/turbores)
+[![](https://img.shields.io/discord/1390044844285497344?logo=discord&label=Discord)](https://discord.gg/hmpkyYuS4U)
+
 TurboRes is an extremely fast Apple ProRes decoder library for browsers and other JavaScript environments. It is written from scratch in Zig and TypeScript. Its goal is enabling high-performance processing of ProRes media in browsers without the need for hardware acceleration.
 
 TurboRes is:
@@ -11,12 +16,14 @@ TurboRes is:
 - **Simple.** Very minimal API with easy interop with the WebCodecs API and [Mediabunny](https://mediabunny.dev/).
 - **Tiny.** The gzipped bundle is smaller than 50 kB.
 
+> This project was fully enabled by generous donations by sponsors. If you've derived value from this package, please consider [leaving a donation](https://github.com/sponsors/Vanilagy)! 💘
+
 ## Motivation
 
-As the author of [Mediabunny](https://mediabunny.dev/), I regularly get requests for adding ProRes support to the library. I initially tried doing this by using ffmpeg.wasm, but the performance was insufficient for real-time applications. Knowing that FFmpeg wasn't originally built for WASM, I suspected that a custom-built solution would probably beat it. So, my goals for this library were twofold:
+As the author of [Mediabunny](https://mediabunny.dev/), I regularly get requests for adding ProRes support to the library. I initially tried doing this by using ffmpeg.wasm, but the performance was insufficient for real-time applications. Knowing that FFmpeg wasn't originally built with WASM in mind, I suspected that a custom-built solution would probably beat it. So, my goals for this library were twofold:
 
 - Learn how video decoders work and build one from scratch, ideally with minimal AI assistance
-- Build a ProRes decoder capable of real-time video decoding in browsers
+- Build a relentlessly-optimized ProRes decoder capable of faster-than-real-time video decoding in browsers
 
 It started mainly as a hobby experiment and learning exercise, but since the performance ended up being extremely competitive, I ultimately turned it into a polished library.
 
