@@ -1,7 +1,7 @@
 import { ALL_FORMATS, EncodedPacketSink, FilePathSource, Input, UrlSource } from 'mediabunny';
 import { Decoder, Frame } from './src/index';
 
-const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
+const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true });
 if (decoder instanceof Error) {
     throw decoder;
 }
@@ -39,11 +39,11 @@ for (let i = 0; i < fileIters; i++) {
             throw result;
         }
 
-        console.log(result)
+        //console.log(result)
 
         total++;
 
-        break;
+        continue;
 
         canvas.width = result.visibleWidth;
         canvas.height = result.visibleHeight;
