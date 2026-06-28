@@ -108,7 +108,7 @@ describe('Decoding', () => {
             throw decoder;
         }
         using frame = new Frame();
-        const packet = new Uint8Array(readFileSync(new URL('./public/transparent-2.prores', import.meta.url)));
+        const packet = new Uint8Array(readFileSync(new URL('./public/transparent.prores', import.meta.url)));
         await decoder.decode(packet, frame);
 
         expect(frame.isFilled).toBe(true);
@@ -121,7 +121,7 @@ describe('Decoding', () => {
         expect(frame.scanType).toBe('progressive');
         expect(frame.frameData!.byteLength).toBe(1904 * 1088 * 4 * 2);
         const reference = new Uint8Array(gunzipSync(readFileSync(
-            new URL('./public/transparent-2.framedata.gz', import.meta.url),
+            new URL('./public/transparent.framedata.gz', import.meta.url),
         )));
         expect(Buffer.compare(frame.frameData!, reference)).toBe(0);
 
@@ -627,7 +627,7 @@ describe('Pixel format conversion', () => {
     const sources = [
         { name: '422 frame', fourCc: 'apch', file: 'buck-bunny.prores', format: 'I422P10' },
         { name: '444 frame', fourCc: 'apch', file: 'buck-bunny-444.prores', format: 'I444P10' },
-        { name: 'transparent frame', fourCc: 'apch', file: 'transparent-2.prores', format: 'I444AP10' },
+        { name: 'transparent frame', fourCc: 'apch', file: 'transparent.prores', format: 'I444AP10' },
         { name: '12-bit transparent frame', fourCc: 'ap4h', file: '4444-12bit.prores', format: 'I444AP12' },
     ] as const;
 
