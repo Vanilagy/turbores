@@ -5,7 +5,7 @@
 [![](https://img.shields.io/npm/dm/turbores)](https://www.npmjs.com/package/turbores)
 [![](https://img.shields.io/discord/1390044844285497344?logo=discord&label=Discord)](https://discord.gg/hmpkyYuS4U)
 
-TurboRes is an extremely fast Apple ProRes decoder library for browsers and other JavaScript environments. It is written from scratch in Zig and TypeScript. Its goal is enabling high-performance processing of ProRes media in browsers without the need for hardware acceleration.
+TurboRes is an extremely fast Apple ProRes video decoder library for browsers and other JavaScript environments. It is written from scratch in Zig and TypeScript. Its goal is enabling high-performance processing of ProRes media in browsers without the need for hardware acceleration.
 
 TurboRes is:
 - **Fast.** With both impressive single- and multi-core performance, TurboRes can decode even high-quality 4K videos at hundreds of frames per second and is [more than twice as fast as native FFmpeg](#performance).

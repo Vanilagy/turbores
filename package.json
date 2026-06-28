@@ -1,5 +1,8 @@
 {
-  "name": "prores-decoder",
+  "name": "turbores",
+  "description": "An extremely fast Apple ProRes video decoder",
+  "author": "Vanilagy",
+  "version": "1.0.0",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -12,6 +15,17 @@
   ],
   "license": "MPL-2.0",
   "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vanilagy/turbores.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Vanilagy/turbores/issues"
+  },
+  "funding": {
+    "type": "individual",
+    "url": "https://github.com/sponsors/Vanilagy"
+  },
   "scripts": {
     "dev": "vite",
     "build": "./scripts/build.sh",
@@ -34,5 +48,13 @@
   },
   "optionalDependencies": {
     "@rollup/rollup-linux-x64-gnu": "4.62.1"
-  }
+  },
+  "keywords": [
+    "prores",
+    "apple",
+    "decoder",
+    "wasm",
+    "webassembly",
+    "mediabunny"
+  ]
 }
