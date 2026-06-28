@@ -73,7 +73,8 @@ export fn startWorker() noreturn {
                 };
 
                 if (decoder.running_task_count.fetchSub(1, .seq_cst) == 1) {
-                    io.futexWake(u32, &decoder.wait_word, 4);
+                    decoder.task_state.store(.done, .seq_cst);
+                    io.futexWake(u32, @ptrCast(&decoder.task_state.raw), std.math.maxInt(i32));
                 }
             },
         }

@@ -57,6 +57,30 @@ export type PixelFormat = typeof PIXEL_FORMATS[number];
  */
 export type ScanType = 'progressive' | 'interlaced-top-field-first' | 'interlaced-bottom-field-first';
 
+// Maps from the numeric color codes to the matching WebCodecs color space strings, where one exists
+const COLOR_PRIMARIES_STRINGS: Record<number, string> = {
+    1: 'bt709',
+    5: 'bt470bg',
+    6: 'smpte170m',
+    9: 'bt2020',
+    12: 'smpte432',
+};
+const COLOR_TRANSFER_STRINGS: Record<number, string> = {
+    1: 'bt709',
+    6: 'smpte170m',
+    8: 'linear',
+    13: 'iec61966-2-1',
+    16: 'pq',
+    18: 'hlg',
+};
+const COLOR_MATRIX_STRINGS: Record<number, string> = {
+    0: 'rgb',
+    1: 'bt709',
+    5: 'bt470bg',
+    6: 'smpte170m',
+    9: 'bt2020-ncl',
+};
+
 // For automatic freeing of the WASM side
 const frameRegistry = new FinalizationRegistry<{ runtime: SharedMemoryRuntime; ptr: number }>(({ runtime, ptr }) => {
     runtime.exports.closeFrame(ptr);
@@ -173,6 +197,21 @@ export class Frame implements Disposable {
      * when the frame is split into two fields (the suffix indicates which field comes first).
      */
     scanType: ScanType | null = null;
+
+    /** {@link Frame.colorPrimaries} as a string compatible with the WebCodecs API, or `undefined` if none exists. */
+    get colorPrimariesString() {
+        return this.colorPrimaries === null ? undefined : COLOR_PRIMARIES_STRINGS[this.colorPrimaries];
+    }
+
+    /** {@link Frame.colorTransfer} as a string compatible with the WebCodecs API, or `undefined` if none exists. */
+    get colorTransferString() {
+        return this.colorTransfer === null ? undefined : COLOR_TRANSFER_STRINGS[this.colorTransfer];
+    }
+
+    /** {@link Frame.colorMatrix} as a string compatible with the WebCodecs API, or `undefined` if none exists. */
+    get colorMatrixString() {
+        return this.colorMatrix === null ? undefined : COLOR_MATRIX_STRINGS[this.colorMatrix];
+    }
 
     /**
      * The runtime the WASM Frame lives on (shared-memory path).

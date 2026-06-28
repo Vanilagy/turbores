@@ -34,6 +34,11 @@ const A = [_]f32{
     0.382683432365089771728460,
 };
 
+pub const DecodeTaskState = enum(u32) {
+    done,
+    working,
+};
+
 pub const Decoder = struct {
     concurrency: u32,
     allowed_output_formats: u32,
@@ -53,7 +58,7 @@ pub const Decoder = struct {
 
     tasks: []DecodeTask,
     running_task_count: std.atomic.Value(u32),
-    wait_word: u32,
+    task_state: std.atomic.Value(DecodeTaskState),
     worker_error: std.atomic.Value(?*worker.WorkerError),
 
     error_message: ?[]const u8,
@@ -134,7 +139,7 @@ export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats
 
         .tasks = &.{},
         .running_task_count = .init(0),
-        .wait_word = 0,
+        .task_state = .init(.done),
         .worker_error = .init(null),
 
         .error_message = null,
@@ -175,8 +180,8 @@ export fn allocatePacket(decoder: *Decoder, size: usize) ?[*]u8 {
     return decoder.packet.ptr;
 }
 
-export fn getWaitWordAddress(decoder: *Decoder) *u32 {
-    return &decoder.wait_word;
+export fn getTaskStateAddress(decoder: *Decoder) *u32 {
+    return @ptrCast(&decoder.task_state.raw);
 }
 
 export fn decodePacket(decoder: *Decoder, frame: *Frame) i32 {
@@ -481,6 +486,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         }
     }
 
+    decoder.task_state.store(.working, .seq_cst);
     io.futexWake(u32, &worker.worker_task_queue.len, total_task_count);
 
     decoder.running_task_count.store(total_task_count, .seq_cst);

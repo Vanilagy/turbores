@@ -342,7 +342,7 @@ class SharedMemoryDecoder extends Decoder {
     /** @internal */
     _decoderPtr: number;
     /** @internal */
-    _waitWordAddress: number;
+    _taskStateOffset: number;
 
     override readonly useSharedMemory = true;
     override readonly concurrency: number;
@@ -351,7 +351,7 @@ class SharedMemoryDecoder extends Decoder {
         super(false);
         this._runtime = runtime;
         this._decoderPtr = ptr;
-        this._waitWordAddress = runtime.exports.getWaitWordAddress(ptr);
+        this._taskStateOffset = runtime.exports.getTaskStateAddress(ptr) / 4;
         this.concurrency = concurrency;
 
         sharedMemoryDecoderRegistry.register(this, { runtime, ptr }, this);
@@ -394,8 +394,9 @@ class SharedMemoryDecoder extends Decoder {
         }
 
         if (this.concurrency > 0) {
-            // Wait for all workers to finish
-            await Atomics.waitAsync(new Int32Array(memory.buffer), this._waitWordAddress / 4, 0).value;
+            // Wait for all workers to finish. We wait on the "working" state (1); if the workers already finished
+            // and stored "done" (0), waitAsync returns immediately.
+            await Atomics.waitAsync(new Int32Array(memory.buffer), this._taskStateOffset, 1).value;
 
             resultCode = exports.finalizePacketDecoding(this._decoderPtr);
             if (resultCode < 0) {

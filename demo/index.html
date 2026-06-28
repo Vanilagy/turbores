@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TurboRes Demo</title>
+    <style>
+        html {
+            background: #ececef;
+        }
+
+        body {
+            font-family: sans-serif;
+            box-sizing: border-box;
+            height: 100dvh;
+            margin: 0 auto;
+            max-width: 960px;
+            padding: 2rem 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            align-items: center;
+        }
+
+        h1,
+        p {
+            margin: 0;
+            text-align: center;
+        }
+
+        p {
+            color: #555;
+        }
+
+        #player {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+            flex: 0 1 auto;
+            min-height: 0;
+            max-width: 100%;
+        }
+
+        #canvas-container {
+            flex: 0 1 auto;
+            min-height: 0;
+            display: flex;
+            justify-content: center;
+        }
+
+        canvas {
+            max-width: 100%;
+            max-height: 100%;
+            background: #000;
+            border-radius: 8px;
+        }
+
+        #scrubber {
+            width: 100%;
+        }
+
+        #view-source {
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            color: #333;
+            font-size: 0.875rem;
+            opacity: 0.5;
+        }
+
+        #view-source:hover {
+            opacity: 1;
+        }
+    </style>
+</head>
+
+<body>
+    <a id="view-source" href="https://github.com/Vanilagy/turbores/blob/main/demo/index.html" target="_blank">
+        View source code
+    </a>
+    <h1>TurboRes Demo</h1>
+    <p>Select a video file containing Apple ProRes video, then drag the scrubber to seek through it.</p>
+    <input type="file" id="file">
+    <div id="player">
+        <div id="canvas-container">
+            <canvas id="canvas"></canvas>
+        </div>
+        <input type="range" id="scrubber" min="0" max="0" value="0" disabled>
+    </div>
+
+    <script type="module">
+        import { ALL_FORMATS, BlobSource, EncodedPacketSink, Input } from 'mediabunny';
+        import { Decoder, Frame } from '../src/index';
+
+        const fileInput = document.querySelector('#file');
+        const canvas = document.querySelector('#canvas');
+        const scrubber = document.querySelector('#scrubber');
+        const ctx = canvas.getContext('2d');
+        const frame = new Frame();
+
+        let decoder = null;
+        let sink = null;
+        let currentTimestamp = null;
+        let decoding = false;
+        let nextTime = null;
+
+        fileInput.addEventListener('change', async () => {
+            const file = fileInput.files[0];
+            if (!file) {
+                return;
+            }
+
+            // Tear down any previous session
+            await decoder?.close();
+
+            const input = new Input({
+                source: new BlobSource(file),
+                formats: ALL_FORMATS,
+            });
+
+            const videoTrack = await input.getPrimaryVideoTrack();
+            if (!videoTrack) {
+                throw new Error('The selected file has no video track.');
+            }
+
+            // For ISOBMFF files, internalCodecId is the sample entry name, which is the ProRes FourCC
+            const proresFourCc = videoTrack.internalCodecId;
+
+            decoder = await Decoder.create({
+                proresFourCc,
+                useSharedMemory: Decoder.canUseSharedMemory(),
+            });
+            if (decoder instanceof Error) {
+                throw decoder;
+            }
+
+            sink = new EncodedPacketSink(videoTrack);
+
+            canvas.width = videoTrack.displayWidth;
+            canvas.height = videoTrack.displayHeight;
+
+            currentTimestamp = null;
+            const firstTimestamp = await videoTrack.getFirstTimestamp();
+            scrubber.min = firstTimestamp;
+            scrubber.max = await videoTrack.computeDuration();
+            scrubber.step = 'any';
+            scrubber.value = firstTimestamp;
+            scrubber.disabled = false;
+
+            showFrame(firstTimestamp);
+        });
+
+        scrubber.addEventListener('input', () => {
+            showFrame(Number(scrubber.value));
+        });
+
+        const showFrame = async (time) => {
+            if (decoding) {
+                // There's an ongoing decode, so remember it for later instead of decoding it now
+                nextTime = time;
+                return;
+            }
+
+            decoding = true;
+
+            // Grab the packet covering this timestamp on demand, and only decode if it's a different one
+            const packet = await sink.getPacket(time);
+            if (packet && packet.timestamp !== currentTimestamp) {
+                currentTimestamp = packet.timestamp;
+
+                const result = await decoder.decode(packet.data, frame);
+                if (result instanceof Error) {
+                    throw result;
+                }
+
+                const videoFrame = new VideoFrame(result.frameData, {
+                    format: result.pixelFormat,
+                    codedWidth: result.codedWidth,
+                    codedHeight: result.codedHeight,
+                    visibleRect: {
+                        x: 0,
+                        y: 0,
+                        width: result.visibleWidth,
+                        height: result.visibleHeight,
+                    },
+                    colorSpace: {
+                        primaries: result.colorPrimariesString ?? null,
+                        transfer: result.colorTransferString ?? null,
+                        matrix: result.colorMatrixString ?? null,
+                        fullRange: result.colorRangeFull,
+                    },
+                    timestamp: packet.microsecondTimestamp,
+                    duration: packet.microsecondDuration,
+                });
+                ctx.drawImage(videoFrame, 0, 0);
+                videoFrame.close();
+            }
+            
+
+            decoding = false;
+
+            // Catch up to the most recent time requested while we were busy
+            if (nextTime !== null) {
+                const time = nextTime;
+                nextTime = null;
+                showFrame(time);
+            }
+        };
+    </script>
+</body>
+
+</html>
