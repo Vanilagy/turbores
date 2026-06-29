@@ -254,3 +254,9 @@ Use `npm run check` and `npm run lint` to perform typechecking and linting on th
 Use `npm test` to run the full test suite using the Zig debug build.
 
 Use `npm run demo:dev` and `npm run demo:build` to run and build the demo. Working with the demo assumes that the Zig code has already been built.
+
+## References
+
+The following resources helped me realize this project:
+- https://web.archive.org/web/20250802070520/https://wiki.multimedia.cx/index.php/Apple_ProRes
+- https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/proresdec.c
