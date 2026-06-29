@@ -22,6 +22,9 @@ export default mergeConfig(baseConfig, defineConfig({
         emptyOutDir: true,
         rollupOptions: {
             input: 'demo/index.html',
+            output: {
+                entryFileNames: 'index.js',
+            },
         },
     },
 }));
