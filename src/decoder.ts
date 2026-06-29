@@ -296,7 +296,7 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
         return promise;
     }
 
-    /** Closes this decoder and releases all internal resources once any queued packet decodes complete. */
+    /** Closes this decoder and releases all internal resources once all queued packet decodes complete. */
     close() {
         if (this._closed) {
             // Idempotent, just resolve when the queue is done

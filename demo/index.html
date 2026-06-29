@@ -4,15 +4,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TurboRes Demo</title>
+    <title>TurboRes demo</title>
     <meta name="description" content="An interactive demo of TurboRes, an extremely fast Apple ProRes video decoder for the web.">
     <link rel="canonical" href="https://turbores.pages.dev/">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://turbores.pages.dev/">
-    <meta property="og:title" content="TurboRes Demo">
+    <meta property="og:title" content="TurboRes demo">
     <meta property="og:description" content="An interactive demo of TurboRes, an extremely fast Apple ProRes video decoder for the web.">
     <meta name="twitter:card" content="summary">
-    <meta name="twitter:title" content="TurboRes Demo">
+    <meta name="twitter:title" content="TurboRes demo">
     <meta name="twitter:description" content="An interactive demo of TurboRes, an extremely fast Apple ProRes video decoder for the web.">
 
     <style>
@@ -110,7 +110,7 @@
     <a id="view-source" href="https://github.com/Vanilagy/turbores/blob/main/demo/index.html" target="_blank">
         View source code
     </a>
-    <h1>TurboRes Demo</h1>
+    <h1>TurboRes demo</h1>
     <p>Select a video file containing Apple ProRes video, then drag the scrubber to seek through it.</p>
     <div id="file-picker">
         <input type="file" id="file">
@@ -166,6 +166,7 @@
             // Tear down any previous session
             await decoder?.close();
 
+            // Use Mediabunny to extract packets from the file
             const input = new Input({
                 source: new BlobSource(file),
                 formats: ALL_FORMATS,
