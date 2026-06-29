@@ -33,6 +33,18 @@
             color: #555;
         }
 
+        #file-picker {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        #download-sample {
+            font-size: 0.8rem;
+            color: #888;
+        }
+
         #error {
             color: #c00;
         }
@@ -90,7 +102,12 @@
     </a>
     <h1>TurboRes Demo</h1>
     <p>Select a video file containing Apple ProRes video, then drag the scrubber to seek through it.</p>
-    <input type="file" id="file">
+    <div id="file-picker">
+        <input type="file" id="file">
+        <a id="download-sample" href="https://pub-1ee78aacb848486482b20a72b55b3121.r2.dev/IMG_1586_stripped.MOV" download>
+            Download sample file
+        </a>
+    </div>
     <p id="error"></p>
     <div id="player">
         <div id="canvas-container">
@@ -155,6 +172,8 @@
             decoder = await Decoder.create({
                 proresFourCc,
                 useSharedMemory: Decoder.canUseSharedMemory(),
+                // Non-Chrome browsers only support I420
+                allowedOutputFormats: window.chrome ? undefined : ['I420', 'I420A'],
             });
             if (decoder instanceof Error) {
                 throw decoder;
