@@ -746,7 +746,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
 
     // Grab slice pairs from the picture's shared cursor until it's drained
     while (true) {
-        const base = picture.next_slice_index.fetchAdd(2, .seq_cst);
+        const base = picture.next_slice_index.fetchAdd(2, .monotonic);
         if (base >= slice_count) {
             break;
         }
