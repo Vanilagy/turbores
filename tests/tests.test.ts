@@ -34,7 +34,9 @@ describe('Decoding', () => {
         expect(frame.visibleHeight).toBe(1080);
         expect(frame.codedWidth).toBe(1920);
         expect(frame.codedHeight).toBe(1088);
+        expect(frame.pixelAspectRatio).toEqual({ num: 1, den: 1 });
         expect(frame.pixelFormat).toBe('I422P10');
+        expect(frame.originalPixelFormat).toBe('I422P10');
         expect(frame.colorPrimaries).toBe(1);
         expect(frame.colorTransfer).toBe(1);
         expect(frame.colorMatrix).toBe(1);
@@ -175,6 +177,35 @@ describe('Decoding', () => {
 
         await decoder.close();
     });
+
+    test('HDR 422 frame', async () => {
+        const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
+        if (decoder instanceof Error) {
+            throw decoder;
+        }
+        using frame = new Frame();
+        const packet = new Uint8Array(readFileSync(new URL('./public/hdr-422.prores', import.meta.url)));
+        await decoder.decode(packet, frame);
+
+        expect(frame.isFilled).toBe(true);
+        expect(frame.visibleWidth).toBe(1920);
+        expect(frame.visibleHeight).toBe(1080);
+        expect(frame.codedWidth).toBe(1920);
+        expect(frame.codedHeight).toBe(1088);
+        expect(frame.pixelAspectRatio).toEqual({ num: 1, den: 1 });
+        expect(frame.pixelFormat).toBe('I422P10');
+        expect(frame.colorPrimaries).toBe(9);
+        expect(frame.colorTransfer).toBe(18);
+        expect(frame.colorMatrix).toBe(9);
+        expect(frame.scanType).toBe('progressive');
+        expect(frame.frameData!.byteLength).toBe(1920 * 1088 * 2 * 2);
+        const reference = new Uint8Array(gunzipSync(readFileSync(
+            new URL('./public/hdr-422.framedata.gz', import.meta.url),
+        )));
+        expect(Buffer.compare(frame.frameData!, reference)).toBe(0);
+
+        await decoder.close();
+    });
 });
 
 describe('Invalid packets', () => {
@@ -222,6 +253,30 @@ describe('Invalid packets', () => {
         const result = await decodeMutated(packet => packet[25] = (packet[25]! & 0xf0) | 3);
         expect(result).toBeInstanceOf(InvalidDataError);
         expect((result as Error).message).toMatch(/alpha/);
+    });
+
+    test('Invalid aspect ratio information', async () => {
+        const result = await decodeMutated(packet => packet[21] = (packet[21]! & 0x0f) | 0x40);
+        expect(result).toBeInstanceOf(InvalidDataError);
+        expect((result as Error).message).toMatch(/aspect ratio/);
+    });
+
+    test('Invalid color primaries', async () => {
+        const result = await decodeMutated(packet => packet[22] = 3);
+        expect(result).toBeInstanceOf(InvalidDataError);
+        expect((result as Error).message).toMatch(/color primaries/);
+    });
+
+    test('Invalid transfer characteristic', async () => {
+        const result = await decodeMutated(packet => packet[23] = 3);
+        expect(result).toBeInstanceOf(InvalidDataError);
+        expect((result as Error).message).toMatch(/transfer characteristic/);
+    });
+
+    test('Invalid matrix coefficients', async () => {
+        const result = await decodeMutated(packet => packet[24] = 3);
+        expect(result).toBeInstanceOf(InvalidDataError);
+        expect((result as Error).message).toMatch(/matrix coefficients/);
     });
 
     test('Picture data size larger than packet', async () => {

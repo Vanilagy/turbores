@@ -128,69 +128,46 @@ export class Frame implements Disposable {
      */
     originalPixelFormat: PixelFormat | null = null;
     /**
-     * The color primaries of the decoded frame's color space. The values correspond to those defined in
-     * ISO/IEC 23091-4:
+     * The pixel aspect ratio of the decoded frame. This is typically 1:1.
+     */
+    pixelAspectRatio: {
+        /** The numerator of the pixel aspect ratio. Always an integer. */
+        num: number;
+        /** The denominator of the pixel aspect ratio. Always an integer. */
+        den: number;
+    } | null = null;
+
+    /**
+     * The color primaries of the decoded frame's color space. The following values are possible:
      *
-     * 0 - reserved \
+     * 0 - Unknown/unspecified \
      * 1 - ITU-R BT.709 \
-     * 2 - unspecified \
-     * 3 - reserved2 \
-     * 4 - ITU-R BT.470M \
-     * 5 - ITU-R BT.470BG - BT.601 625 \
-     * 6 - ITU-R BT.601 525 - SMPTE 170M \
-     * 7 - SMPTE 240M \
-     * 8 - FILM \
+     * 2 - Unknown/unspecified \
+     * 5 - ITU-R BT.601 625 \
+     * 6 - ITU-R BT.601 525 \
      * 9 - ITU-R BT.2020 \
-     * 10 - SMPTE ST 428-1 \
-     * 11 - SMPTE RP 432-2 \
-     * 12 - SMPTE EG 432-2 \
-     * 22 - EBU Tech. 3213-E - JEDEC P22 phosphors
+     * 11 - DCI P3 \
+     * 12 - P3 D65
      */
     colorPrimaries: number | null = null;
     /**
-     * The color transfer function of the decoded frame's color space. The values correspond to those defined in
-     * ISO/IEC 23091-4:
+     * The color transfer function of the decoded frame's color space. The following values are possible:
      *
-     * 0 - reserved \
-     * 1 - ITU-R BT.709 \
-     * 2 - unspecified \
-     * 3 - reserved2 \
-     * 4 - Gamma 2.2 curve - BT.470M \
-     * 5 - Gamma 2.8 curve - BT.470BG \
-     * 6 - SMPTE 170M \
-     * 7 - SMPTE 240M \
-     * 8 - Linear \
-     * 9 - Log \
-     * 10 - Log Sqrt \
-     * 11 - IEC 61966-2-4 \
-     * 12 - ITU-R BT.1361 Extended Colour Gamut \
-     * 13 - IEC 61966-2-1 \
-     * 14 - ITU-R BT.2020 10 bit \
-     * 15 - ITU-R BT.2020 12 bit \
-     * 16 - ITU-R BT.2100 Perceptual Quantization \
-     * 17 - SMPTE ST 428-1 \
-     * 18 - ARIB STD-B67 (HLG)
+     * 0 - Unknown/unspecified \
+     * 1 - ITU-R BT.601/BT.709/BT.2020 \
+     * 2 - Unknown/unspecified \
+     * 16 - SMPTE ST 2084 (PQ) \
+     * 18 - ITU-R BT.2100-2 (HLG)
      */
     colorTransfer: number | null = null;
     /**
-     * The matrix coefficients of the decoded frame's color space. The values correspond to those defined in
-     * ISO/IEC 23001-8:
+     * The matrix coefficients of the decoded frame's color space. The following values are possible:
      *
-     * 0 - Identity \
+     * 0 - Unknown/unspecified \
      * 1 - ITU-R BT.709 \
-     * 2 - unspecified \
-     * 3 - reserved \
-     * 4 - US FCC 73.682 \
-     * 5 - ITU-R BT.470BG \
-     * 6 - SMPTE 170M \
-     * 7 - SMPTE 240M \
-     * 8 - YCoCg \
-     * 9 - BT2020 Non-constant Luminance \
-     * 10 - BT2020 Constant Luminance \
-     * 11 - SMPTE ST 2085 \
-     * 12 - Chroma-derived Non-constant Luminance \
-     * 13 - Chroma-derived Constant Luminance \
-     * 14 - ITU-R BT.2100-0
+     * 2 - Unknown/unspecified \
+     * 6 - ITU-R BT.601 \
+     * 9 - ITU-R BT.2020
      */
     colorMatrix: number | null = null;
     /**
@@ -250,6 +227,7 @@ export class Frame implements Disposable {
             && this.visibleWidth !== null
             && this.visibleHeight !== null
             && this.pixelFormat !== null
+            && this.pixelAspectRatio !== null
             && this.colorPrimaries !== null
             && this.colorTransfer !== null
             && this.colorMatrix !== null
@@ -328,6 +306,7 @@ export class Frame implements Disposable {
         this.visibleWidth = null;
         this.visibleHeight = null;
         this.pixelFormat = null;
+        this.pixelAspectRatio = null;
         this.colorPrimaries = null;
         this.colorTransfer = null;
         this.colorMatrix = null;
@@ -344,6 +323,7 @@ export class Frame implements Disposable {
         this.visibleHeight = contents.visibleHeight;
         this.pixelFormat = contents.pixelFormat;
         this.originalPixelFormat = contents.originalPixelFormat;
+        this.pixelAspectRatio = contents.pixelAspectRatio;
         this.colorPrimaries = contents.colorPrimaries;
         this.colorTransfer = contents.colorTransfer;
         this.colorMatrix = contents.colorMatrix;
@@ -368,6 +348,7 @@ export type FrameContents = {
     visibleHeight: number;
     pixelFormat: PixelFormat;
     originalPixelFormat: PixelFormat;
+    pixelAspectRatio: { num: number; den: number };
     colorPrimaries: number;
     colorTransfer: number;
     colorMatrix: number;
@@ -406,6 +387,10 @@ export const readFrameContents = (
         visibleHeight: exports.getVisibleHeight(framePtr),
         pixelFormat,
         originalPixelFormat,
+        pixelAspectRatio: {
+            num: exports.getAspectRatioNum(framePtr),
+            den: exports.getAspectRatioDen(framePtr),
+        },
         colorPrimaries: exports.getColorPrimaries(framePtr),
         colorTransfer: exports.getColorTransfer(framePtr),
         colorMatrix: exports.getColorMatrix(framePtr),

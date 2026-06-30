@@ -252,10 +252,56 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     const log2_chroma_blocks_per_mb: u32 = @intCast(chrominance_flag + 1); // 1 => 422, 2 => 444
     decoder.log2_chroma_blocks_per_mb = log2_chroma_blocks_per_mb;
 
-    reader.toss(1); // Reserved
+    const aspect_ratio_information = (try reader.takeInt(u8)) >> 4;
+    switch (aspect_ratio_information) {
+        0, 1 => {
+            frame.aspect_ratio_num = 1;
+            frame.aspect_ratio_den = 1;
+        },
+        2 => {
+            frame.aspect_ratio_num = 4;
+            frame.aspect_ratio_den = 3;
+        },
+        3 => {
+            frame.aspect_ratio_num = 16;
+            frame.aspect_ratio_den = 9;
+        },
+        else => {
+            @branchHint(.unlikely);
+            decoder.error_message = "Invalid aspect ratio information header field.";
+            return error.InvalidData;
+        },
+    }
+
     frame.color_primaries = try reader.takeInt(u8);
+    switch (frame.color_primaries) {
+        0, 1, 2, 5, 6, 9, 11, 12 => {},
+        else => {
+            @branchHint(.unlikely);
+            decoder.error_message = "Invalid color primaries header field.";
+            return error.InvalidData;
+        },
+    }
+
     frame.color_transfer = try reader.takeInt(u8);
+    switch (frame.color_transfer) {
+        0, 1, 2, 16, 18 => {},
+        else => {
+            @branchHint(.unlikely);
+            decoder.error_message = "Invalid transfer characteristic header field.";
+            return error.InvalidData;
+        },
+    }
+
     frame.color_matrix = try reader.takeInt(u8);
+    switch (frame.color_matrix) {
+        0, 1, 2, 6, 9 => {},
+        else => {
+            @branchHint(.unlikely);
+            decoder.error_message = "Invalid matrix coefficients header field.";
+            return error.InvalidData;
+        },
+    }
 
     const next_byte = try reader.takeInt(u8);
     _ = next_byte >> 4; // Source pixel format
@@ -688,13 +734,6 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     const slice_data = try gpa.alignedAlloc(f32, .@"16", (max_luma_slice_len + (max_chroma_slice_len << 1)) << 1);
     defer gpa.free(slice_data);
 
-    const slice_1_luma_data = slice_data[0..max_luma_slice_len];
-    const slice_2_luma_data = slice_data[max_luma_slice_len..][0..max_luma_slice_len];
-    const slice_1_u_data = slice_data[(max_luma_slice_len << 1)..][0..max_chroma_slice_len];
-    const slice_2_u_data = slice_data[(max_luma_slice_len << 1) + 1 * max_chroma_slice_len ..][0..max_chroma_slice_len];
-    const slice_1_v_data = slice_data[(max_luma_slice_len << 1) + 2 * max_chroma_slice_len ..][0..max_chroma_slice_len];
-    const slice_2_v_data = slice_data[(max_luma_slice_len << 1) + 3 * max_chroma_slice_len ..][0..max_chroma_slice_len];
-
     const has_alpha_to_parse = frame.alpha_bit_depth > 0;
 
     if (frame.alpha_bit_depth == -1 and &decoder.tasks[decoder.tasks.len - 1] == task) {
@@ -868,6 +907,13 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
         const num_luma_blocks_2 = header_2.width_mb << 2;
         const num_chroma_blocks_1 = header_1.width_mb << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
         const num_chroma_blocks_2 = header_2.width_mb << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
+
+        const slice_1_luma_data = slice_data[0..max_luma_slice_len];
+        const slice_2_luma_data = slice_data[max_luma_slice_len..][0..max_luma_slice_len];
+        const slice_1_u_data = slice_data[(max_luma_slice_len << 1)..][0..max_chroma_slice_len];
+        const slice_2_u_data = slice_data[(max_luma_slice_len << 1) + 1 * max_chroma_slice_len ..][0..max_chroma_slice_len];
+        const slice_1_v_data = slice_data[(max_luma_slice_len << 1) + 2 * max_chroma_slice_len ..][0..max_chroma_slice_len];
+        const slice_2_v_data = slice_data[(max_luma_slice_len << 1) + 3 * max_chroma_slice_len ..][0..max_chroma_slice_len];
 
         // Luma for slice 1 and 2
         try parseDcAndAcPair(
