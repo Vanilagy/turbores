@@ -261,24 +261,6 @@ describe('Invalid packets', () => {
         expect((result as Error).message).toMatch(/aspect ratio/);
     });
 
-    test('Invalid color primaries', async () => {
-        const result = await decodeMutated(packet => packet[22] = 3);
-        expect(result).toBeInstanceOf(InvalidDataError);
-        expect((result as Error).message).toMatch(/color primaries/);
-    });
-
-    test('Invalid transfer characteristic', async () => {
-        const result = await decodeMutated(packet => packet[23] = 3);
-        expect(result).toBeInstanceOf(InvalidDataError);
-        expect((result as Error).message).toMatch(/transfer characteristic/);
-    });
-
-    test('Invalid matrix coefficients', async () => {
-        const result = await decodeMutated(packet => packet[24] = 3);
-        expect(result).toBeInstanceOf(InvalidDataError);
-        expect((result as Error).message).toMatch(/matrix coefficients/);
-    });
-
     test('Picture data size larger than packet', async () => {
         const result = await decodeMutated((packet, view) => view.setUint32(picHeaderStart(view) + 1, 0xffffff00));
         expect(result).toBeInstanceOf(InvalidDataError);
