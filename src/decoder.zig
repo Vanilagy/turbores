@@ -252,10 +252,56 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     const log2_chroma_blocks_per_mb: u32 = @intCast(chrominance_flag + 1); // 1 => 422, 2 => 444
     decoder.log2_chroma_blocks_per_mb = log2_chroma_blocks_per_mb;
 
-    reader.toss(1); // Reserved
+    const aspect_ratio_information = (try reader.takeInt(u8)) >> 4;
+    switch (aspect_ratio_information) {
+        0, 1 => {
+            frame.aspect_ratio_num = 1;
+            frame.aspect_ratio_den = 1;
+        },
+        2 => {
+            frame.aspect_ratio_num = 4;
+            frame.aspect_ratio_den = 3;
+        },
+        3 => {
+            frame.aspect_ratio_num = 16;
+            frame.aspect_ratio_den = 9;
+        },
+        else => {
+            @branchHint(.unlikely);
+            decoder.error_message = "Invalid aspect ratio information header field.";
+            return error.InvalidData;
+        },
+    }
+
     frame.color_primaries = try reader.takeInt(u8);
+    switch (frame.color_primaries) {
+        0, 1, 2, 5, 6, 9, 11, 12 => {},
+        else => {
+            @branchHint(.unlikely);
+            decoder.error_message = "Invalid color primaries header field.";
+            return error.InvalidData;
+        },
+    }
+
     frame.color_transfer = try reader.takeInt(u8);
+    switch (frame.color_transfer) {
+        0, 1, 2, 16, 18 => {},
+        else => {
+            @branchHint(.unlikely);
+            decoder.error_message = "Invalid transfer characteristic header field.";
+            return error.InvalidData;
+        },
+    }
+
     frame.color_matrix = try reader.takeInt(u8);
+    switch (frame.color_matrix) {
+        0, 1, 2, 6, 9 => {},
+        else => {
+            @branchHint(.unlikely);
+            decoder.error_message = "Invalid matrix coefficients header field.";
+            return error.InvalidData;
+        },
+    }
 
     const next_byte = try reader.takeInt(u8);
     _ = next_byte >> 4; // Source pixel format

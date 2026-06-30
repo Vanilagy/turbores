@@ -18,7 +18,7 @@ TurboRes is:
 - **Robust.** TurboRes fully validates all input and gracefully rejects any corrupted or malicious data.
 - **Portable.** TurboRes runs everywhere out of the box: Chromium, Firefox, Safari, Node, Deno, Bun.
 - **Simple.** Very minimal API with easy interop with the WebCodecs API and [Mediabunny](https://mediabunny.dev/).
-- **Tiny.** The gzipped bundle is only around 50 kB in size.
+- **Tiny.** With zero runtime dependencies, the gzipped bundle is only around 50 kB in size.
 
 > This project was fully enabled by generous donations by sponsors. If you've derived value from this package, please consider [leaving a donation](https://github.com/sponsors/Vanilagy)! 💘
 
@@ -87,10 +87,11 @@ result.codedWidth; // => 1920
 result.codedHeight; // => 1088
 result.visibleWidth; // => 1920
 result.visibleHeight; // => 1080
+result.pixelAspectRatio; // => { num: 1, den: 1 }
 
 result.colorPrimaries; // => 9 (ITU-R BT.2020)
-result.colorTransfer; // => 18 (ARIB STD-B67 (HLG))
-result.colorMatrix; // => 9 (BT2020 Non-constant Luminance)
+result.colorTransfer; // => 18 (ITU-R BT.2100-2 (HLG))
+result.colorMatrix; // => 9 (ITU-R BT.2020)
 result.colorRangeFull; // => false
 ```
 
@@ -174,6 +175,8 @@ const decoder = await Decoder.create({
     allowedOutputFormats: ['I420'],
 });
 ```
+
+You can always inspect the original pixel format stored in the packet via `frame.originalPixelFormat`.
 
 You can specify multiple format options:
 ```ts
@@ -272,3 +275,4 @@ Use `npm run demo:dev` and `npm run demo:build` to run and build the demo. Worki
 The following resources helped me realize this project:
 - https://wiki.multimedia.cx/index.php/Apple_ProRes (https://web.archive.org/web/20250802070520/https://wiki.multimedia.cx/index.php/Apple_ProRes)
 - https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/proresdec.c
+- https://pub.smpte.org/doc/rdd36/20220909-pub/

@@ -19,6 +19,8 @@ pub const Frame = struct {
     /// -1 => no alpha present in source, but must emit alpha channel anyway
     alpha_bit_depth: i32,
     bit_depth: u32,
+    aspect_ratio_num: u32,
+    aspect_ratio_den: u32,
     color_primaries: u32,
     color_transfer: u32,
     color_matrix: u32,
@@ -43,6 +45,8 @@ export fn createFrame() ?*Frame {
         .log2_chroma_blocks_per_mb = undefined,
         .alpha_bit_depth = undefined,
         .bit_depth = undefined,
+        .aspect_ratio_num = undefined,
+        .aspect_ratio_den = undefined,
         .color_primaries = undefined,
         .color_transfer = undefined,
         .color_matrix = undefined,
@@ -87,6 +91,14 @@ export fn getFramePixelFormat(frame: *Frame) u32 {
         frame.bit_depth,
         frame.alpha_bit_depth != 0,
     ));
+}
+
+export fn getAspectRatioNum(frame: *Frame) u32 {
+    return frame.aspect_ratio_num;
+}
+
+export fn getAspectRatioDen(frame: *Frame) u32 {
+    return frame.aspect_ratio_den;
 }
 
 export fn getColorPrimaries(frame: *Frame) u32 {

@@ -2,7 +2,7 @@
   "name": "turbores",
   "description": "An extremely fast Apple ProRes video decoder",
   "author": "Vanilagy",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "main": "./dist/turbores.js",
   "module": "./dist/turbores.js",
@@ -57,6 +57,7 @@
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.48.0",
     "vite": "^7.2.7",
+    "vite-node": "^6.0.0",
     "vitest": "^4.1.8"
   },
   "optionalDependencies": {

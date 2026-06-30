@@ -1,4 +1,4 @@
-// Usage: npx tsx scripts/generate-reference-frames.ts <name> <prores-four-cc>
+// Usage: npx vite-node scripts/generate-reference-frames.ts -- <name> <prores-four-cc>
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { gzipSync } from 'node:zlib';
