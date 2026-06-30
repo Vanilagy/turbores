@@ -25,3 +25,5 @@ zig build-exe \
     --export=__tls_align \
     --export=__wasm_init_tls \
     ./src/index.zig
+
+echo "Built ./build/lib.wasm ($mode)"

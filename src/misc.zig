@@ -8,6 +8,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const BrkAllocator = @import("./BrkAllocator.zig");
 
+pub const is_wasm = builtin.cpu.arch.isWasm();
+
 extern fn externPrint(offset: usize, length: usize) void;
 
 pub threadlocal var is_browser_main_thread: bool = undefined;
@@ -32,7 +34,8 @@ pub fn printValues(arguments: anytype) void {
     }
 }
 
-pub const io = blk: {
+// WASM has no std.Io.Threaded, so we hand-roll a vtable backed by the WASM atomic futex intrinsics.
+const wasm_io = blk: {
     var vtable = std.Io.failing.vtable.*;
     vtable.futexWait = &futexWait;
     vtable.futexWake = &futexWake;
@@ -44,12 +47,43 @@ pub const io = blk: {
     };
 };
 
+// On WASM this is the comptime-known futex vtable above. On native targets it's filled in at runtime by
+// `ensureNativeIo` with a std.Io.Threaded instance.
+pub var io: std.Io = if (is_wasm) wasm_io else undefined;
+
+var threaded: std.Io.Threaded = undefined;
+var native_io_initialized: bool = false;
+// A plain atomic spinlock, since we can't use std.Io.Mutex here (it needs the very `io` we're initializing).
+var native_io_lock = std.atomic.Value(bool).init(false);
+
+/// Lazily initializes the native threaded I/O instance. No-op on WASM and on repeated calls.
+pub fn ensureNativeIo() void {
+    if (is_wasm) {
+        return;
+    } else {
+        while (native_io_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+        defer native_io_lock.store(false, .release);
+
+        if (native_io_initialized) return;
+
+        threaded = std.Io.Threaded.init(gpa, .{});
+        io = threaded.io();
+        native_io_initialized = true;
+    }
+}
+
 var gpa_mutex = std.Io.Mutex.init;
 pub const wasm_allocator: std.mem.Allocator = .{
     .ptr = undefined,
     .vtable = &BrkAllocator.vtable,
 };
-pub const gpa: std.mem.Allocator = .{
+
+// WASM lacks a general-purpose threadsafe allocator, so we guard the bump allocator with a mutex. Native targets
+// get the standard threadsafe SMP allocator, which needs no extra synchronization.
+pub const gpa: std.mem.Allocator = if (is_wasm) wasm_gpa else std.heap.smp_allocator;
+const wasm_gpa: std.mem.Allocator = .{
     .ptr = undefined,
     .vtable = &.{
         .alloc = &alloc,
@@ -139,11 +173,11 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
 }
 
 pub inline fn lockMutex(mutex: *std.Io.Mutex) void {
-    if (is_browser_main_thread) {
+    if (is_wasm and is_browser_main_thread) {
         // The browser main thread isn't allowed to block on atomics.wait, so the best we can do is a spinlock
         while (!mutex.tryLock()) {}
     } else {
-        mutex.lock(io) catch unreachable; // Cancels can't happen in WASM
+        mutex.lock(io) catch unreachable; // Cancels can't happen here
     }
 }
 
@@ -325,29 +359,47 @@ pub inline fn arrayReverse(arr: anytype) @TypeOf(arr) {
     return reversed;
 }
 
-// Needed because LLVM cannot be trusted
+// On WASM we emit the i8x16.shuffle instruction directly, because LLVM cannot be trusted to do so. On native
+// targets we fall back to the regular @shuffle builtin.
 pub inline fn wasmShuffle(
     a: @Vector(16, u8),
     b: @Vector(16, u8),
     comptime mask: [16]u8,
 ) @Vector(16, u8) {
-    @setEvalBranchQuota(1000000);
+    if (is_wasm) {
+        @setEvalBranchQuota(1000000);
 
-    const lanes = comptime blk: {
-        var s: []const u8 = "i8x16.shuffle ";
-        for (mask, 0..) |idx, i| {
-            std.debug.assert(idx < 32);
-            s = s ++ (if (i == 0) "" else ", ") ++ std.fmt.comptimePrint("{d}", .{idx});
-        }
-        break :blk s;
-    };
+        const lanes = comptime blk: {
+            var s: []const u8 = "i8x16.shuffle ";
+            for (mask, 0..) |idx, i| {
+                std.debug.assert(idx < 32);
+                s = s ++ (if (i == 0) "" else ", ") ++ std.fmt.comptimePrint("{d}", .{idx});
+            }
+            break :blk s;
+        };
 
-    return asm volatile ("local.get %[a]\n" ++
-            "local.get %[b]\n" ++
-            lanes ++ "\n" ++
-            "local.set %[ret]"
-        : [ret] "=r" (-> @Vector(16, u8)),
-        : [a] "r" (a),
-          [b] "r" (b),
-    );
+        return asm volatile ("local.get %[a]\n" ++
+                "local.get %[b]\n" ++
+                lanes ++ "\n" ++
+                "local.set %[ret]"
+            : [ret] "=r" (-> @Vector(16, u8)),
+            : [a] "r" (a),
+              [b] "r" (b),
+        );
+    } else {
+        @setEvalBranchQuota(1000000);
+
+        // @shuffle selects from the first vector with non-negative indices and from the second using ~i. The WASM
+        // mask uses 0..15 for `a` and 16..31 for `b`, so translate accordingly.
+        const shuffle_mask: @Vector(16, i32) = comptime blk: {
+            var m: [16]i32 = undefined;
+            for (mask, 0..) |idx, i| {
+                std.debug.assert(idx < 32);
+                m[i] = if (idx < 16) idx else ~@as(i32, @as(i32, idx) - 16);
+            }
+            break :blk m;
+        };
+
+        return @shuffle(u8, a, b, shuffle_mask);
+    }
 }

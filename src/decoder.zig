@@ -7,7 +7,7 @@
 const std = @import("std");
 const misc = @import("./misc.zig");
 const gpa = misc.gpa;
-const io = misc.io;
+const is_wasm = misc.is_wasm;
 const worker = @import("./worker.zig");
 const Frame = @import("./frame.zig").Frame;
 const PixelFormat = @import("./frame.zig").PixelFormat;
@@ -118,6 +118,15 @@ pub const DecodeTask = struct {
 export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats: u32) ?*Decoder {
     std.debug.assert(bit_depth == 10 or bit_depth == 12);
     std.debug.assert(allowed_output_formats != 0); // Ensured by the caller
+
+    if (comptime !is_wasm) {
+        // On native targets we own the I/O instance and the worker pool, so make sure both are ready. On WASM, the
+        // host sets these up instead.
+        misc.ensureNativeIo();
+        if (concurrency > 0) {
+            worker.ensureWorkers(concurrency) catch return null;
+        }
+    }
 
     const result = gpa.create(Decoder) catch return null;
 
@@ -460,7 +469,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     }
 
     misc.lockMutex(&worker.worker_task_queue_mutex);
-    defer worker.worker_task_queue_mutex.unlock(io);
+    defer worker.worker_task_queue_mutex.unlock(misc.io);
 
     const task_count_per_picture = decoder.concurrency;
     const total_task_count = picture_count * task_count_per_picture;
@@ -487,9 +496,10 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     }
 
     decoder.task_state.store(.working, .seq_cst);
-    io.futexWake(u32, &worker.worker_task_queue.len, total_task_count);
-
     decoder.running_task_count.store(total_task_count, .seq_cst);
+
+    worker.work_signal.store(@intCast(worker.worker_task_queue.len), .seq_cst);
+    misc.io.futexWake(u32, &worker.work_signal.raw, total_task_count);
 }
 
 fn parsePicture(
@@ -508,7 +518,7 @@ fn parsePicture(
     const pic_data_size = try reader.takeInt(u32);
 
     // Protect against overflow
-    const pic_data_end = try std.math.add(u32, pic_header_start_pos, pic_data_size);
+    const pic_data_end = try std.math.add(usize, pic_header_start_pos, pic_data_size);
 
     if (reader.data.len < pic_data_end) {
         @branchHint(.unlikely);
@@ -617,6 +627,15 @@ fn parsePicture(
     outside_reader.pos = pic_data_end;
 }
 
+// Blocks the calling thread until all dispatched worker tasks have completed. On WASM the host waits on the task
+// state futex asynchronously instead (via `getTaskStateAddress`), but native callers have no event loop, so they use
+// this to block.
+export fn waitForCompletion(decoder: *Decoder) void {
+    while (decoder.task_state.load(.seq_cst) != .done) {
+        misc.io.futexWait(DecodeTaskState, &decoder.task_state.raw, .working) catch unreachable;
+    }
+}
+
 export fn finalizePacketDecoding(decoder: *Decoder) i32 {
     if (decoder.running_task_count.load(.seq_cst) > 0) {
         @branchHint(.unlikely);
@@ -684,16 +703,20 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     const alpha_frame_data: []align(2) u8 =
         @alignCast(frame_data[alpha_plane_start + (if (frame.alpha_bit_depth > 0) luma_field_byte_offset else 0) ..]);
 
-    // Aligned for SIMD access
-    const slice_data = try gpa.alignedAlloc(f32, .@"16", (max_luma_slice_len + (max_chroma_slice_len << 1)) << 1);
+    // Aligned for SIMD access. Only large enough for a single plane's slice pair (luma, the largest plane). Because
+    // the planes are decoded strictly one after another (luma fully stored before U, U before V), the U and V planes
+    // alias the same two luma buffers. This keeps the working set small enough to stay cache-resident, which matters
+    // a lot under multithreading where SMT siblings share an L1.
+    const slice_data = try gpa.alignedAlloc(f32, .@"16", max_luma_slice_len << 1);
     defer gpa.free(slice_data);
 
     const slice_1_luma_data = slice_data[0..max_luma_slice_len];
     const slice_2_luma_data = slice_data[max_luma_slice_len..][0..max_luma_slice_len];
-    const slice_1_u_data = slice_data[(max_luma_slice_len << 1)..][0..max_chroma_slice_len];
-    const slice_2_u_data = slice_data[(max_luma_slice_len << 1) + 1 * max_chroma_slice_len ..][0..max_chroma_slice_len];
-    const slice_1_v_data = slice_data[(max_luma_slice_len << 1) + 2 * max_chroma_slice_len ..][0..max_chroma_slice_len];
-    const slice_2_v_data = slice_data[(max_luma_slice_len << 1) + 3 * max_chroma_slice_len ..][0..max_chroma_slice_len];
+    // Chroma is never larger than luma, so U and V reuse the front of each luma buffer.
+    const slice_1_u_data = slice_1_luma_data[0..max_chroma_slice_len];
+    const slice_2_u_data = slice_2_luma_data[0..max_chroma_slice_len];
+    const slice_1_v_data = slice_1_u_data;
+    const slice_2_v_data = slice_2_u_data;
 
     const has_alpha_to_parse = frame.alpha_bit_depth > 0;
 
@@ -748,11 +771,11 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             const luma_slice_len = num_luma_blocks << 6;
             const chroma_slice_len = num_chroma_blocks << 6;
 
-            @memset(slice_data[0 .. luma_slice_len + (chroma_slice_len << 1)], 0);
-
+            // U and V alias the luma buffer; each plane is zeroed right before it's decoded, since the planes are
+            // processed one fully at a time.
             const luma_data = slice_data[0..luma_slice_len];
-            const u_data = slice_data[luma_slice_len..][0..chroma_slice_len];
-            const v_data = slice_data[luma_slice_len + chroma_slice_len ..][0..chroma_slice_len];
+            const u_data = slice_data[0..chroma_slice_len];
+            const v_data = slice_data[0..chroma_slice_len];
 
             const pos = SlicePos{
                 .x = header.pos_x_mb << 4,
@@ -764,6 +787,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             const chroma_vec = @as(@Vector(64, f32), chroma_scaling_matrix) * scale;
 
             // Luma
+            @memset(luma_data, 0);
             try parseDcAndAcSingle(header.luma_data, luma_data, num_luma_blocks, task, scan_table);
             transformAndStoreSliceData(
                 task,
@@ -780,6 +804,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             );
 
             // U
+            @memset(u_data, 0);
             try parseDcAndAcSingle(header.u_data, u_data, num_chroma_blocks, task, scan_table);
             transformAndStoreSliceData(
                 task,
@@ -796,6 +821,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             );
 
             // V
+            @memset(v_data, 0);
             try parseDcAndAcSingle(header.v_data, v_data, num_chroma_blocks, task, scan_table);
             transformAndStoreSliceData(
                 task,
@@ -843,7 +869,8 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
         reader.pos = picture.slice_offsets[base + 1];
         const header_2 = try parseSliceHeader(task, &reader, base + 1);
 
-        // AC parameters are sparse, so we must memset them all to zero
+        // AC parameters are sparse, so we must zero the buffers before each plane. This first memset covers the luma
+        // pair (the whole buffer); U and V reuse it and are re-zeroed just before they're decoded.
         @memset(slice_data, 0);
 
         const pos_1 = SlicePos{
@@ -908,6 +935,8 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
         );
 
         // U for slice 1 and 2
+        @memset(slice_1_u_data, 0);
+        @memset(slice_2_u_data, 0);
         try parseDcAndAcPair(
             header_1.u_data,
             header_2.u_data,
@@ -946,6 +975,8 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
         );
 
         // V for slice 1 and 2
+        @memset(slice_1_v_data, 0);
+        @memset(slice_2_v_data, 0);
         try parseDcAndAcPair(
             header_1.v_data,
             header_2.v_data,
@@ -1041,7 +1072,9 @@ inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize
 
     const picture = task.picture;
     const start_pos = reader.pos;
-    const slice_size = picture.slice_sizes[i];
+    // Slice sizes are read as u16 values, so they always fit in a u32; keeping this narrow avoids mixing widths
+    // with the u32 plane-size arithmetic below.
+    const slice_size: u32 = @intCast(picture.slice_sizes[i]);
     const slice_header_size: u32 = try reader.takeInt(u8) >> 3;
 
     var scale_factor: u32 = std.math.clamp(try reader.takeInt(u8), 1, 224);
@@ -1097,7 +1130,7 @@ inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize
         .alpha_data = alpha_data,
         .width_mb = picture.slice_info_in_row.items(.size)[x_index],
         .pos_x_mb = picture.slice_info_in_row.items(.pos)[x_index],
-        .pos_y_mb = y_index,
+        .pos_y_mb = @intCast(y_index),
     };
 }
 
@@ -1422,7 +1455,7 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
                 .pos = 0,
                 .alpha_val = mask,
                 .x_mask = slice_width - 1,
-                .log2_slice_width = std.math.log2_int(usize, slice_width),
+                .log2_slice_width = @intCast(std.math.log2_int(usize, slice_width)),
             };
         }
 
@@ -1474,7 +1507,7 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
 
                 // +1 because of the previous write
                 for (1..capped_run + 1) |i| {
-                    self.writeValue(final_value, self.pos + i);
+                    self.writeValue(final_value, self.pos + @as(u32, @intCast(i)));
                 }
 
                 self.pos += 1 + capped_run;
@@ -1546,6 +1579,10 @@ inline fn transformAndStoreSliceData(
     bytes_per_sample: u32,
     row_stride_shift: u5,
 ) void {
+    if (true) {
+        //return;
+    }
+
     // Based on the incoming parameters, dispatch to the correct baked function
     switch (bytes_per_sample) {
         inline 1, 2 => |bytes_per_sample_captured| {

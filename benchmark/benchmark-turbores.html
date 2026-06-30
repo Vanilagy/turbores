@@ -30,11 +30,13 @@ document.querySelector('button').addEventListener('click', () => {
             const packets = [];
             for await (const packet of sink.packets()) {
                 packets.push(packet);
+                break;
             }
     
             const decoder = await Decoder.create({
                 proresFourCc: 'apch',
                 useSharedMemory: true,
+                concurrency: 12,
             });
             const frame = new Frame();
     
@@ -46,7 +48,7 @@ document.querySelector('button').addEventListener('click', () => {
     
             const start = performance.now();
     
-            const iters = 2;
+            const iters = 1000;
             for (let i = 0; i < iters; i++) {
                 for (const packet of packets) {
                     await decoder.decode(packet.data, frame);
