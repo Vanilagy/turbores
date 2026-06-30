@@ -19,7 +19,16 @@ fi
 
 cd "$(dirname "$0")/.."
 
-arch="x86_64"
+# Match the build to the host: native arch, and the right runtime loader path. The linker finds the right
+# library extension (.dylib / .so) via -l on its own.
+case "$(uname -m)" in
+    arm64|aarch64) arch="aarch64" ;;
+    *)             arch="x86_64" ;;
+esac
+case "$(uname -s)" in
+    Darwin) ld_var="DYLD_LIBRARY_PATH" ;;
+    *)      ld_var="LD_LIBRARY_PATH" ;;
+esac
 
 ./scripts/build-native.sh --release "--${arch}"
 
@@ -28,4 +37,4 @@ gcc -O3 -pthread dev/bench-decode-2.c \
     -o build/bench-decode-2 \
     -Lbuild "-lturbores-${arch}"
 
-LD_LIBRARY_PATH=build ./build/bench-decode-2 "$@"
+env "${ld_var}=build" ./build/bench-decode-2 "$@"

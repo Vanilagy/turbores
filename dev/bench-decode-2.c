@@ -34,6 +34,10 @@
  */
 
 #define _POSIX_C_SOURCE 200112L
+#ifdef __APPLE__
+/* sysconf(_SC_NPROCESSORS_ONLN) is a Darwin extension that the strict _POSIX_C_SOURCE above hides. */
+#define _DARWIN_C_SOURCE
+#endif
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -46,6 +50,57 @@
 
 #include "packet-source.h"
 #include "turbores.h"
+
+#ifdef __APPLE__
+/* macOS doesn't ship pthread_barrier, so roll a minimal one on top of a mutex + condvar. */
+typedef int pthread_barrierattr_t;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    unsigned int threshold;
+    unsigned int count;
+    unsigned int generation;
+} pthread_barrier_t;
+
+static int pthread_barrier_init(pthread_barrier_t *b, const pthread_barrierattr_t *attr, unsigned int count) {
+    (void) attr;
+    if (count == 0) return -1;
+    if (pthread_mutex_init(&b->mutex, NULL) != 0) return -1;
+    if (pthread_cond_init(&b->cond, NULL) != 0) {
+        pthread_mutex_destroy(&b->mutex);
+        return -1;
+    }
+    b->threshold = count;
+    b->count = 0;
+    b->generation = 0;
+    return 0;
+}
+
+static int pthread_barrier_destroy(pthread_barrier_t *b) {
+    pthread_cond_destroy(&b->cond);
+    pthread_mutex_destroy(&b->mutex);
+    return 0;
+}
+
+static int pthread_barrier_wait(pthread_barrier_t *b) {
+    pthread_mutex_lock(&b->mutex);
+    unsigned int gen = b->generation;
+    if (++b->count == b->threshold) {
+        b->generation++;
+        b->count = 0;
+        pthread_cond_broadcast(&b->cond);
+        pthread_mutex_unlock(&b->mutex);
+        return 1; /* PTHREAD_BARRIER_SERIAL_THREAD */
+    }
+    /* Wait out the rest of this generation; the condvar guards against spurious wakeups. */
+    while (gen == b->generation) {
+        pthread_cond_wait(&b->cond, &b->mutex);
+    }
+    pthread_mutex_unlock(&b->mutex);
+    return 0;
+}
+#endif
 
 /* Shared state visible to all worker threads (read-only during a pass). */
 typedef struct {

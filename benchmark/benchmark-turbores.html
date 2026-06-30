@@ -30,7 +30,6 @@ document.querySelector('button').addEventListener('click', () => {
             const packets = [];
             for await (const packet of sink.packets()) {
                 packets.push(packet);
-                break;
             }
     
             const decoder = await Decoder.create({
@@ -48,7 +47,7 @@ document.querySelector('button').addEventListener('click', () => {
     
             const start = performance.now();
     
-            const iters = 1000;
+            const iters = 10;
             for (let i = 0; i < iters; i++) {
                 for (const packet of packets) {
                     await decoder.decode(packet.data, frame);

@@ -75,13 +75,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    long logical_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    //long logical_cores = sysconf(_SC_NPROCESSORS_ONLN);
 
     printf("File:          %s\n", video_path);
     printf("Resolution:    %dx%d\n", set.width, set.height);
     printf("Bit depth:     %u\n", set.bit_depth);
     printf("Concurrency:   %u worker thread(s)\n", concurrency);
-    printf("Logical cores: %ld\n", logical_cores);
+    //printf("Logical cores: %ld\n", logical_cores);
     printf("Packets/frame: %zu extracted\n", set.count);
     printf("Repeats:       %ld\n", repeats);
 

@@ -75,9 +75,14 @@ pub fn ensureNativeIo() void {
 }
 
 var gpa_mutex = std.Io.Mutex.init;
+// BrkAllocator is the WASM-only bump allocator; referencing it under a comptime `is_wasm` branch keeps native
+// targets from analyzing it at all (it has no sbrk-like primitive outside Linux/WASM). The native-side decls
+// that name `wasm_allocator` -- the `allocateThreadLocalState` export and the wasm_gpa vtable shims -- only ever
+// run on WASM, but they still get compiled on native, so we point the native vtable at the real SMP allocator
+// (which ignores `.ptr`) to keep it a valid, dereferenceable allocator rather than undefined.
 pub const wasm_allocator: std.mem.Allocator = .{
     .ptr = undefined,
-    .vtable = &BrkAllocator.vtable,
+    .vtable = if (is_wasm) &BrkAllocator.vtable else std.heap.smp_allocator.vtable,
 };
 
 // WASM lacks a general-purpose threadsafe allocator, so we guard the bump allocator with a mutex. Native targets
