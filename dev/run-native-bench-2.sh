@@ -26,7 +26,6 @@ arch="x86_64"
 gcc -O3 -pthread dev/bench-decode-2.c \
     -Idev \
     -o build/bench-decode-2 \
-    -Lbuild "-lturbores-${arch}" \
-    $(pkg-config --cflags --libs libavformat libavcodec libavutil)
+    -Lbuild "-lturbores-${arch}"
 
 LD_LIBRARY_PATH=build ./build/bench-decode-2 "$@"
