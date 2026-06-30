@@ -138,7 +138,7 @@ export class Frame implements Disposable {
     } | null = null;
 
     /**
-     * The color primaries of the decoded frame's color space. The following values are possible:
+     * The color primaries of the decoded frame's color space. Common values are:
      *
      * 0 - Unknown/unspecified \
      * 1 - ITU-R BT.709 \
@@ -151,22 +151,26 @@ export class Frame implements Disposable {
      */
     colorPrimaries: number | null = null;
     /**
-     * The color transfer function of the decoded frame's color space. The following values are possible:
+     * The color transfer function of the decoded frame's color space. Common values are:
      *
      * 0 - Unknown/unspecified \
      * 1 - ITU-R BT.601/BT.709/BT.2020 \
      * 2 - Unknown/unspecified \
+     * 6 - ITU-R BT.601 \
+     * 8 - Linear \
+     * 13 - IEC 61966-2-1
      * 16 - SMPTE ST 2084 (PQ) \
      * 18 - ITU-R BT.2100-2 (HLG)
      */
     colorTransfer: number | null = null;
     /**
-     * The matrix coefficients of the decoded frame's color space. The following values are possible:
+     * The matrix coefficients of the decoded frame's color space. Common values are:
      *
      * 0 - Unknown/unspecified \
      * 1 - ITU-R BT.709 \
      * 2 - Unknown/unspecified \
-     * 6 - ITU-R BT.601 \
+     * 5 - ITU-R BT.601 625 \
+     * 6 - ITU-R BT.601 525 \
      * 9 - ITU-R BT.2020
      */
     colorMatrix: number | null = null;
