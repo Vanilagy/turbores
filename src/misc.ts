@@ -81,3 +81,5 @@ export class AsyncMutex {
 }
 
 export const canUseSharedMemory = typeof SharedArrayBuffer !== 'undefined';
+
+export const identity = <T>(x: T) => x;

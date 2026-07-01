@@ -139,14 +139,12 @@ export default defineConfig({
     build: {
         // Lib mode keeps vite's preload helper out of the bundle
         lib: {
+            name: 'TurboRes',
             entry: resolve(import.meta.dirname, 'src/index.ts'),
-            formats: ['es'],
+            formats: ['es', 'umd'],
         },
         rollupOptions: {
             external: [/^node:/],
-            output: {
-                entryFileNames: 'turbores.js',
-            },
         },
     },
     server: {

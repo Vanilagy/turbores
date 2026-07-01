@@ -74,6 +74,7 @@ jobs:
         run: >
           gh release upload ${{ github.event.release.tag_name }}
           dist/turbores.js
+          dist/turbores.umd.cjs
           dist/turbores.d.ts
 
       - name: Publish to npm

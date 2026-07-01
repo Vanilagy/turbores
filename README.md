@@ -38,10 +38,20 @@ Download and install TurboRes from the npm registry:
 npm install turbores
 ```
 
-Alternatively, download `turbores.js` (and `turbores.d.ts` for types) from the [releases page](https://github.com/Vanilagy/turbores/releases) and then import it directly:
+---
+
+Alternatively, download the ESM build `turbores.js` (and `turbores.d.ts` for types) from the [releases page](https://github.com/Vanilagy/turbores/releases) and then import it directly:
 ```ts
 import { /* ... */ } from './turbores.js';
 ```
+
+---
+
+You can also download `turbores.umd.cjs` from the [releases page](https://github.com/Vanilagy/turbores/releases) and import it using a plain script tag:
+```html
+<script src="./turbores.umd.cjs"></script>
+```
+This will expose a global `TurboRes` namespace. Types for this global are also provided by `turbores.d.ts`.
 
 ## Usage
 

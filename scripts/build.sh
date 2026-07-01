@@ -13,3 +13,6 @@ npx tsc -p src
 npx api-extractor run
 
 npm run check-docblocks
+
+# Appends stuff to the declaration file to register the global variable this library exposes
+echo 'export as namespace TurboRes;' >> dist/turbores.d.ts

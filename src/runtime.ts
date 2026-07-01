@@ -10,7 +10,7 @@ import type { Transferable as NodeTransferable, Worker as NodeWorker } from 'nod
 import wasmBinaryString from '../build/lib.wasm?inline-binary';
 import { OutOfMemoryError } from './errors.js';
 import { MessageType, type WorkerMessage, type WorkerReply } from './messages.js';
-import { AsyncMutex } from './misc.js';
+import { AsyncMutex, identity } from './misc.js';
 import { initWasmModule, type WasmExports } from './wasm.js';
 import workerSource from './worker?inline-worker';
 
@@ -41,8 +41,8 @@ export const createWorker = async () => {
     }
 
     // Node and Bun: there is no (usable) web Worker, so use worker_threads
-    const { Worker: NodeWorker } = await import('node:worker_threads');
-    return new WorkerWrapper(null, new NodeWorker(workerSource, { eval: true }));
+    const worker_threads = await import('node:' + identity('worker_threads')) as typeof import('node:worker_threads');
+    return new WorkerWrapper(null, new worker_threads.Worker(workerSource, { eval: true }));
 };
 
 // Provides a single worker interface over both web workers and node:worker_threads workers
@@ -107,7 +107,7 @@ export const getConcurrency = async (): Promise<number> => {
     }
 
     // Fallback for server-side environments without `navigator`
-    const os = await import('node:os');
+    const os = await import('node:' + identity('os')) as typeof import('node:os');
     return os.availableParallelism?.() ?? os.cpus().length;
 };
 
