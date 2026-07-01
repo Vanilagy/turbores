@@ -79,3 +79,8 @@ jobs:
           git checkout release
           git merge origin/main --no-ff -m "Merge main into release for tag ${{ github.event.release.tag_name }}"
           git push origin release
+
+      - name: Run Deploy Pages
+        run: gh workflow run deploy-pages.yml --ref release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

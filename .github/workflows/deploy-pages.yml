@@ -1,6 +1,7 @@
 name: Deploy Pages
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - release
