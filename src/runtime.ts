@@ -41,7 +41,9 @@ export const createWorker = async () => {
     }
 
     // Node and Bun: there is no (usable) web Worker, so use worker_threads
-    const worker_threads = await import('node:' + identity('worker_threads')) as typeof import('node:worker_threads');
+    // Weird dynamic import so that bundlers don't mess with it
+    const worker_threads = await import(/* @vite-ignore */ 'node:' + identity('worker_threads')) as
+        typeof import('node:worker_threads');
     return new WorkerWrapper(null, new worker_threads.Worker(workerSource, { eval: true }));
 };
 
@@ -107,7 +109,8 @@ export const getConcurrency = async (): Promise<number> => {
     }
 
     // Fallback for server-side environments without `navigator`
-    const os = await import('node:' + identity('os')) as typeof import('node:os');
+    // Weird dynamic import so that bundlers don't mess with it
+    const os = await import(/* @vite-ignore */ 'node:' + identity('os')) as typeof import('node:os');
     return os.availableParallelism?.() ?? os.cpus().length;
 };
 
