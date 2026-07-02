@@ -18,7 +18,7 @@ import {
 } from './errors.js';
 import { Frame, PIXEL_FORMATS, PixelFormat, readFrameContents, type FilledFrame } from './frame.js';
 import { MessageType, type WorkerMessage, type WorkerReply } from './messages.js';
-import { assert, canUseSharedMemory, decodeUtf8 } from './misc.js';
+import { assert, AsyncMutex, canUseSharedMemory, decodeUtf8 } from './misc.js';
 import {
     getConcurrency,
     getSharedMemoryRuntime,
@@ -102,8 +102,6 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
     /** @internal */
     _queue: Promise<unknown> = Promise.resolve();
     /** @internal */
-    _concurrentDecode: boolean;
-    /** @internal */
     _decodeQueueSize = 0;
     /** @internal */
     _dequeuedResolve!: () => void;
@@ -111,6 +109,9 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
     _dequeued = new Promise<void>((resolve) => {
         this._dequeuedResolve = resolve;
     });
+
+    /** @internal */
+    abstract readonly _highWaterMark: number;
 
     /** Whether this decodes makes use of shared-memory multithreading. Specified in the decoder options. */
     abstract readonly useSharedMemory: boolean;
@@ -120,16 +121,21 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
      */
     abstract readonly concurrency: number;
 
-    protected constructor(concurrentDecode: boolean) {
-        this._concurrentDecode = concurrentDecode;
-    }
-
     /**
      * The number of decoding tasks that have been queued but have not yet finished. You can monitor this value
      * to apply backpressure if the decoder can't keep up with your supply of packets.
      */
     get decodeQueueSize() {
         return this._decodeQueueSize;
+    }
+
+    /**
+     * The number of additional packets that can be queued for decoding before the decoder's internal high-water mark
+     * is reached, mirroring `desiredSize` from the Web Streams API. Keep queuing packets while this is positive to
+     * make the most of the decoder performance-wise.
+     */
+    get desiredSize() {
+        return this._highWaterMark - this._decodeQueueSize;
     }
 
     /**
@@ -278,9 +284,12 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
 
         this._decodeQueueSize++;
 
-        const work = this._concurrentDecode ? this._runDecode(packetData, frame, options) : null;
+        const work = this._runDecode(packetData, frame, options);
+        work.catch(() => {}); // So that the error doesn't surface before `then` is called further down
+
+        // Make sure the promises resolve in the same order in which they were queued
         const promise = this._queue
-            .then(() => work ?? this._runDecode(packetData, frame, options))
+            .then(() => work)
             .finally(() => {
                 frame._locked = false;
 
@@ -350,12 +359,23 @@ class SharedMemoryDecoder extends Decoder {
     _decoderPtr: number;
     /** @internal */
     _taskStateOffset: number;
+    /** @internal */
+    _decodeMutex = new AsyncMutex();
+    /** @internal */
+    _nextPacketSlot = 0;
+    /** @internal */
+    _packetSlotMutexes = [new AsyncMutex(), new AsyncMutex()];
+
+    /** @internal */
+    override readonly _highWaterMark: number;
 
     override readonly useSharedMemory = true;
     override readonly concurrency: number;
 
     constructor(runtime: SharedMemoryRuntime, ptr: number, concurrency: number) {
-        super(false);
+        super();
+
+        this._highWaterMark = concurrency === 0 ? 1 : 2;
         this._runtime = runtime;
         this._decoderPtr = ptr;
         this._taskStateOffset = runtime.exports.getTaskStateAddress(ptr) / 4;
@@ -389,30 +409,46 @@ class SharedMemoryDecoder extends Decoder {
             packetData = structuredClone(packetData, { transfer: [packetData.buffer] });
         }
 
-        const packetPtr = exports.allocatePacket(this._decoderPtr, packetData.byteLength);
-        if (packetPtr === 0) {
-            return new OutOfMemoryError();
-        }
-        new Uint8Array(memory.buffer).set(packetData, packetPtr);
+        const packetSlot = this._nextPacketSlot;
+        this._nextPacketSlot = (this._nextPacketSlot + 1) & 1;
 
-        let resultCode = exports.decodePacket(this._decoderPtr, framePtr);
-        if (resultCode < 0) {
-            return this._createError(resultCode);
-        }
+        const releasePacket = await this._packetSlotMutexes[packetSlot]!.acquire();
 
-        if (this.concurrency > 0) {
-            // Wait for all workers to finish. We wait on the "working" state (1); if the workers already finished
-            // and stored "done" (0), waitAsync returns immediately.
-            await Atomics.waitAsync(new Int32Array(memory.buffer), this._taskStateOffset, 1).value;
-
-            resultCode = exports.finalizePacketDecoding(this._decoderPtr);
-            if (resultCode < 0) {
-                return this._createError(resultCode);
+        try {
+            const packetPtr = exports.allocatePacket(this._decoderPtr, packetData.byteLength, packetSlot);
+            if (packetPtr === 0) {
+                return new OutOfMemoryError();
             }
+            new Uint8Array(memory.buffer).set(packetData, packetPtr);
+
+            const releaseDecode = await this._decodeMutex.acquire();
+
+            try {
+                let resultCode = exports.decodePacket(this._decoderPtr, framePtr, packetSlot);
+                if (resultCode < 0) {
+                    return this._createError(resultCode);
+                }
+
+                if (this.concurrency > 0) {
+                    // Wait for all workers to finish. We wait on the "working" state (1); if the workers already
+                    // finished and stored "done" (0), waitAsync returns immediately.
+                    await Atomics.waitAsync(new Int32Array(memory.buffer), this._taskStateOffset, 1).value;
+
+                    resultCode = exports.finalizePacketDecoding(this._decoderPtr);
+                    if (resultCode < 0) {
+                        return this._createError(resultCode);
+                    }
+                }
+
+                // The frame data is not copied; it's a direct view into the WASM memory
+                frame._populate(readFrameContents(exports, memory, framePtr, this._decoderPtr));
+            } finally {
+                releaseDecode();
+            }
+        } finally {
+            releasePacket();
         }
 
-        // The frame data is not copied; it's a direct view into the WASM memory
-        frame._populate(readFrameContents(exports, memory, framePtr, this._decoderPtr));
         return frame as FilledFrame;
     }
 
@@ -446,6 +482,9 @@ class MessagePassingDecoder extends Decoder {
     /** @internal */
     _decoderId: number;
 
+    /** @internal */
+    override readonly _highWaterMark: number;
+
     override readonly useSharedMemory = false;
     override readonly concurrency: number;
 
@@ -455,7 +494,9 @@ class MessagePassingDecoder extends Decoder {
         bitDepth: number,
         allowedOutputFormats: number,
     ) {
-        super(true);
+        super();
+
+        this._highWaterMark = Math.max(concurrency, 1);
         this._runtime = runtime;
         this.concurrency = concurrency;
         this._decoderId = runtime.nextDecoderId++;

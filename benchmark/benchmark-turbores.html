@@ -16,45 +16,67 @@ document.querySelector('button').addEventListener('click', () => {
     fileInput.type = 'file';
     fileInput.onchange = async (event) => {
         p.textContent = 'Benchmarking... (may take a while)';
-    
+
         try {
             const file = event.target.files[0];
             const input = new Input({
                 source: new BlobSource(file),
                 formats: ALL_FORMATS,
             });
-    
+
             const track = await input.getPrimaryVideoTrack();
             const sink = new EncodedPacketSink(track);
-    
+
             const packets = [];
             for await (const packet of sink.packets()) {
                 packets.push(packet);
             }
-    
+
             const decoder = await Decoder.create({
                 proresFourCc: 'apch',
                 useSharedMemory: true,
             });
-            const frame = new Frame();
-    
-            for (let i = 0; i < 3; i++) {
+
+            const framePool = [];
+            let decodeError = null;
+
+            const decodePass = async () => {
                 for (const packet of packets) {
-                    await decoder.decode(packet.data, frame);
+                    while (decoder.desiredSize <= 0) {
+                        await decoder.dequeued;
+                    }
+
+                    const frame = framePool.shift() ?? new Frame();
+                    void decoder.decode(packet.data, frame).then((result) => {
+                        if (result instanceof Error) {
+                            decodeError ??= result;
+                        }
+                        framePool.push(frame);
+                    });
+
+                    if (decodeError) {
+                        throw decodeError;
+                    }
                 }
+
+                while (decoder.decodeQueueSize > 0) {
+                    await decoder.dequeued;
+                }
+            };
+
+            for (let i = 0; i < 3; i++) {
+                await decodePass();
             }
-    
+
             const start = performance.now();
-    
+
             const iters = 10;
             for (let i = 0; i < iters; i++) {
-                for (const packet of packets) {
-                    await decoder.decode(packet.data, frame);
-                }
+                await decodePass();
             }
-    
+
             const elapsed = performance.now() - start;
-    
+
             p.textContent = `Done. ${elapsed / iters} ms per full-file decode, ${(iters * packets.length) / (elapsed / 1000)} FPS`;
         } catch (error) {
             p.textContent = 'Errored.';

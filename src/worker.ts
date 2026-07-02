@@ -114,7 +114,7 @@ const onMessage = async (message: WorkerMessage) => {
                 return;
             }
 
-            const packetPtr = exports.allocatePacket(decoder, packet.byteLength);
+            const packetPtr = exports.allocatePacket(decoder, packet.byteLength, 0);
             if (packetPtr === 0) {
                 sendMessage({
                     type: MessageType.DecodeError,
@@ -126,7 +126,7 @@ const onMessage = async (message: WorkerMessage) => {
             }
             new Uint8Array(memory.buffer).set(packet, packetPtr);
 
-            const code = exports.decodePacket(decoder, frame);
+            const code = exports.decodePacket(decoder, frame, 0);
             if (code < 0) {
                 let errorMessage: string | undefined = undefined;
                 const messagePtr = exports.getErrorMessagePtr(decoder);

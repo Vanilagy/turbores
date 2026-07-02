@@ -13,7 +13,7 @@ zig build-exe \
     -fno-entry \
     -rdynamic \
     -O $mode \
-    -mcpu=generic+atomics+bulk_memory+multivalue+nontrapping_fptoint+reference_types+sign_ext+simd128+relaxed_simd \
+    -mcpu=generic+atomics+bulk_memory+multivalue+nontrapping_fptoint+reference_types+sign_ext+simd128 \
     -femit-bin=./build/lib.wasm \
     -fno-single-threaded \
     --import-memory \

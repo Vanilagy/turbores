@@ -43,6 +43,9 @@ pub const Decoder = struct {
     concurrency: u32,
     allowed_output_formats: u32,
 
+    // Two packet slots so the JS side can copy the next packet in while the current one is still being decoded
+    packet_slots: [2][]u8,
+    // The slot currently being decoded
     packet: []u8,
 
     // Need two for interlaced
@@ -125,6 +128,7 @@ export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats
         .concurrency = concurrency,
         .allowed_output_formats = allowed_output_formats,
 
+        .packet_slots = .{ &.{}, &.{} },
         .packet = &.{},
 
         .pictures = .{ Picture.empty, Picture.empty },
@@ -165,7 +169,9 @@ export fn getErrorMessageSize(decoder: *Decoder) usize {
 }
 
 export fn closeDecoder(decoder: *Decoder) void {
-    gpa.free(decoder.packet);
+    for (decoder.packet_slots) |slot| {
+        gpa.free(slot);
+    }
     for (&decoder.pictures) |*picture| {
         picture.slice_info_in_row.deinit(gpa);
         gpa.free(picture.slice_sizes);
@@ -175,16 +181,17 @@ export fn closeDecoder(decoder: *Decoder) void {
     gpa.destroy(decoder);
 }
 
-export fn allocatePacket(decoder: *Decoder, size: usize) ?[*]u8 {
-    decoder.packet = gpa.realloc(decoder.packet, size) catch return null;
-    return decoder.packet.ptr;
+export fn allocatePacket(decoder: *Decoder, size: usize, slot: u32) ?[*]u8 {
+    decoder.packet_slots[slot] = gpa.realloc(decoder.packet_slots[slot], size) catch return null;
+    return decoder.packet_slots[slot].ptr;
 }
 
 export fn getTaskStateAddress(decoder: *Decoder) *u32 {
     return @ptrCast(&decoder.task_state.raw);
 }
 
-export fn decodePacket(decoder: *Decoder, frame: *Frame) i32 {
+export fn decodePacket(decoder: *Decoder, frame: *Frame, slot: u32) i32 {
+    decoder.packet = decoder.packet_slots[slot];
     decodePacketInternal(decoder, frame) catch |err| return misc.toErrorCode(err);
     return 0;
 }
@@ -1152,9 +1159,86 @@ fn transpose_scan_values(s: [64]u8) [64]u8 {
     return result;
 }
 
+const dc_params = [_]u8{ 0x04, 0x28, 0x28, 0x4D, 0x4D, 0x70, 0x70 };
 const run_params = [_]u8{ 0x06, 0x06, 0x05, 0x05, 0x04, 0x29, 0x29, 0x29, 0x29, 0x28, 0x28, 0x28, 0x28, 0x28, 0x28, 0x4C };
 const level_params = [_]u8{ 0x04, 0x0A, 0x05, 0x06, 0x04, 0x28, 0x28, 0x28, 0x28, 0x4C };
-const dc_params = [_]u8{ 0x04, 0x28, 0x28, 0x4D, 0x4D, 0x70, 0x70 };
+
+// In the code parsing, everything except the raw bits is a pure function of (params, clz), so bake codebook decoding
+// into tables indexed by the leading-zero count. A sentinel bits value > 31 marks invalid codes.
+const CodeLutEntry = struct {
+    bits: u32,
+    base_minus_sub: i32,
+};
+
+fn buildCodeLut(comptime params: u8) [32]CodeLutEntry {
+    const mp: i64 = params & 0b11;
+    const g: i64 = (params >> 2) & 0b111;
+    const r: i64 = params >> 5;
+
+    var result: [32]CodeLutEntry = undefined;
+    for (&result, 0..) |*entry, n_usize| {
+        const n: i64 = @intCast(n_usize);
+        const is_big = n > mp;
+
+        const capped: i64 = @min(n, mp + 1);
+        const base = capped << @as(u6, @intCast(r));
+        const bits = if (is_big) 2 * n + g - mp else n + 1 + r;
+        const sub = @as(i64, 1) << @as(u6, @intCast(if (is_big) g else r));
+
+        entry.* = if (bits > 31)
+            .{ .bits = 0xFF, .base_minus_sub = undefined } // Invalid
+        else
+            .{ .bits = @intCast(bits), .base_minus_sub = @intCast(base - sub) };
+    }
+
+    return result;
+}
+
+const distinct_params = blk: {
+    var all = dc_params ++ run_params ++ level_params ++ [_]u8{ 0xb8, 0x70 };
+    std.mem.sort(u8, &all, {}, std.sort.asc(u8));
+
+    var list: [all.len]u8 = undefined;
+    var count: usize = 0;
+    for (all, 0..) |p, i| {
+        if (i == 0 or p != all[i - 1]) {
+            list[count] = p;
+            count += 1;
+        }
+    }
+
+    break :blk list[0..count].*;
+};
+
+const code_luts = blk: {
+    // Most params appear many times, so only generate one LUT per unique param. This way, more of it is likely to
+    // reside in the cache.
+    var result: [distinct_params.len][32]CodeLutEntry = undefined;
+    for (&result, distinct_params) |*lut, p| {
+        lut.* = buildCodeLut(p);
+    }
+
+    break :blk result;
+};
+
+fn codeLutFor(comptime params: u8) *const [32]CodeLutEntry {
+    return &code_luts[comptime std.mem.indexOfScalar(u8, &distinct_params, params).?];
+}
+
+fn buildCodeLutPointers(comptime params: []const u8) [params.len]*const [32]CodeLutEntry {
+    var result: [params.len]*const [32]CodeLutEntry = undefined;
+    inline for (&result, params) |*pointer, p| {
+        pointer.* = codeLutFor(p);
+    }
+
+    return result;
+}
+
+const first_dc_lut = codeLutFor(0xb8);
+const second_dc_lut = codeLutFor(0x70);
+const dc_luts = buildCodeLutPointers(&dc_params);
+const run_luts = buildCodeLutPointers(&run_params);
+const level_luts = buildCodeLutPointers(&level_params);
 
 fn parseDcAndAcPair(
     data_1: []u8,
@@ -1289,7 +1373,10 @@ const DcState = struct {
 
         s.bit_reader.maybeLoadData();
 
-        const first_code_result = try parseCode(s.bit_reader.current, 0xb8);
+        const first_code_result = try parseCode(
+            s.bit_reader.current,
+            first_dc_lut,
+        );
         s.code = @intCast(first_code_result.value);
 
         const first_dc = (s.code >> 1) ^ -(s.code & 1);
@@ -1298,7 +1385,7 @@ const DcState = struct {
 
         const second_code_result = try parseCode(
             s.bit_reader.current << @as(u6, @intCast(first_code_result.bits)),
-            0x70,
+            second_dc_lut,
         );
         s.code = @intCast(second_code_result.value);
         s.sign = @intFromBool(s.code > 0) * -(s.code & 1);
@@ -1317,7 +1404,7 @@ const DcState = struct {
 
         const code_result_1 = try parseCode(
             self.bit_reader.current,
-            dc_params[@min(@as(usize, @intCast(self.code)), 6)],
+            dc_luts[@min(@as(usize, @intCast(self.code)), 6)],
         );
 
         self.code = @intCast(code_result_1.value);
@@ -1329,7 +1416,7 @@ const DcState = struct {
         const next_current = self.bit_reader.current << @as(u6, @intCast(code_result_1.bits));
         const code_result_2 = try parseCode(
             next_current,
-            dc_params[@min(code_result_1.value, 6)],
+            dc_luts[@min(code_result_1.value, 6)],
         );
 
         self.code = @intCast(code_result_2.value);
@@ -1362,7 +1449,7 @@ const AcState = struct {
 
         const run_result = try parseCode(
             self.bit_reader.current,
-            run_params[@min(self.run, 15)],
+            run_luts[@min(self.run, 15)],
         );
         self.run = @intCast(run_result.value);
         self.pos += self.run + 1;
@@ -1374,7 +1461,7 @@ const AcState = struct {
 
         const level_result = try parseCode(
             self.bit_reader.current << @as(u6, @intCast(run_result.bits)),
-            level_params[@min(@as(u32, @intCast(self.level)), 9)],
+            level_luts[@min(@as(u32, @intCast(self.level)), 9)],
         );
         self.level = @as(i32, @intCast(level_result.value)) + 1;
 
@@ -1492,9 +1579,14 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
 
                 const capped_run = @min(@as(u32, @intCast(run)), self.num_values - self.pos - 1);
 
-                // +1 because of the previous write
-                for (1..capped_run + 1) |i| {
-                    self.writeValue(final_value, self.pos + i);
+                var pos: usize = self.pos + 1; // +1 because of the previous write
+                const run_end: usize = pos + capped_run;
+                while (pos < run_end) {
+                    const col = pos & self.x_mask;
+                    const count = @min(self.slice_width - col, run_end - pos);
+                    const start = self.y_offset + self.coded_width * (pos >> self.log2_slice_width) + self.x + col;
+                    @memset(self.frame_data[start..][0..count], @intCast(final_value));
+                    pos += count;
                 }
 
                 self.pos += 1 + capped_run;
@@ -1523,33 +1615,21 @@ const ParsedCode = struct {
     bits: u64,
 };
 
-inline fn parseCode(word: u64, params: u64) !ParsedCode {
-    const mp: u64 = params & 0b11;
-    const g: u64 = (params >> 2) & 0b111;
-    const r: u64 = params >> 5;
-
+inline fn parseCode(word: u64, lut: *const [32]CodeLutEntry) !ParsedCode {
     const n: u64 = @clz(word);
-    const is_big = n > mp;
+    const entry = lut[@min(n, 31)];
 
-    const base = @as(u64, @min(n, mp + 1)) << @as(u6, @intCast(r));
-
-    const bits_big = (n << 1) +% g -% mp;
-    const bits_small = n + 1 + r;
-    const bits = if (is_big) bits_big else bits_small;
-
-    if (bits > 31) {
+    if (entry.bits > 31) {
         @branchHint(.unlikely);
         return error.InvalidData;
     }
 
-    const sub = @as(u64, 1) << (if (is_big) @intCast(g) else @intCast(r));
-    const raw = word >> @as(u6, @intCast(64 - bits));
-
-    const result = base +% raw -% sub;
+    const raw = word >> @as(u6, @intCast(64 - entry.bits));
+    const result: u64 = @intCast(@as(i64, @intCast(raw)) + entry.base_minus_sub);
 
     return .{
         .value = result,
-        .bits = bits,
+        .bits = entry.bits,
     };
 }
 

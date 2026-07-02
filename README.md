@@ -204,7 +204,7 @@ These pixel formats are supported by TurboRes: \
 
 ### Packet queueing
 
-Multiple packets can be queued for decoding:
+Multiple packets can be queued for decoding for improved decoding performance:
 ```ts
 const frame1 = new Frame();
 const frame2 = new Frame();
@@ -226,22 +226,24 @@ decoder.decodeQueueSize; // => 0
 
 Decoding jobs will always resolve in the order in which they were queued, meaning `promise1` will resolve before `promise2`, which will resolve before `promise3`.
 
+You can read `decoder.desiredSize` to get a watermark signal for pushing packets to the decoder. When zero or below, the decoder is maximally strained and you should await `decoder.dequeued` before continuing.
+
 ## Performance
 
 As the name suggests, TurboRes is extremely performant and can decode ProRes at speeds exceeding 1 GB/s. The following benchmarks compare it to the native FFmpeg CLI and ffmpeg.wasm:
 
 | | ProRes 422 HQ @ 4K | ProRes 4444 @ 1080p | ProRes 422 HQ @ 1080p | ProRes 422 Proxy @ 1080p |
 | - | - | - | - | - |
-| **TurboRes, multithreaded** | **228 FPS** | **710 FPS** | **803 FPS** | **2126 FPS** |
+| **TurboRes, multithreaded** | **250 FPS** | **763 FPS** | **920 FPS** | **2310 FPS** |
 | FFmpeg native, hardware-accelerated | 160 FPS | 256 FPS | 464 FPS | 466 FPS |
 | FFmpeg native, multithreaded | 107 FPS | 342 FPS | 375 FPS | 948 FPS |
 | ffmpeg.wasm, multithreaded | 84 FPS | 288 FPS | 295 FPS | 706 FPS |
 |  |  |  |  |  |
-| **TurboRes, singlethreaded** | **40 FPS** | **127 FPS** | **146 FPS** | **430 FPS** |
+| **TurboRes, singlethreaded** | **42 FPS** | **128 FPS** | **158 FPS** | **450 FPS** |
 | FFmpeg native, singlethreaded | 15 FPS | 55 FPS | 57 FPS | 161 FPS |
 | ffmpeg.wasm, singlethreaded | 13 FPS | 50 FPS | 48 FPS | 131 FPS |
 
-> Averaged over 10 runs. Higher is better. Measured on an M4 (4P+6E) MacBook Air. \
+> Averaged over 10 runs. Higher is better. Measured on an M4 (4P+6E) MacBook Air with TurboRes 1.2.0 and FFmpeg 7.1.1. \
 > To reproduce these benchmarks, check out [`benchmark/README.md`](./benchmark/README.md).
 
 ## Under the hood
