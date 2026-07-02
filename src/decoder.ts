@@ -293,11 +293,14 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
             .finally(() => {
                 frame._locked = false;
 
-                this._decodeQueueSize--;
+                // Queue a microtask so that the dequeue promise gets resolved AFTER this promise gets resolved
+                queueMicrotask(() => {
+                    this._decodeQueueSize--;
 
-                this._dequeuedResolve();
-                this._dequeued = new Promise<void>((resolve) => {
-                    this._dequeuedResolve = resolve;
+                    this._dequeuedResolve();
+                    this._dequeued = new Promise<void>((resolve) => {
+                        this._dequeuedResolve = resolve;
+                    });
                 });
             });
         this._queue = promise.catch(() => {});
