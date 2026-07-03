@@ -154,6 +154,41 @@ describe('Decoding', () => {
         await decoder.close();
     });
 
+    test('8K 4444 frame', async () => {
+        const packet = new Uint8Array(readFileSync(new URL('./public/8k.prores', import.meta.url)));
+        const dims: Record<1 | 2 | 4 | 8, [number, number]> = {
+            1: [8192, 4320], 2: [4096, 2160], 4: [2048, 1080], 8: [1024, 540],
+        };
+        for (const scale of [1, 2, 4, 8] as const) {
+            const decoder = await Decoder.create({
+                proresFourCc: 'ap4h', useSharedMemory: true, concurrency: 0, scale,
+            });
+            if (decoder instanceof Error) {
+                throw decoder;
+            }
+            using frame = new Frame();
+            const result = await decoder.decode(packet, frame);
+            if (result instanceof Error) {
+                throw result;
+            }
+            expect(frame.isFilled).toBe(true);
+            expect(frame.visibleWidth).toBe(dims[scale][0]);
+            expect(frame.visibleHeight).toBe(dims[scale][1]);
+            expect(frame.pixelFormat).toBe('I444AP12');
+            expect(frame.scanType).toBe('progressive');
+            // A full-resolution reference would be ~280 MB, so we self-regress the 1/8 decode. It captures every 8x8
+            // block's dequantized DC across the whole 8K frame, so a value regression (e.g. the all-green 12-bit
+            // dequant bug) would still be caught here.
+            if (scale === 8) {
+                const reference = new Uint8Array(gunzipSync(readFileSync(
+                    new URL('./public/8k.framedata.gz', import.meta.url),
+                )));
+                expect(Buffer.compare(frame.frameData!, reference)).toBe(0);
+            }
+            await decoder.close();
+        }
+    });
+
     test('Interlaced frame', async () => {
         const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
         if (decoder instanceof Error) {
@@ -697,6 +732,159 @@ describe('Pixel format conversion', () => {
             });
         }
     }
+});
+
+describe('Downscaled decoding', () => {
+    // Decoding at scale S emits frames downscaled by S in each axis, in the native pixel format.
+    for (const [scale, codedWidth, codedHeight, visibleWidth, visibleHeight] of [
+        [2, 960, 544, 960, 540],
+        [4, 480, 272, 480, 270],
+        [8, 240, 136, 240, 135],
+    ] as const) {
+        test(`scale ${scale} produces downscaled native-format frames`, async () => {
+            const decoder = await Decoder.create({
+                proresFourCc: 'apch', useSharedMemory: true, concurrency: 0, scale,
+            });
+            if (decoder instanceof Error) {
+                throw decoder;
+            }
+            using frame = new Frame();
+            const packet = new Uint8Array(readFileSync(new URL('./public/buck-bunny.prores', import.meta.url)));
+            const result = await decoder.decode(packet, frame);
+            if (result instanceof Error) {
+                throw result;
+            }
+
+            expect(frame.pixelFormat).toBe('I422P10'); // native format is preserved
+            expect(frame.codedWidth).toBe(codedWidth);
+            expect(frame.codedHeight).toBe(codedHeight);
+            expect(frame.visibleWidth).toBe(visibleWidth);
+            expect(frame.visibleHeight).toBe(visibleHeight);
+            expect(frame.frameData!.byteLength).toBe(codedWidth * codedHeight * 2 * 2); // 422, 10-bit
+
+            await decoder.close();
+        });
+    }
+
+    test('scale 8 luma equals the 8x8 block average of the full-resolution decode', async () => {
+        const packet = new Uint8Array(readFileSync(new URL('./public/buck-bunny.prores', import.meta.url)));
+
+        const fullDecoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
+        const lowDecoder = await Decoder.create({
+            proresFourCc: 'apch', useSharedMemory: true, concurrency: 0, scale: 8,
+        });
+        if (fullDecoder instanceof Error) throw fullDecoder;
+        if (lowDecoder instanceof Error) throw lowDecoder;
+
+        using fullFrame = new Frame();
+        using lowFrame = new Frame();
+        const full = await fullDecoder.decode(packet, fullFrame);
+        const low = await lowDecoder.decode(packet, lowFrame);
+        if (full instanceof Error) throw full;
+        if (low instanceof Error) throw low;
+
+        // A block's DC coefficient is its mean, so DC-only (scale 8) decoding must reproduce the 8x8 block average.
+        const fullData = new Uint16Array(
+            full.frameData.buffer, full.frameData.byteOffset, full.frameData.byteLength / 2,
+        );
+        const lowData = new Uint16Array(
+            low.frameData.buffer, low.frameData.byteOffset, low.frameData.byteLength / 2,
+        );
+        const fullWidth = full.codedWidth;
+        const lowWidth = low.codedWidth;
+
+        let maxAbsError = 0;
+        for (let y = 0; y < low.codedHeight; y++) {
+            for (let x = 0; x < lowWidth; x++) {
+                let sum = 0;
+                for (let dy = 0; dy < 8; dy++) {
+                    for (let dx = 0; dx < 8; dx++) {
+                        sum += fullData[(y * 8 + dy) * fullWidth + (x * 8 + dx)]!;
+                    }
+                }
+                maxAbsError = Math.max(maxAbsError, Math.abs(lowData[y * lowWidth + x]! - sum / 64));
+            }
+        }
+        // Tiny differences only, from rounding and clamping (the data is 10-bit, range 0..1023).
+        expect(maxAbsError).toBeLessThanOrEqual(2);
+
+        await fullDecoder.close();
+        await lowDecoder.close();
+    });
+
+    test('scale 2 blocks are correctly oriented (not transposed)', async () => {
+        // A reduced inverse DCT that mixes up the row/column frequency axes transposes each block — invisible to the
+        // block-average check above (a transpose preserves the mean), but it reads as rotated/mirrored blocks. Guard
+        // against it by comparing each 4x4 output block to a 2x2 box-downscale of the full-res decode (whose
+        // orientation is unambiguous) both as-is and transposed; the as-is comparison must fit far better.
+        const packet = new Uint8Array(readFileSync(new URL('./public/buck-bunny.prores', import.meta.url)));
+        const fullDecoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
+        const lowDecoder = await Decoder.create({
+            proresFourCc: 'apch', useSharedMemory: true, concurrency: 0, scale: 2,
+        });
+        if (fullDecoder instanceof Error) throw fullDecoder;
+        if (lowDecoder instanceof Error) throw lowDecoder;
+
+        using fullFrame = new Frame();
+        using lowFrame = new Frame();
+        const full = await fullDecoder.decode(packet, fullFrame);
+        const low = await lowDecoder.decode(packet, lowFrame);
+        if (full instanceof Error) throw full;
+        if (low instanceof Error) throw low;
+
+        const fullData = new Uint16Array(
+            full.frameData.buffer, full.frameData.byteOffset, full.frameData.byteLength / 2,
+        );
+        const lowData = new Uint16Array(
+            low.frameData.buffer, low.frameData.byteOffset, low.frameData.byteLength / 2,
+        );
+        const fullWidth = full.codedWidth;
+        const lowWidth = low.codedWidth;
+        const box = (y: number, x: number) => (
+            fullData[2 * y * fullWidth + 2 * x]! + fullData[2 * y * fullWidth + 2 * x + 1]!
+            + fullData[(2 * y + 1) * fullWidth + 2 * x]! + fullData[(2 * y + 1) * fullWidth + 2 * x + 1]!
+        ) / 4;
+
+        let aligned = 0;
+        let transposed = 0;
+        let count = 0;
+        for (let by = 0; by * 4 + 4 <= low.codedHeight; by++) {
+            for (let bx = 0; bx * 4 + 4 <= lowWidth; bx++) {
+                for (let yp = 0; yp < 4; yp++) {
+                    for (let xp = 0; xp < 4; xp++) {
+                        const got = lowData[(by * 4 + yp) * lowWidth + bx * 4 + xp]!;
+                        aligned += Math.abs(got - box(by * 4 + yp, bx * 4 + xp));
+                        transposed += Math.abs(got - box(by * 4 + xp, bx * 4 + yp)); // swap within the block
+                        count++;
+                    }
+                }
+            }
+        }
+        // The correctly-oriented downscale tracks the box-average closely; the transposed one does not.
+        expect(aligned / count).toBeLessThan(transposed / count / 3);
+
+        await fullDecoder.close();
+        await lowDecoder.close();
+    });
+
+    test('rejects downscaled decoding of interlaced content', async () => {
+        const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0, scale: 2 });
+        if (decoder instanceof Error) {
+            throw decoder;
+        }
+        using frame = new Frame();
+        const packet = new Uint8Array(readFileSync(new URL('./public/interlaced-buck-bunny.prores', import.meta.url)));
+        const result = await decoder.decode(packet, frame);
+        expect(result).toBeInstanceOf(NotSupportedError);
+
+        await decoder.close();
+    });
+
+    test('rejects an invalid scale', async () => {
+        await expect(
+            Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, scale: 3 as 1 }),
+        ).rejects.toThrow(TypeError);
+    });
 });
 
 describe('Pixel format preference', () => {

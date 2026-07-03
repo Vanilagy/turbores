@@ -71,10 +71,10 @@ const onMessage = async (message: WorkerMessage) => {
         case MessageType.CreateDecoder: {
             assert(messagePassingState);
             const { exports } = messagePassingState;
-            const { decoderId, bitDepth, allowedOutputFormats } = message;
+            const { decoderId, bitDepth, allowedOutputFormats, log2Scale } = message;
 
             // Concurrency 0 = decode synchronously, since each worker is itself one unit of parallelism
-            const decoder = exports.createDecoder(0, bitDepth, allowedOutputFormats);
+            const decoder = exports.createDecoder(0, bitDepth, allowedOutputFormats, log2Scale);
             if (decoder === 0) {
                 // Leave it unregistered and fail later
                 return;

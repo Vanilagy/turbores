@@ -76,6 +76,20 @@ export type DecoderOptions = {
      * of loss, preferring maintaining bit depth over chroma resolution.
      */
     allowedOutputFormats?: PixelFormat[];
+    /**
+     * Decodes the video at a reduced resolution for extra speed. Must be one of `1` (full resolution, the default),
+     * `2`, `4` or `8`, producing frames at 1, 1/2, 1/4 or 1/8 of the source dimensions in each axis.
+     *
+     * This is not a post-decode resize: the decoder runs a smaller inverse DCT over only the low-frequency
+     * coefficients of each block, so no separate resampling step is performed and less work is done overall (at scale
+     * `8`, the high-frequency coefficient stream is skipped entirely). The result is a clean, correctly-aligned
+     * downscale, ideal for fast previews, scrubbing, or generating thumbnails.
+     *
+     * When `scale` is greater than `1`, frames are always emitted in their native pixel format; `allowedOutputFormats`
+     * is not applied, as downscaling does not combine with pixel-format conversion. Downscaled decoding is also not
+     * supported for interlaced content.
+     */
+    scale?: 1 | 2 | 4 | 8;
 };
 
 /**
@@ -183,6 +197,10 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
                 + `${PIXEL_FORMATS.join(', ')}.`,
             );
         }
+        if (options.scale !== undefined && options.scale !== 1 && options.scale !== 2
+            && options.scale !== 4 && options.scale !== 8) {
+            throw new TypeError('options.scale, when provided, must be one of 1, 2, 4 or 8.');
+        }
 
         if (options.useSharedMemory && !canUseSharedMemory) {
             return new NotSupportedError(
@@ -209,6 +227,7 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
         const bitDepth = options.proresFourCc === 'ap4h' || options.proresFourCc === 'ap4x'
             ? 12
             : 10;
+        const log2Scale = Math.log2(options.scale ?? 1); // 1/2/4/8 -> 0/1/2/3
         const concurrency = options.concurrency ?? await getConcurrency();
 
         // Concurrency 0 always uses the shared memory runtime, since that's the only one with a WASM instance on the
@@ -219,7 +238,12 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
 
             await runtime.ensureWorkers(concurrency);
 
-            const decoderPtr = runtime.exports.createDecoder(concurrency, bitDepth, allowedOutputFormatsBitfield);
+            const decoderPtr = runtime.exports.createDecoder(
+                concurrency,
+                bitDepth,
+                allowedOutputFormatsBitfield,
+                log2Scale,
+            );
             if (decoderPtr === 0) {
                 runtime.unref();
                 return new OutOfMemoryError();
@@ -242,6 +266,7 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
                 concurrency,
                 bitDepth,
                 allowedOutputFormatsBitfield,
+                log2Scale,
             ) as Decoder;
         }
     }
@@ -496,6 +521,7 @@ class MessagePassingDecoder extends Decoder {
         concurrency: number,
         bitDepth: number,
         allowedOutputFormats: number,
+        log2Scale: number,
     ) {
         super();
 
@@ -505,7 +531,7 @@ class MessagePassingDecoder extends Decoder {
         this._decoderId = runtime.nextDecoderId++;
 
         // Spin up our own decoder on every worker; the workers are shared across decoder instances
-        runtime.registerDecoder(this._decoderId, bitDepth, allowedOutputFormats);
+        runtime.registerDecoder(this._decoderId, bitDepth, allowedOutputFormats, log2Scale);
 
         messagePassingDecoderRegistry.register(this, runtime, this);
     }

@@ -9,8 +9,14 @@ const gpa = misc.gpa;
 
 pub const Frame = struct {
     frame_data: []align(16) u8,
+    // The coded dimensions of the emitted frame data. With downscaled decoding (scale > 1) these are the
+    // source coded dimensions divided by the scale factor.
     coded_width: u32,
     coded_height: u32,
+    // The source coded dimensions (always a multiple of 16), i.e. the macroblock grid the packet is decoded on.
+    // These match coded_width/coded_height when decoding at full resolution.
+    source_coded_width: u32,
+    source_coded_height: u32,
     visible_width: u32,
     visible_height: u32,
     log2_chroma_blocks_per_mb: u32,
@@ -40,6 +46,8 @@ export fn createFrame() ?*Frame {
         .frame_data = &.{},
         .coded_width = undefined,
         .coded_height = undefined,
+        .source_coded_width = undefined,
+        .source_coded_height = undefined,
         .visible_width = undefined,
         .visible_height = undefined,
         .log2_chroma_blocks_per_mb = undefined,
