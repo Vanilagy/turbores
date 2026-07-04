@@ -63,6 +63,16 @@
             display: none;
         }
 
+        #stats {
+            font-size: 0.8rem;
+            color: #888;
+            font-variant-numeric: tabular-nums;
+        }
+
+        #stats:empty {
+            display: none;
+        }
+
         #scale-control {
             font-size: 0.8rem;
             color: #555;
@@ -138,6 +148,7 @@
             <canvas id="canvas"></canvas>
         </div>
         <input type="range" id="scrubber" min="0" max="0" value="0" disabled>
+        <p id="stats"></p>
     </div>
 
     <script type="module">
@@ -148,6 +159,7 @@
         const canvas = document.querySelector('#canvas');
         const scrubber = document.querySelector('#scrubber');
         const scaleSelect = document.querySelector('#scale');
+        const statsField = document.querySelector('#stats');
         const errorField = document.querySelector('#error');
         const ctx = canvas.getContext('2d');
         const frame = new Frame();
@@ -383,7 +395,9 @@
                 if (packet && packet.timestamp !== currentTimestamp) {
                     currentTimestamp = packet.timestamp;
 
+                    const startTime = performance.now();
                     const result = await decoder.decode(packet.data, frame);
+                    const decodeMs = performance.now() - startTime;
                     if (result instanceof Error) {
                         throw result;
                     }
@@ -432,6 +446,9 @@
                     });
                     ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
                     videoFrame.close();
+
+                    statsField.textContent = `Decoded ${result.visibleWidth}×${result.visibleHeight} in `
+                        + `${decodeMs.toFixed(1)} ms (${Math.round(1000 / decodeMs)} fps)`;
                 }
 
                 decoding = false;
