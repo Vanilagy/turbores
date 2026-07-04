@@ -421,6 +421,43 @@ describe('Decoding modes', () => {
 
         await decoder.close();
     });
+
+    test('Downscaled decoding matches across threading modes', async () => {
+        // Downscaled decoding takes a different multithreading path (a work-aware worker cap, plus main-thread
+        // participation), so a threaded downscale must still be byte-identical to a single-threaded one. Uses 4:4:4
+        // and 4:4:4:4 fixtures to exercise the multi-plane worker cap and the alpha plane.
+        for (const name of ['buck-bunny-444', 'transparent'] as const) {
+            const packet = new Uint8Array(readFileSync(new URL(`./public/${name}.prores`, import.meta.url)));
+            for (const scale of [2, 4, 8] as const) {
+                const sync = await Decoder.create({
+                    proresFourCc: 'apch', useSharedMemory: true, concurrency: 0, scale,
+                });
+                if (sync instanceof Error) {
+                    throw sync;
+                }
+                const threaded = await Decoder.create({
+                    proresFourCc: 'apch', useSharedMemory: true, concurrency: 4, scale,
+                });
+                if (threaded instanceof Error) {
+                    throw threaded;
+                }
+                using syncFrame = new Frame();
+                using threadedFrame = new Frame();
+                const syncResult = await sync.decode(packet, syncFrame);
+                const threadedResult = await threaded.decode(packet, threadedFrame);
+                if (syncResult instanceof Error) {
+                    throw syncResult;
+                }
+                if (threadedResult instanceof Error) {
+                    throw threadedResult;
+                }
+                expect(Buffer.compare(syncFrame.frameData!, threadedFrame.frameData!)).toBe(0);
+
+                await sync.close();
+                await threaded.close();
+            }
+        }
+    });
 });
 
 describe('API misuse', () => {

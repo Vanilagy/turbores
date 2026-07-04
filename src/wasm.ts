@@ -26,6 +26,7 @@ export type WasmExports = {
     closeFrame: (frame: number) => void;
     allocatePacket: (decoder: number, size: number, slot: number) => number;
     decodePacket: (decoder: number, frame: number, slot: number) => number;
+    decodeOnMainThread: (decoder: number, frame: number) => void;
     finalizePacketDecoding: (decoder: number) => number;
     getVisibleWidth: (frame: number) => number;
     getVisibleHeight: (frame: number) => number;

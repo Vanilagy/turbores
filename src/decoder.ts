@@ -458,6 +458,12 @@ class SharedMemoryDecoder extends Decoder {
                 }
 
                 if (this.concurrency > 0) {
+                    // Unless more packets are queued (in which case the main thread is better used feeding the
+                    // pipeline), help decode instead of idling until the workers finish.
+                    if (this._decodeQueueSize <= 1) {
+                        exports.decodeOnMainThread(this._decoderPtr, framePtr);
+                    }
+
                     // Wait for all workers to finish. We wait on the "working" state (1); if the workers already
                     // finished and stored "done" (0), waitAsync returns immediately.
                     await Atomics.waitAsync(new Int32Array(memory.buffer), this._taskStateOffset, 1).value;

@@ -10,24 +10,24 @@ unchanged* below).
 
 ## Speedup vs full-resolution decode
 
-Node.js v26, Apple M5 Max (18 cores), min of 5 runs (each run aggregates ~400 ms of work). MT = multi-threaded
-(shared memory).
+Node.js v26, Apple M5 Max (18 cores), best of 5 iterations, median of 3 runs (each iteration aggregates ~400 ms of
+work). MT = multi-threaded (shared memory).
 
 | content | 1/2 | 1/4 | 1/8 | MT 1/2 | MT 1/4 | MT 1/8 |
 |---|--:|--:|--:|--:|--:|--:|
-| 1080p 422 Proxy | 1.67× | 2.72× | 6.93× | 1.30× | 1.64× | 2.33× |
-| 1080p 422 Standard | 1.71× | 4.04× | 13.03× | 1.03× | 1.51× | 2.36× |
-| 8K 4444 | 2.07× | 5.17× | 18.47× | 1.78× | 3.47× | 6.55× |
-| buck-bunny (422 HQ) | 1.97× | 5.09× | 13.08× | 1.03× | 1.57× | 2.30× |
-| buck-bunny-444 (444 HQ) | 2.07× | 5.95× | 17.79× | 1.68× | 2.05× | 3.09× |
-| transparent (4444 alpha) | 1.57× | 2.35× | 2.89× | 1.43× | 1.86× | 2.03× |
-| 4444 12-bit | 2.55× | 4.59× | 7.89× | 1.49× | 1.93× | 2.27× |
+| 1080p 422 Proxy | 1.67× | 2.70× | 6.89× | 1.52× | 1.62× | 2.30× |
+| 1080p 422 Standard | 1.70× | 4.03× | 13.03× | 1.31× | 1.62× | 3.26× |
+| 8K 4444 | 2.07× | 5.20× | 18.70× | 1.77× | 3.47× | 6.43× |
+| buck-bunny (422 HQ) | 1.97× | 5.07× | 13.19× | 1.40× | 1.83× | 3.16× |
+| buck-bunny-444 (444 HQ) | 2.05× | 5.91× | 17.89× | 1.69× | 2.62× | 3.92× |
+| transparent (4444 alpha) | 1.57× | 2.38× | 2.88× | 1.43× | 1.89× | 2.14× |
+| 4444 12-bit | 2.54× | 4.70× | 7.73× | 1.31× | 1.67× | 1.97× |
 
-1/4 and 1/8 are large, universal wins, and **1/2 is 1.5–2.5× single-threaded across every content type** (figures are
-min-of-5 and vary somewhat with machine load). Multi-threaded speedups compress on small frames, which become
-orchestration-bound — and more so now that the shared-memory decoder copies the output plane in parallel across
-workers, which speeds the larger full-resolution copy more than the smaller downscaled one. Alpha (transparent) gains
-less because the alpha plane is run-length coded and parsed in full at every scale. Interlaced content is
+1/4 and 1/8 are large, universal wins, and **1/2 is 1.5–2.5× single-threaded across every content type** (figures vary
+somewhat with machine load). Multi-threaded speedups are necessarily smaller — a 1080p frame's *entire* decode is
+already ~0.4 ms once split across 18 cores, so there is little absolute time left to remove — but the work-aware
+scheduling described below keeps MT 1/2 at 1.3–1.8× and MT 1/8 at 2–6.4×. Alpha content (transparent) gains less
+because the alpha plane is run-length coded and parsed in full at every scale. Interlaced content is
 full-resolution only.
 
 ## Techniques, most to least important
@@ -79,6 +79,26 @@ the per-output-pixel write/convert work, not by IDCT multiplies. Each technique 
   associated memset shrink (below) is small.
 - **Memset shrink at 1/2 and 1/4:** measurable but tiny (~0.05× on Proxy), not worth the bookkeeping.
 
+## Multithreading: sizing the workers to the work
+
+The shared-memory decoder splits a frame's slices across workers that pull from a shared atomic counter. A downscaled
+frame does far less work per slice, so waking all ~18 workers on a small one loses more to dispatch and counter
+contention than it gains — 1080p 1/2 peaks around half the workers and gets *slower* beyond that, which is why the
+naive MT 1/2 speedups sat near 1.0×. Two adjustments fix this (single-threaded and full-resolution decoding are
+untouched, and the output stays byte-identical):
+
+- **Work-aware worker cap.** For a chroma-only downscale, the worker count is capped by the frame's total work
+  (parsed bytes + bytes written), so a 1080p downscale uses about half its workers while an 8K frame still uses all of
+  them. Alpha-bearing frames are exempt — the run-length alpha plane is decoded in full at every scale, so it keeps
+  enough work to feed every worker (this is what regressed when the cap was tried on output size alone).
+- **Main-thread participation.** When the cap leaves a core spare, the main thread — which would otherwise just idle
+  on the completion wait — joins in and decodes slices from the same counter, for concurrency+1 effective decoders. It
+  does so only when no other packet is queued, so it never steals the main thread from a decode pipeline, and only
+  when a core is actually free, so it never over-subscribes the CPU.
+
+Together these lift MT 1/2 on chroma-only content from ~1.0–1.3× to ~1.3–1.5× and cut 1/8 latency substantially
+(e.g. 1080p Standard MT 1/8 2.4× → 3.3×, 4:4:4 HQ MT 1/8 3.1× → 3.9×).
+
 ## Why 1× (full-resolution) decoding is unchanged
 
 Everything above is gated behind `scale > 1`. Crucially, the full-resolution path *already* uses the same core
@@ -86,4 +106,5 @@ techniques — it truncates (no round), converts at full SIMD width, and compute
 storing — which is exactly why it was several× more efficient per output pixel than the first naive reduced kernel.
 Bringing the reduced path up to that same standard is what these changes do; they add only a never-taken,
 `@branchHint(.unlikely)` cutoff guard to the shared AC-decode loop (~0.002% of an 8K decode), so 1× decode speed is
-unchanged.
+unchanged. The multithreading adjustments above are likewise gated to `scale > 1`: the worker cap never fires at full
+resolution, and the main thread only joins in when the cap has freed a core, which never happens for a 1× decode.

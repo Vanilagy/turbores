@@ -71,6 +71,8 @@ pub const Decoder = struct {
     tasks: []DecodeTask,
     running_task_count: std.atomic.Value(u32),
     task_state: std.atomic.Value(DecodeTaskState),
+    picture_count: u32,
+    main_should_help: bool,
     worker_error: std.atomic.Value(?*worker.WorkerError),
 
     error_message: ?[]const u8,
@@ -158,6 +160,8 @@ export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats
         .tasks = &.{},
         .running_task_count = .init(0),
         .task_state = .init(.done),
+        .picture_count = 1,
+        .main_should_help = false,
         .worker_error = .init(null),
 
         .error_message = null,
@@ -204,10 +208,40 @@ export fn getTaskStateAddress(decoder: *Decoder) *u32 {
     return @ptrCast(&decoder.task_state.raw);
 }
 
+// Work (parsed bytes + output bytes) below which an extra worker isn't worth its dispatch and contention cost. Tuned
+// so a downscaled 1080p frame uses ~half the workers (its efficient point) while large frames still use all of them.
+const downscaled_bytes_per_worker: usize = 200 * 1024;
+
 export fn decodePacket(decoder: *Decoder, frame: *Frame, slot: u32) i32 {
     decoder.packet = decoder.packet_slots[slot];
     decodePacketInternal(decoder, frame) catch |err| return misc.toErrorCode(err);
     return 0;
+}
+
+// Preallocated so storing an error can't fail (mirrors the worker's threadlocal).
+threadlocal var main_thread_error: worker.WorkerError = undefined;
+
+// After decodePacket dispatches slices to the workers, the main thread would otherwise just idle on the completion
+// wait. Instead it joins in, pulling slices from the same shared counter — giving concurrency+1 effective decoders and
+// shrinking the wait to whatever stragglers remain. The caller only invokes this when no other packet is queued, so it
+// never steals the main thread from pipelined work. Errors go through the same channel as the workers'.
+export fn decodeOnMainThread(decoder: *Decoder, frame: *Frame) void {
+    if (!decoder.main_should_help) {
+        return;
+    }
+    for (0..decoder.picture_count) |p| {
+        var task = DecodeTask{
+            .decoder = decoder,
+            .frame = frame,
+            .picture = &decoder.pictures[p],
+            .error_message = null,
+        };
+        executeDecodeTask(&task) catch |err| {
+            main_thread_error = .{ .code = misc.toErrorCode(err), .message = task.error_message };
+            _ = decoder.worker_error.cmpxchgStrong(null, &main_thread_error, .seq_cst, .seq_cst);
+            return;
+        };
+    }
 }
 
 threadlocal var error_print_buffer: [1024]u8 = undefined;
@@ -452,6 +486,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         return error.NotSupported;
     }
     const picture_count: u32 = if (is_interlaced) 2 else 1;
+    decoder.picture_count = picture_count;
     const row_stride_shift: u5 = if (is_interlaced) 1 else 0;
 
     frame.source_coded_width = (frame_width + 15) & ~@as(u32, 15);
@@ -540,8 +575,22 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     misc.lockMutex(&worker.worker_task_queue_mutex);
     defer worker.worker_task_queue_mutex.unlock(io);
 
-    const task_count_per_picture = decoder.concurrency;
+    // Downscaled frames do far less work per slice, so waking every worker on a small one loses more to dispatch and
+    // slice-counter contention than it gains. Cap the workers to the frame's total work (parsed bytes plus bytes
+    // written), so large frames like 8K still saturate all workers while a 1080p downscale uses about half. This is
+    // skipped for alpha-bearing frames: the alpha plane is run-length coded and decoded in full at every scale, so it
+    // keeps enough work to use every worker. Full-resolution decoding is left untouched.
+    const cap_workers = decoder.log2_scale != 0 and decoder.alpha_bit_depth == 0;
+    const task_count_per_picture = if (!cap_workers) decoder.concurrency else blk: {
+        const work = decoder.pictures[0].total_slice_size + @as(usize, frame_data_size);
+        const wanted: u32 = @intCast(@max(1, work / downscaled_bytes_per_worker));
+        break :blk @min(decoder.concurrency, wanted);
+    };
     const total_task_count = picture_count * task_count_per_picture;
+
+    // The main thread pitches in via decodeOnMainThread, but only when the cap left a core spare for it — otherwise it
+    // would over-subscribe the CPU and slow the very frames (full-resolution, alpha) it's trying to help.
+    decoder.main_should_help = total_task_count < decoder.concurrency;
     decoder.tasks = try gpa.realloc(decoder.tasks, total_task_count);
 
     var task_index: usize = 0;
