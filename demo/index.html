@@ -141,6 +141,10 @@
                 <option value="8">1/8</option>
             </select>
         </label>
+        <label id="single-thread-control">
+            <input type="checkbox" id="single-thread" disabled>
+            Single-threaded decoding
+        </label>
     </div>
     <p id="error"></p>
     <div id="player">
@@ -159,6 +163,7 @@
         const canvas = document.querySelector('#canvas');
         const scrubber = document.querySelector('#scrubber');
         const scaleSelect = document.querySelector('#scale');
+        const singleThreadCheckbox = document.querySelector('#single-thread');
         const statsField = document.querySelector('#stats');
         const errorField = document.querySelector('#error');
         const ctx = canvas.getContext('2d');
@@ -280,17 +285,20 @@
         // Square-pixel (aspect-corrected, unrotated) display size of the loaded video, captured on load.
         let squarePixelWidth = 0;
         let squarePixelHeight = 0;
+        let currentSingleThread = false;
         let currentTimestamp = null;
         let decoding = false;
         let nextTime = null;
 
         // At full resolution we constrain the output to I420/I420A (the formats every browser's `VideoFrame` can draw)
         // and render via `VideoFrame`. Downscaled modes emit the native format and are rendered in software, since
-        // `allowedOutputFormats` (pixel-format conversion) does not apply when scaling.
+        // `allowedOutputFormats` (pixel-format conversion) does not apply when scaling. `concurrency: 0` forces a
+        // single synchronous worker (useful for comparing against the multi-threaded decode).
         const createDecoder = () => Decoder.create({
             proresFourCc,
             useSharedMemory: Decoder.canUseSharedMemory(),
             scale: currentScale,
+            ...(currentSingleThread ? { concurrency: 0 } : {}),
             ...(currentScale === 1 ? { allowedOutputFormats: ['I420', 'I420A'] } : {}),
         });
 
@@ -346,6 +354,7 @@
             scrubber.value = firstTimestamp;
             scrubber.disabled = false;
             scaleSelect.disabled = false;
+            singleThreadCheckbox.disabled = false;
 
             showFrame(firstTimestamp);
         };
@@ -377,6 +386,11 @@
 
         scaleSelect.addEventListener('change', () => {
             currentScale = Number(scaleSelect.value);
+            rebuildDecoder();
+        });
+
+        singleThreadCheckbox.addEventListener('change', () => {
+            currentSingleThread = singleThreadCheckbox.checked;
             rebuildDecoder();
         });
 
