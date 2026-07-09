@@ -145,6 +145,14 @@ describe('Decoding', () => {
         expect(frame.pixelFormat).toBe('I444AP12');
         expect(frame.scanType).toBe('progressive');
         expect(frame.frameData!.byteLength).toBe(1920 * 1088 * 4 * 2);
+
+        // The frame is black, so luma must sit at video-range black and chroma at the neutral midpoint, at proper
+        // 12-bit scale. This guards against values coming out at the wrong scale (as the coefficient scale of the
+        // bitstream is the same for all ProRes variants).
+        const view = new DataView(frame.frameData!.buffer, frame.frameData!.byteOffset);
+        expect(view.getUint16(0, true)).toBe(16 << 4); // Y
+        expect(view.getUint16(1920 * 1088 * 2, true)).toBe(128 << 4); // U
+
         const reference = new Uint8Array(gunzipSync(readFileSync(
             new URL('./public/4444-12bit.framedata.gz', import.meta.url),
         )));
