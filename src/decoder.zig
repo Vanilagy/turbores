@@ -376,11 +376,16 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         }
     }
 
-    // To achieve the desired output bit depth, we must derive a scaling factor for it
-    const output_value_scaling = if (frame.bit_depth >= decoder.bit_depth)
-        @as(f32, @floatFromInt(@as(u32, 1) << @as(u5, @intCast(frame.bit_depth - decoder.bit_depth))))
+    // The coefficient scale of the ProRes bitstream is the same for all variants; there is no bit depth information
+    // in the bitstream itself, and our decoding pipeline natively produces values at 10-bit scale. The profile's bit
+    // depth (from the FourCC) therefore only determines the output format, not the interpretation of the coefficient
+    // data. To achieve the desired output bit depth, we must derive a scaling factor for it, relative to the native
+    // 10-bit scale.
+    const native_bit_depth = 10;
+    const output_value_scaling = if (frame.bit_depth >= native_bit_depth)
+        @as(f32, @floatFromInt(@as(u32, 1) << @as(u5, @intCast(frame.bit_depth - native_bit_depth))))
     else
-        1 / @as(f32, @floatFromInt(@as(u32, 1) << @as(u5, @intCast(decoder.bit_depth - frame.bit_depth))));
+        1 / @as(f32, @floatFromInt(@as(u32, 1) << @as(u5, @intCast(native_bit_depth - frame.bit_depth))));
     decoder.dc_offset = output_value_scaling * (comptime 4096 / (S[0] * S[0]));
 
     // Fold the dequantization, AAN scaling factors and bit depth scaling into a single matrix
