@@ -145,6 +145,7 @@ describe('Decoding', () => {
         expect(frame.pixelFormat).toBe('I444AP12');
         expect(frame.scanType).toBe('progressive');
         expect(frame.frameData!.byteLength).toBe(1920 * 1088 * 4 * 2);
+
         const reference = new Uint8Array(gunzipSync(readFileSync(
             new URL('./public/4444-12bit.framedata.gz', import.meta.url),
         )));
