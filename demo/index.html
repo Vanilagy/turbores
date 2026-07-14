@@ -192,8 +192,8 @@
 
             sink = new EncodedPacketSink(videoTrack);
 
-            canvas.width = videoTrack.displayWidth;
-            canvas.height = videoTrack.displayHeight;
+            canvas.width = videoTrack.squarePixelWidth;
+            canvas.height = videoTrack.squarePixelHeight;
 
             currentTimestamp = null;
             const firstTimestamp = await videoTrack.getFirstTimestamp();
