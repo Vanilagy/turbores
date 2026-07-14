@@ -48,7 +48,7 @@
     "@stylistic/eslint-plugin": "^4.2.0",
     "@types/node": "^25.9.2",
     "eslint": "^9.22.0",
-    "mediabunny": "^1.25.8",
+    "mediabunny": "^1.50.8",
     "tsx": "^4.22.4",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.48.0",
