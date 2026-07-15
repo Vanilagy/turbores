@@ -63,6 +63,21 @@
             display: none;
         }
 
+        #stats {
+            font-size: 0.8rem;
+            color: #888;
+            font-variant-numeric: tabular-nums;
+        }
+
+        #stats:empty {
+            display: none;
+        }
+
+        #scale-control {
+            font-size: 0.8rem;
+            color: #555;
+        }
+
         #player {
             display: flex;
             flex-direction: column;
@@ -117,6 +132,19 @@
         <a id="download-sample" href="https://pub-1ee78aacb848486482b20a72b55b3121.r2.dev/turbores-sample.mov" download>
             Download sample file
         </a>
+        <label id="scale-control">
+            Decode resolution:
+            <select id="scale" disabled>
+                <option value="1">Full</option>
+                <option value="2">1/2</option>
+                <option value="4">1/4</option>
+                <option value="8">1/8</option>
+            </select>
+        </label>
+        <label id="single-thread-control">
+            <input type="checkbox" id="single-thread" disabled>
+            Single-threaded decoding
+        </label>
     </div>
     <p id="error"></p>
     <div id="player">
@@ -124,6 +152,7 @@
             <canvas id="canvas"></canvas>
         </div>
         <input type="range" id="scrubber" min="0" max="0" value="0" disabled>
+        <p id="stats"></p>
     </div>
 
     <script type="module">
@@ -133,6 +162,9 @@
         const fileInput = document.querySelector('#file');
         const canvas = document.querySelector('#canvas');
         const scrubber = document.querySelector('#scrubber');
+        const scaleSelect = document.querySelector('#scale');
+        const singleThreadCheckbox = document.querySelector('#single-thread');
+        const statsField = document.querySelector('#stats');
         const errorField = document.querySelector('#error');
         const ctx = canvas.getContext('2d');
         const frame = new Frame();
@@ -141,11 +173,134 @@
             errorField.textContent = String(error);
         };
 
+        // Copies the visible (top-left) region out of a decoded frame's coded planes into a single
+        // tightly-packed buffer whose plane dimensions exactly match the visible size. Handles any YUV
+        // pixel format (chroma subsampling, bit depth and optional alpha).
+        const packVisibleRegion = (frame) => {
+            const { pixelFormat, codedWidth, codedHeight, visibleWidth, visibleHeight, frameData } = frame;
+
+            // No coded padding: the planes are already tightly packed at the visible size, so there's nothing to copy.
+            if (codedWidth === visibleWidth && codedHeight === visibleHeight) {
+                return { data: frameData };
+            }
+
+            const bytesPerSample = pixelFormat.includes('P12') || pixelFormat.includes('P10') ? 2 : 1;
+            const is444 = pixelFormat.startsWith('I444');
+            const is420 = pixelFormat.startsWith('I420');
+            const hasAlpha = pixelFormat.startsWith('I420A') || pixelFormat.startsWith('I422A')
+                || pixelFormat.startsWith('I444A');
+
+            const chromaShiftX = is444 ? 0 : 1; // horizontal subsampling
+            const chromaShiftY = is420 ? 1 : 0; // vertical subsampling
+
+            // [coded width, coded height, visible width, visible height] for each plane, in samples
+            const planes = [[codedWidth, codedHeight, visibleWidth, visibleHeight]]; // Y
+            const chroma = [
+                codedWidth >> chromaShiftX, codedHeight >> chromaShiftY,
+                visibleWidth >> chromaShiftX, visibleHeight >> chromaShiftY,
+            ];
+            planes.push(chroma, chroma); // U, V
+            if (hasAlpha) {
+                planes.push([codedWidth, codedHeight, visibleWidth, visibleHeight]); // A
+            }
+
+            const outBytes = planes.reduce((sum, [, , vw, vh]) => sum + vw * vh * bytesPerSample, 0);
+            const out = new Uint8Array(outBytes);
+
+            let srcOffset = 0;
+            let dstOffset = 0;
+            for (const [cw, ch, vw, vh] of planes) {
+                const srcRowBytes = cw * bytesPerSample;
+                const dstRowBytes = vw * bytesPerSample;
+                for (let y = 0; y < vh; y++) {
+                    out.set(
+                        frameData.subarray(srcOffset + y * srcRowBytes, srcOffset + y * srcRowBytes + dstRowBytes),
+                        dstOffset + y * dstRowBytes,
+                    );
+                }
+                srcOffset += cw * ch * bytesPerSample;
+                dstOffset += vw * vh * bytesPerSample;
+            }
+
+            return { data: out };
+        };
+
+        // Down-converts a downscaled, native-format frame to 8-bit I420/I420A (the only YUV formats every browser's
+        // `VideoFrame` can draw). Crucially this keeps the data as YUV, so when we hand it to `VideoFrame` with the
+        // frame's color space the browser still performs proper HDR color management — a software YUV->RGB conversion
+        // here would bypass that and make HLG/PQ clips look wrong. It operates on the full coded rectangle, which is
+        // always even-sized, so no `visibleRect` crop (and thus no WebKit bug 317524) is needed.
+        const nativeToI420 = (result) => {
+            const { pixelFormat, codedWidth, codedHeight, frameData } = result;
+
+            const bitDepth = pixelFormat.includes('P12') ? 12 : pixelFormat.includes('P10') ? 10 : 8;
+            const shift = bitDepth - 8; // 10-/12-bit -> 8-bit
+            const is444 = pixelFormat.startsWith('I444');
+            const hasAlpha = pixelFormat.startsWith('I444A') || pixelFormat.startsWith('I422A')
+                || pixelFormat.startsWith('I420A');
+
+            const samples = bitDepth > 8
+                ? new Uint16Array(frameData.buffer, frameData.byteOffset, frameData.byteLength >> 1)
+                : frameData;
+            const srcChromaWidth = is444 ? codedWidth : codedWidth >> 1; // ProRes chroma is 4:2:2 or 4:4:4, full height
+            const srcY = 0;
+            const srcU = codedWidth * codedHeight;
+            const srcV = srcU + srcChromaWidth * codedHeight;
+            const srcA = srcV + srcChromaWidth * codedHeight;
+
+            const outChromaWidth = codedWidth >> 1;
+            const outChromaHeight = codedHeight >> 1;
+            const out = new Uint8Array(
+                codedWidth * codedHeight
+                + 2 * outChromaWidth * outChromaHeight
+                + (hasAlpha ? codedWidth * codedHeight : 0),
+            );
+
+            let offset = 0;
+            for (let i = 0; i < codedWidth * codedHeight; i++) {
+                out[offset++] = samples[srcY + i] >> shift;
+            }
+            for (const plane of [srcU, srcV]) {
+                for (let y = 0; y < outChromaHeight; y++) {
+                    for (let x = 0; x < outChromaWidth; x++) {
+                        // 4:2:0 output: take every other row, and every other column for 4:4:4 sources
+                        const sx = is444 ? x << 1 : x;
+                        out[offset++] = samples[plane + (y << 1) * srcChromaWidth + sx] >> shift;
+                    }
+                }
+            }
+            if (hasAlpha) {
+                for (let i = 0; i < codedWidth * codedHeight; i++) {
+                    out[offset++] = samples[srcA + i] >> shift;
+                }
+            }
+
+            return { data: out, format: hasAlpha ? 'I420A' : 'I420', width: codedWidth, height: codedHeight };
+        };
+
         let decoder = null;
         let sink = null;
+        let proresFourCc = null;
+        let currentScale = 1;
+        // Square-pixel (aspect-corrected, unrotated) display size of the loaded video, captured on load.
+        let squarePixelWidth = 0;
+        let squarePixelHeight = 0;
+        let currentSingleThread = false;
         let currentTimestamp = null;
         let decoding = false;
         let nextTime = null;
+
+        // At full resolution we constrain the output to I420/I420A (the formats every browser's `VideoFrame` can draw)
+        // and render via `VideoFrame`. Downscaled modes emit the native format and are rendered in software, since
+        // `allowedOutputFormats` (pixel-format conversion) does not apply when scaling. `concurrency: 0` forces a
+        // single synchronous worker (useful for comparing against the multi-threaded decode).
+        const createDecoder = () => Decoder.create({
+            proresFourCc,
+            useSharedMemory: Decoder.canUseSharedMemory(),
+            scale: currentScale,
+            ...(currentSingleThread ? { concurrency: 0 } : {}),
+            ...(currentScale === 1 ? { allowedOutputFormats: ['I420', 'I420A'] } : {}),
+        });
 
         fileInput.addEventListener('change', async () => {
             try {
@@ -178,22 +333,18 @@
             }
 
             // For ISOBMFF files, internalCodecId is the sample entry name, which is the ProRes FourCC
-            const proresFourCc = videoTrack.internalCodecId;
+            proresFourCc = videoTrack.internalCodecId;
 
-            decoder = await Decoder.create({
-                proresFourCc,
-                useSharedMemory: Decoder.canUseSharedMemory(),
-                // Non-Chrome browsers only support I420
-                allowedOutputFormats: window.chrome ? undefined : ['I420', 'I420A'],
-            });
+            // Aspect-corrected, unrotated display dimensions (mediabunny), used to size the render canvas.
+            squarePixelWidth = videoTrack.squarePixelWidth;
+            squarePixelHeight = videoTrack.squarePixelHeight;
+
+            decoder = await createDecoder();
             if (decoder instanceof Error) {
                 throw decoder;
             }
 
             sink = new EncodedPacketSink(videoTrack);
-
-            canvas.width = videoTrack.squarePixelWidth;
-            canvas.height = videoTrack.squarePixelHeight;
 
             currentTimestamp = null;
             const firstTimestamp = await videoTrack.getFirstTimestamp();
@@ -202,12 +353,45 @@
             scrubber.step = 'any';
             scrubber.value = firstTimestamp;
             scrubber.disabled = false;
+            scaleSelect.disabled = false;
+            singleThreadCheckbox.disabled = false;
 
             showFrame(firstTimestamp);
         };
 
         scrubber.addEventListener('input', () => {
             showFrame(Number(scrubber.value));
+        });
+
+        // Switching resolution rebuilds the decoder (scale is fixed per decoder) and re-renders the current frame.
+        // Decoder options (scale, threading) are fixed per decoder, so changing them rebuilds it and re-renders.
+        const rebuildDecoder = async () => {
+            if (!sink) {
+                return;
+            }
+            try {
+                await decoder?.close(); // drains in-flight decodes and unlocks the shared frame
+                decoder = await createDecoder();
+                if (decoder instanceof Error) {
+                    throw decoder;
+                }
+                currentTimestamp = null;
+                decoding = false;
+                nextTime = null;
+                showFrame(Number(scrubber.value));
+            } catch (error) {
+                showError(error);
+            }
+        };
+
+        scaleSelect.addEventListener('change', () => {
+            currentScale = Number(scaleSelect.value);
+            rebuildDecoder();
+        });
+
+        singleThreadCheckbox.addEventListener('change', () => {
+            currentSingleThread = singleThreadCheckbox.checked;
+            rebuildDecoder();
         });
 
         const showFrame = async (time) => {
@@ -225,21 +409,46 @@
                 if (packet && packet.timestamp !== currentTimestamp) {
                     currentTimestamp = packet.timestamp;
 
+                    const startTime = performance.now();
                     const result = await decoder.decode(packet.data, frame);
+                    const decodeMs = performance.now() - startTime;
                     if (result instanceof Error) {
                         throw result;
                     }
 
-                    const videoFrame = new VideoFrame(result.frameData, {
-                        format: result.pixelFormat,
-                        codedWidth: result.codedWidth,
-                        codedHeight: result.codedHeight,
-                        visibleRect: {
-                            x: 0,
-                            y: 0,
-                            width: result.visibleWidth,
-                            height: result.visibleHeight,
-                        },
+                    // Prepare a frame buffer that `VideoFrame` can draw in every browser. At full resolution the
+                    // decoder already emits I420/I420A; we just pack the visible region (the coded rectangle is rounded
+                    // up to the macroblock grid, and a smaller `visibleRect` triggers WebKit bug 317524 — an
+                    // incorrectly-offset chroma render — so we avoid it by making coded == visible). At reduced
+                    // resolution the decoder emits the native format, so we down-convert it to I420/I420A. Either way
+                    // we keep the data as YUV and pass the color space, so the browser still does HDR color management.
+                    let buffer;
+                    let format;
+                    let width;
+                    let height;
+                    if (currentScale === 1) {
+                        buffer = packVisibleRegion(result).data;
+                        format = result.pixelFormat;
+                        width = result.visibleWidth;
+                        height = result.visibleHeight;
+                    } else {
+                        const converted = nativeToI420(result);
+                        buffer = converted.data;
+                        format = converted.format;
+                        width = converted.width;
+                        height = converted.height;
+                    }
+
+                    // Size the canvas to the square-pixel (aspect-corrected, unrotated) display dimensions, scaled
+                    // down to match the current decode scale, then stretch the decoded frame to fill it — so
+                    // anamorphic sources render at the correct aspect ratio. For square-pixel content this equals the
+                    // frame's own dimensions, so nothing changes.
+                    canvas.width = Math.max(1, Math.round(squarePixelWidth / currentScale));
+                    canvas.height = Math.max(1, Math.round(squarePixelHeight / currentScale));
+                    const videoFrame = new VideoFrame(buffer, {
+                        format,
+                        codedWidth: width,
+                        codedHeight: height,
                         colorSpace: {
                             primaries: result.colorPrimariesString ?? null,
                             transfer: result.colorTransferString ?? null,
@@ -249,8 +458,11 @@
                         timestamp: packet.microsecondTimestamp,
                         duration: packet.microsecondDuration,
                     });
-                    ctx.drawImage(videoFrame, 0, 0);
+                    ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
                     videoFrame.close();
+
+                    statsField.textContent = `Decoded ${result.visibleWidth}×${result.visibleHeight} in `
+                        + `${decodeMs.toFixed(1)} ms (${Math.round(1000 / decodeMs)} fps)`;
                 }
 
                 decoding = false;

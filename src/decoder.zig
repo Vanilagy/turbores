@@ -42,6 +42,9 @@ pub const DecodeTaskState = enum(u32) {
 pub const Decoder = struct {
     concurrency: u32,
     allowed_output_formats: u32,
+    // Downscale factor expressed as a power of two: 0 => full resolution, 1 => 1/2, 2 => 1/4, 3 => 1/8. Achieved by
+    // running a smaller inverse DCT over only the low-frequency coefficients of each block (no separate resampling).
+    log2_scale: u5,
 
     // Two packet slots so the JS side can copy the next packet in while the current one is still being decoded
     packet_slots: [2][]u8,
@@ -59,9 +62,17 @@ pub const Decoder = struct {
     chroma_scaling_matrix: [64]f32,
     dc_offset: f32,
 
+    // Dequantization matrices for downscaled decoding. Unlike the scaling matrices above (which bake in the 8-point
+    // AAN factors), these are plain dequantization weights folded with the DCT-II normalization factors, suitable for
+    // the direct low-frequency inverse DCT used at scale > 1.
+    lowres_luma_dequant: [64]f32,
+    lowres_chroma_dequant: [64]f32,
+
     tasks: []DecodeTask,
     running_task_count: std.atomic.Value(u32),
     task_state: std.atomic.Value(DecodeTaskState),
+    picture_count: u32,
+    main_should_help: bool,
     worker_error: std.atomic.Value(?*worker.WorkerError),
 
     error_message: ?[]const u8,
@@ -118,15 +129,17 @@ pub const DecodeTask = struct {
     error_message: ?[]const u8,
 };
 
-export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats: u32) ?*Decoder {
+export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats: u32, log2_scale: u32) ?*Decoder {
     std.debug.assert(bit_depth == 10 or bit_depth == 12);
     std.debug.assert(allowed_output_formats != 0); // Ensured by the caller
+    std.debug.assert(log2_scale <= 3); // Ensured by the caller
 
     const result = gpa.create(Decoder) catch return null;
 
     result.* = .{
         .concurrency = concurrency,
         .allowed_output_formats = allowed_output_formats,
+        .log2_scale = @intCast(log2_scale),
 
         .packet_slots = .{ &.{}, &.{} },
         .packet = &.{},
@@ -141,9 +154,14 @@ export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats
         .chroma_scaling_matrix = undefined,
         .dc_offset = undefined,
 
+        .lowres_luma_dequant = undefined,
+        .lowres_chroma_dequant = undefined,
+
         .tasks = &.{},
         .running_task_count = .init(0),
         .task_state = .init(.done),
+        .picture_count = 1,
+        .main_should_help = false,
         .worker_error = .init(null),
 
         .error_message = null,
@@ -190,10 +208,40 @@ export fn getTaskStateAddress(decoder: *Decoder) *u32 {
     return @ptrCast(&decoder.task_state.raw);
 }
 
+// Work (parsed bytes + output bytes) below which an extra worker isn't worth its dispatch and contention cost. Tuned
+// so a downscaled 1080p frame uses ~half the workers (its efficient point) while large frames still use all of them.
+const downscaled_bytes_per_worker: usize = 200 * 1024;
+
 export fn decodePacket(decoder: *Decoder, frame: *Frame, slot: u32) i32 {
     decoder.packet = decoder.packet_slots[slot];
     decodePacketInternal(decoder, frame) catch |err| return misc.toErrorCode(err);
     return 0;
+}
+
+// Preallocated so storing an error can't fail (mirrors the worker's threadlocal).
+threadlocal var main_thread_error: worker.WorkerError = undefined;
+
+// After decodePacket dispatches slices to the workers, the main thread would otherwise just idle on the completion
+// wait. Instead it joins in, pulling slices from the same shared counter — giving concurrency+1 effective decoders and
+// shrinking the wait to whatever stragglers remain. The caller only invokes this when no other packet is queued, so it
+// never steals the main thread from pipelined work. Errors go through the same channel as the workers'.
+export fn decodeOnMainThread(decoder: *Decoder, frame: *Frame) void {
+    if (!decoder.main_should_help) {
+        return;
+    }
+    for (0..decoder.picture_count) |p| {
+        var task = DecodeTask{
+            .decoder = decoder,
+            .frame = frame,
+            .picture = &decoder.pictures[p],
+            .error_message = null,
+        };
+        executeDecodeTask(&task) catch |err| {
+            main_thread_error = .{ .code = misc.toErrorCode(err), .message = task.error_message };
+            _ = decoder.worker_error.cmpxchgStrong(null, &main_thread_error, .seq_cst, .seq_cst);
+            return;
+        };
+    }
 }
 
 threadlocal var error_print_buffer: [1024]u8 = undefined;
@@ -320,7 +368,10 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     frame.bit_depth = decoder.bit_depth;
     frame.alpha_bit_depth = alpha_bit_depth;
 
-    if (!decoder.pixelFormatIsAvailable(actual_pixel_format)) blk: {
+    // Downscaled decoding always emits the native pixel format (chroma subsampling, bit depth and alpha are kept as
+    // in the source); it does not combine with the pixel-format conversion below. Conversions would require a second
+    // spatial resampling pass on top of the DCT-domain downscale, which isn't supported.
+    if (decoder.log2_scale == 0 and !decoder.pixelFormatIsAvailable(actual_pixel_format)) blk: {
         const alpha_states = [_]bool{ false, true };
         const chroma_subsamplings = [_]u32{ 0, 1, 2 };
         const bit_depths = [_]u32{ 8, 10, 12 };
@@ -409,21 +460,51 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         }
     }
 
+    // Dequantization matrices for the direct low-frequency inverse DCT used when downscaling. The direct transform
+    // wants plain dequantization weights folded with the DCT-II normalization (a global 1/16 factor matching the
+    // full-resolution scaling, plus the per-axis 1/sqrt(2) factor on the DC row/column).
+    if (decoder.log2_scale != 0) {
+        const lowres_base = output_value_scaling / 16;
+        const inv_sqrt2 = comptime 1.0 / @sqrt(2.0);
+        inline for (0..8) |x| {
+            inline for (0..8) |y| {
+                const i = 8 * y + x;
+                const c_col: f32 = if (x == 0) inv_sqrt2 else 1; // x is the horizontal frequency
+                const c_row: f32 = if (y == 0) inv_sqrt2 else 1; // y is the vertical frequency
+                decoder.lowres_luma_dequant[i] =
+                    @as(f32, @floatFromInt(q_mat_luma[8 * x + y])) * lowres_base * c_col * c_row;
+                decoder.lowres_chroma_dequant[i] =
+                    @as(f32, @floatFromInt(q_mat_chroma[8 * x + y])) * lowres_base * c_col * c_row;
+            }
+        }
+    }
+
     const is_interlaced = frame_type != 0;
+    if (is_interlaced and decoder.log2_scale != 0) {
+        @branchHint(.unlikely);
+        decoder.error_message = "Downscaled decoding (scale > 1) is not supported for interlaced content.";
+        return error.NotSupported;
+    }
     const picture_count: u32 = if (is_interlaced) 2 else 1;
+    decoder.picture_count = picture_count;
     const row_stride_shift: u5 = if (is_interlaced) 1 else 0;
 
-    frame.visible_width = frame_width;
-    frame.visible_height = frame_height;
-
-    frame.coded_width = (frame_width + 15) & ~@as(u32, 15);
+    frame.source_coded_width = (frame_width + 15) & ~@as(u32, 15);
     if (is_interlaced) {
         const field_visible_height = (frame_height + 1) >> 1;
         const field_coded_height = (field_visible_height + 15) & ~@as(u32, 15);
-        frame.coded_height = field_coded_height << 1;
+        frame.source_coded_height = field_coded_height << 1;
     } else {
-        frame.coded_height = (frame_height + 15) & ~@as(u32, 15);
+        frame.source_coded_height = (frame_height + 15) & ~@as(u32, 15);
     }
+
+    // The emitted frame is the source divided by the scale factor. Coded dimensions divide cleanly (the source is a
+    // multiple of 16 and the scale factor is at most 8); visible dimensions round up so visible content is never lost.
+    const scale = @as(u32, 1) << decoder.log2_scale;
+    frame.coded_width = frame.source_coded_width >> decoder.log2_scale;
+    frame.coded_height = frame.source_coded_height >> decoder.log2_scale;
+    frame.visible_width = (frame_width + scale - 1) >> decoder.log2_scale;
+    frame.visible_height = (frame_height + scale - 1) >> decoder.log2_scale;
 
     const luma_data_size = frame.coded_width * frame.coded_height;
     var frame_data_size = luma_data_size;
@@ -450,7 +531,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
 
     reader.pos = 8 + header_size;
 
-    const field_coded_height = frame.coded_height >> row_stride_shift;
+    const field_coded_height = frame.source_coded_height >> row_stride_shift;
     const first_field_offset: u32 = if (frame_type == 2) 1 else 0;
 
     for (0..picture_count) |i| {
@@ -494,8 +575,22 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     misc.lockMutex(&worker.worker_task_queue_mutex);
     defer worker.worker_task_queue_mutex.unlock(io);
 
-    const task_count_per_picture = decoder.concurrency;
+    // Downscaled frames do far less work per slice, so waking every worker on a small one loses more to dispatch and
+    // slice-counter contention than it gains. Cap the workers to the frame's total work (parsed bytes plus bytes
+    // written), so large frames like 8K still saturate all workers while a 1080p downscale uses about half. This is
+    // skipped for alpha-bearing frames: the alpha plane is run-length coded and decoded in full at every scale, so it
+    // keeps enough work to use every worker. Full-resolution decoding is left untouched.
+    const cap_workers = decoder.log2_scale != 0 and decoder.alpha_bit_depth == 0;
+    const task_count_per_picture = if (!cap_workers) decoder.concurrency else blk: {
+        const work = decoder.pictures[0].total_slice_size + @as(usize, frame_data_size);
+        const wanted: u32 = @intCast(@max(1, work / downscaled_bytes_per_worker));
+        break :blk @min(decoder.concurrency, wanted);
+    };
     const total_task_count = picture_count * task_count_per_picture;
+
+    // The main thread pitches in via decodeOnMainThread, but only when the cap left a core spare for it — otherwise it
+    // would over-subscribe the CPU and slow the very frames (full-resolution, alpha) it's trying to help.
+    decoder.main_should_help = total_task_count < decoder.concurrency;
     decoder.tasks = try gpa.realloc(decoder.tasks, total_task_count);
 
     var task_index: usize = 0;
@@ -583,7 +678,7 @@ fn parsePicture(
     picture.max_slice_width = 0;
 
     var current_x: u16 = 0;
-    const coded_width_in_macroblocks = frame.coded_width >> 4;
+    const coded_width_in_macroblocks = frame.source_coded_width >> 4;
     while (current_x < coded_width_in_macroblocks) {
         var width: u8 = @intCast(picture.slice_width);
         while (current_x + width > coded_width_in_macroblocks) {
@@ -681,6 +776,14 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     else
         &progressive_scan_order;
 
+    // When downscaling, stop the AC entropy decode after the last coefficient kept by the reduced inverse DCT.
+    const ac_scan_cutoff: u32 = switch (decoder.log2_scale) {
+        1 => comptime lowresAcCutoff(4),
+        2 => comptime lowresAcCutoff(2),
+        3 => comptime lowresAcCutoff(1),
+        else => 63,
+    };
+
     var reader = misc.ByteReader.init(decoder.packet);
 
     const max_num_luma_blocks = picture.max_slice_width << 2;
@@ -689,8 +792,10 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     const max_luma_slice_len = max_num_luma_blocks << 6;
     const max_chroma_slice_len = max_num_chroma_blocks << 6;
 
-    const luma_scaling_matrix = decoder.luma_scaling_matrix;
-    const chroma_scaling_matrix = decoder.chroma_scaling_matrix;
+    // When downscaling, the per-slice scale factor is folded into the low-frequency dequantization matrices instead of
+    // the AAN scaling matrices; the downstream transform path picks the right one based on decoder.log2_scale.
+    const luma_scaling_matrix = if (decoder.log2_scale != 0) decoder.lowres_luma_dequant else decoder.luma_scaling_matrix;
+    const chroma_scaling_matrix = if (decoder.log2_scale != 0) decoder.lowres_chroma_dequant else decoder.chroma_scaling_matrix;
 
     const frame_data = frame.frame_data;
     const bytes_per_sample = (frame.bit_depth + 7) >> 3;
@@ -773,7 +878,11 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             const luma_slice_len = num_luma_blocks << 6;
             const chroma_slice_len = num_chroma_blocks << 6;
 
-            @memset(slice_data[0 .. luma_slice_len + (chroma_slice_len << 1)], 0);
+            // At 1/8 only each block's DC coefficient is read (and DcState always writes it), so the zero-fill of the
+            // sparse AC coefficients is unnecessary. At other scales the kept low-frequency AC must start zeroed.
+            if (decoder.log2_scale != 3) {
+                @memset(slice_data[0 .. luma_slice_len + (chroma_slice_len << 1)], 0);
+            }
 
             const luma_data = slice_data[0..luma_slice_len];
             const u_data = slice_data[luma_slice_len..][0..chroma_slice_len];
@@ -789,7 +898,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             const chroma_vec = @as(@Vector(64, f32), chroma_scaling_matrix) * scale;
 
             // Luma
-            try parseDcAndAcSingle(header.luma_data, luma_data, num_luma_blocks, task, scan_table);
+            try parseDcAndAcSingle(header.luma_data, luma_data, num_luma_blocks, task, scan_table, ac_scan_cutoff);
             transformAndStoreSliceData(
                 task,
                 luma_data,
@@ -805,7 +914,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             );
 
             // U
-            try parseDcAndAcSingle(header.u_data, u_data, num_chroma_blocks, task, scan_table);
+            try parseDcAndAcSingle(header.u_data, u_data, num_chroma_blocks, task, scan_table, ac_scan_cutoff);
             transformAndStoreSliceData(
                 task,
                 u_data,
@@ -821,7 +930,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             );
 
             // V
-            try parseDcAndAcSingle(header.v_data, v_data, num_chroma_blocks, task, scan_table);
+            try parseDcAndAcSingle(header.v_data, v_data, num_chroma_blocks, task, scan_table, ac_scan_cutoff);
             transformAndStoreSliceData(
                 task,
                 v_data,
@@ -851,6 +960,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                                     frame.coded_width << row_stride_shift,
                                     source_bit_depth,
                                     target_bit_depth,
+                                    decoder.log2_scale,
                                 );
                             },
                             else => unreachable,
@@ -868,8 +978,11 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
         reader.pos = picture.slice_offsets[base + 1];
         const header_2 = try parseSliceHeader(task, &reader, base + 1);
 
-        // AC parameters are sparse, so we must memset them all to zero
-        @memset(slice_data, 0);
+        // AC parameters are sparse, so we must memset them all to zero — except at 1/8, where only the always-written
+        // DC of each block is read.
+        if (decoder.log2_scale != 3) {
+            @memset(slice_data, 0);
+        }
 
         const pos_1 = SlicePos{
             .x = header_1.pos_x_mb << 4,
@@ -911,6 +1024,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             num_luma_blocks_2,
             task,
             scan_table,
+            ac_scan_cutoff,
         );
         transformAndStoreSliceData(
             task,
@@ -949,6 +1063,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             num_chroma_blocks_2,
             task,
             scan_table,
+            ac_scan_cutoff,
         );
         transformAndStoreSliceData(
             task,
@@ -987,6 +1102,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             num_chroma_blocks_2,
             task,
             scan_table,
+            ac_scan_cutoff,
         );
         transformAndStoreSliceData(
             task,
@@ -1034,6 +1150,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                                 frame.coded_width << row_stride_shift,
                                 source_bit_depth,
                                 target_bit_depth,
+                                decoder.log2_scale,
                             );
                             // Alpha for slice 2
                             parseAndStoreAlpha(
@@ -1046,6 +1163,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                                 frame.coded_width << row_stride_shift,
                                 source_bit_depth,
                                 target_bit_depth,
+                                decoder.log2_scale,
                             );
                         },
                         else => unreachable,
@@ -1165,6 +1283,19 @@ fn transpose_scan_values(s: [64]u8) [64]u8 {
 }
 
 const dc_params = [_]u8{ 0x04, 0x28, 0x28, 0x4D, 0x4D, 0x70, 0x70 };
+
+// The last progressive scan-order index whose coefficient falls inside the top-left `kept`×`kept` block. Downscaled
+// decoding stops the AC entropy decode once it passes this, since every later coefficient is purely high-frequency
+// and would be discarded by the reduced inverse DCT. (Downscaled decoding is progressive-only.)
+fn lowresAcCutoff(comptime kept: u32) u32 {
+    var cutoff: u32 = 0;
+    for (progressive_scan_order, 0..) |natural, j| {
+        if (natural / 8 < kept and natural % 8 < kept) {
+            cutoff = @intCast(j);
+        }
+    }
+    return cutoff;
+}
 const run_params = [_]u8{ 0x06, 0x06, 0x05, 0x05, 0x04, 0x29, 0x29, 0x29, 0x29, 0x28, 0x28, 0x28, 0x28, 0x28, 0x28, 0x4C };
 const level_params = [_]u8{ 0x04, 0x0A, 0x05, 0x06, 0x04, 0x28, 0x28, 0x28, 0x28, 0x4C };
 
@@ -1254,15 +1385,16 @@ fn parseDcAndAcPair(
     num_blocks_2: u32,
     task: *DecodeTask,
     scan_table: *const [64]u8,
+    max_scan_index: u32,
 ) !void {
     // Special logic in case the data is empty (which is handled gracefully)
     if (data_1.len == 0 or data_2.len == 0) {
         @branchHint(.unlikely);
 
         if (data_1.len != 0) {
-            return parseDcAndAcSingle(data_1, slice_1_data, num_blocks_1, task, scan_table);
+            return parseDcAndAcSingle(data_1, slice_1_data, num_blocks_1, task, scan_table, max_scan_index);
         } else {
-            return parseDcAndAcSingle(data_2, slice_2_data, num_blocks_2, task, scan_table);
+            return parseDcAndAcSingle(data_2, slice_2_data, num_blocks_2, task, scan_table, max_scan_index);
         }
     }
 
@@ -1297,6 +1429,7 @@ fn parseDcAndAcPair(
         .num_coefficients = @as(u32, 64) << log2_block_count_1,
         .block_mask = block_mask_1,
         .scan_order = scan_table,
+        .max_scan_index = max_scan_index,
     };
     var ac_state_2 = AcState{
         .bit_reader = dc_state_2.bit_reader,
@@ -1306,6 +1439,7 @@ fn parseDcAndAcPair(
         .num_coefficients = @as(u32, 64) << log2_block_count_2,
         .block_mask = block_mask_2,
         .scan_order = scan_table,
+        .max_scan_index = max_scan_index,
     };
 
     var active_1 = true;
@@ -1321,7 +1455,7 @@ fn parseDcAndAcPair(
     task.error_message = null;
 }
 
-fn parseDcAndAcSingle(data: []u8, slice_data: []f32, num_blocks: u32, task: *DecodeTask, scan_table: *const [64]u8) !void {
+fn parseDcAndAcSingle(data: []u8, slice_data: []f32, num_blocks: u32, task: *DecodeTask, scan_table: *const [64]u8, max_scan_index: u32) !void {
     // An empty scan carries no coefficients; the slice data is already zeroed, so there's nothing to do.
     if (data.len == 0) {
         @branchHint(.unlikely);
@@ -1352,6 +1486,7 @@ fn parseDcAndAcSingle(data: []u8, slice_data: []f32, num_blocks: u32, task: *Dec
         .num_coefficients = @as(u32, 64) << log2_block_count,
         .block_mask = block_mask,
         .scan_order = scan_table,
+        .max_scan_index = max_scan_index,
     };
 
     while (try ac_state.step()) {}
@@ -1443,6 +1578,10 @@ const AcState = struct {
     num_coefficients: u32,
     block_mask: u32,
     scan_order: *const [64]u8,
+    // The highest scan-order index worth decoding. For full-resolution decoding this is 63 (decode everything); for
+    // downscaled decoding it's the last scan position that lands inside the kept K×K low-frequency block, so the
+    // expensive AC entropy decode stops as soon as the remaining coefficients can only be high-frequency.
+    max_scan_index: u32 = 63,
     run: u32 = 4,
     level: i32 = 2,
 
@@ -1464,13 +1603,19 @@ const AcState = struct {
             return error.InvalidData;
         }
 
+        const j = self.pos >> self.log2_block_count;
+        if (j > self.max_scan_index) {
+            // Downscaled decoding: every remaining coefficient is outside the kept low-frequency band, so stop here.
+            @branchHint(.unlikely);
+            return false;
+        }
+
         const level_result = try parseCode(
             self.bit_reader.current << @as(u6, @intCast(run_result.bits)),
             level_luts[@min(@as(u32, @intCast(self.level)), 9)],
         );
         self.level = @as(i32, @intCast(level_result.value)) + 1;
 
-        const j = self.pos >> self.log2_block_count;
         const total_bits = run_result.bits + level_result.bits + 1;
         const sign = -@as(i32, @intCast((self.bit_reader.current >> @as(u6, @intCast(64 - total_bits))) & 1));
         self.bit_reader.consume(@intCast(total_bits));
@@ -1490,6 +1635,7 @@ fn parseAndStoreAlpha(
     coded_width: usize,
     comptime source_bit_depth: u64,
     comptime target_bit_depth: u64,
+    log2_scale: u5,
 ) void {
     var alpha_state = AlphaState(source_bit_depth, target_bit_depth).init(
         data,
@@ -1499,6 +1645,7 @@ fn parseAndStoreAlpha(
         slice_width,
         num_values,
         coded_width,
+        log2_scale,
     );
     while (alpha_state.step()) {}
 }
@@ -1513,6 +1660,7 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
         bit_reader: misc.BitReader,
         frame_data: []ElementType,
         x: usize,
+        y: usize,
         y_offset: usize,
         slice_width: usize,
         num_values: usize,
@@ -1521,12 +1669,18 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
         alpha_val: i64,
         x_mask: usize,
         log2_slice_width: u5,
+        // Downscale factor (power of two). The alpha plane is not DCT-coded, so it's downscaled by decimation: the
+        // run-length stream is still parsed at full resolution (to stay in sync), but only samples landing on the
+        // downscaled grid are written. Coordinates passed in (x, y, slice_width, num_values) are full-resolution;
+        // coded_width is the downscaled output stride.
+        log2_scale: u5,
 
-        inline fn init(data: []u8, frame_data: []align(2) u8, x: usize, y: usize, slice_width: usize, num_values: usize, coded_width: usize) @This() {
+        inline fn init(data: []u8, frame_data: []align(2) u8, x: usize, y: usize, slice_width: usize, num_values: usize, coded_width: usize, log2_scale: u5) @This() {
             return .{
                 .bit_reader = misc.BitReader.fromData(data),
                 .frame_data = std.mem.bytesAsSlice(ElementType, frame_data),
                 .x = x,
+                .y = y,
                 .y_offset = y * coded_width,
                 .slice_width = slice_width,
                 .num_values = num_values,
@@ -1535,6 +1689,7 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
                 .alpha_val = mask,
                 .x_mask = slice_width - 1,
                 .log2_slice_width = std.math.log2_int(usize, slice_width),
+                .log2_scale = log2_scale,
             };
         }
 
@@ -1584,14 +1739,20 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
 
                 const capped_run = @min(@as(u32, @intCast(run)), self.num_values - self.pos - 1);
 
-                var pos: usize = self.pos + 1; // +1 because of the previous write
-                const run_end: usize = pos + capped_run;
-                while (pos < run_end) {
-                    const col = pos & self.x_mask;
-                    const count = @min(self.slice_width - col, run_end - pos);
-                    const start = self.y_offset + self.coded_width * (pos >> self.log2_slice_width) + self.x + col;
-                    @memset(self.frame_data[start..][0..count], @intCast(final_value));
-                    pos += count;
+                // +1 because of the previous write. Full resolution fills the whole run with memset; downscaled writes
+                // only the samples that land on the decimation grid.
+                if (self.log2_scale == 0) {
+                    var pos: usize = self.pos + 1;
+                    const run_end: usize = pos + capped_run;
+                    while (pos < run_end) {
+                        const col = pos & self.x_mask;
+                        const count = @min(self.slice_width - col, run_end - pos);
+                        const start = self.y_offset + self.coded_width * (pos >> self.log2_slice_width) + self.x + col;
+                        @memset(self.frame_data[start..][0..count], @intCast(final_value));
+                        pos += count;
+                    }
+                } else {
+                    self.fillRunDownscale(final_value, self.pos + 1, capped_run);
                 }
 
                 self.pos += 1 + capped_run;
@@ -1607,10 +1768,50 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
 
         inline fn writeValue(self: *@This(), value: u16, pos: u32) void {
             // Decoded alpha values are written directly into the frame data buffer
-            self.frame_data[
-                self.y_offset + self.coded_width * (pos >> self.log2_slice_width) +
-                    self.x + (pos & self.x_mask)
-            ] = @intCast(value);
+            if (self.log2_scale == 0) {
+                self.frame_data[
+                    self.y_offset + self.coded_width * (pos >> self.log2_slice_width) +
+                        self.x + (pos & self.x_mask)
+                ] = @intCast(value);
+            } else {
+                // Downscaled: only write samples that fall on the decimation grid
+                const scale_mask = (@as(usize, 1) << self.log2_scale) - 1;
+                const full_row = self.y + (pos >> self.log2_slice_width);
+                const full_col = self.x + (pos & self.x_mask);
+                if ((full_row & scale_mask) == 0 and (full_col & scale_mask) == 0) {
+                    self.frame_data[
+                        (full_row >> self.log2_scale) * self.coded_width + (full_col >> self.log2_scale)
+                    ] = @intCast(value);
+                }
+            }
+        }
+
+        // Fill a run of identical alpha values into the downscaled grid for positions [start, start+count). Long alpha
+        // runs are common, and at scale>1 only one sample per scale×scale block is kept — so rather than test every
+        // sample's grid position (as writeValue does), we skip off-grid rows wholesale and step by the scale factor
+        // within on-grid rows. Bit-identical to calling writeValue per position, just without the per-sample test.
+        inline fn fillRunDownscale(self: *@This(), value: u16, start: u32, count: u32) void {
+            const v: ElementType = @intCast(value);
+            const scale = @as(usize, 1) << self.log2_scale;
+            const scale_mask = scale - 1;
+            const slice_width = self.x_mask + 1;
+            var p: usize = start;
+            const end: usize = @as(usize, start) + count;
+            while (p < end) {
+                const row_start = p & ~@as(usize, self.x_mask); // position at column 0 of p's row
+                const row_end = @min(end, row_start + slice_width); // run portion within this row
+                const full_row = self.y + (p >> self.log2_slice_width);
+                if ((full_row & scale_mask) == 0) {
+                    const out_row = (full_row >> self.log2_scale) * self.coded_width;
+                    const first_full_col = self.x + (p - row_start);
+                    const last_full_col = self.x + (row_end - 1 - row_start);
+                    var fcol = (first_full_col + scale_mask) & ~scale_mask; // first grid column at/after the run start
+                    while (fcol <= last_full_col) : (fcol += scale) {
+                        self.frame_data[out_row + (fcol >> self.log2_scale)] = v;
+                    }
+                }
+                p = row_end;
+            }
         }
     };
 }
@@ -1651,6 +1852,24 @@ inline fn transformAndStoreSliceData(
     bytes_per_sample: u32,
     row_stride_shift: u5,
 ) void {
+    // Downscaled decoding takes a separate path: a direct low-frequency inverse DCT producing a smaller output block.
+    // It always emits the native subsampling, so the target subsampling equals the source one here.
+    if (task.decoder.log2_scale != 0) {
+        @branchHint(.unlikely);
+        std.debug.assert(source_log2_blocks_per_macroblock == target_log2_block_per_macroblock);
+        transformAndStoreSliceDataLowres(
+            task,
+            slice_data,
+            frame_data,
+            scaling_matrix_vec,
+            slice_pos,
+            num_blocks,
+            source_log2_blocks_per_macroblock,
+            bytes_per_sample,
+        );
+        return;
+    }
+
     // Based on the incoming parameters, dispatch to the correct baked function
     switch (bytes_per_sample) {
         inline 1, 2 => |bytes_per_sample_captured| {
@@ -1679,6 +1898,240 @@ inline fn transformAndStoreSliceData(
             }
         },
         else => unreachable,
+    }
+}
+
+// Inverse DCT-II basis sampled for the reduced (downscaled) block sizes. Entry [p][u] is cos((2p+1)·u·π / (2K)),
+// i.e. the contribution of frequency u to output sample p of a K-point inverse transform.
+const cos_table_4 = [4][4]f32{
+    .{ 1, 0.92387953251128674, 0.70710678118654752, 0.38268343236508977 },
+    .{ 1, 0.38268343236508977, -0.70710678118654752, -0.92387953251128674 },
+    .{ 1, -0.38268343236508977, -0.70710678118654752, 0.92387953251128674 },
+    .{ 1, -0.92387953251128674, 0.70710678118654752, -0.38268343236508977 },
+};
+const cos_table_2 = [2][2]f32{
+    .{ 1, 0.70710678118654752 },
+    .{ 1, -0.70710678118654752 },
+};
+const cos_table_1 = [1][1]f32{.{1}};
+
+// Downscaled decode path: instead of a full 8x8 inverse DCT, run a K-point inverse DCT (K = 8 >> log2_scale, so 4, 2
+// or 1) over just the top-left K×K low-frequency coefficients of each block. This yields a K×K spatial block that is
+// the block downsampled by the scale factor, with no separate resampling step. The native subsampling is preserved,
+// so each macroblock maps to a (16 >> log2_scale)-pixel luma square (and the matching chroma layout).
+fn transformAndStoreSliceDataLowres(
+    task: *DecodeTask,
+    slice_data: []const f32,
+    frame_data: []align(2) u8,
+    dequant_vec: @Vector(64, f32),
+    slice_pos: SlicePos,
+    num_blocks: u32,
+    source_log2_blocks_per_macroblock: u32,
+    bytes_per_sample: u32,
+) void {
+    switch (bytes_per_sample) {
+        inline 1, 2 => |bytes_per_sample_captured| {
+            switch (task.decoder.log2_scale) {
+                inline 1, 2, 3 => |log2_scale_captured| {
+                    switch (source_log2_blocks_per_macroblock) {
+                        inline 1, 2 => |source_log2_captured| {
+                            transformAndStoreSliceDataLowresBaked(
+                                task,
+                                slice_data,
+                                frame_data,
+                                dequant_vec,
+                                slice_pos,
+                                num_blocks,
+                                source_log2_captured,
+                                bytes_per_sample_captured,
+                                log2_scale_captured,
+                            );
+                        },
+                        else => unreachable,
+                    }
+                },
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
+noinline fn transformAndStoreSliceDataLowresBaked(
+    task: *DecodeTask,
+    slice_data: []const f32,
+    frame_data: []align(2) u8,
+    dequant_vec: @Vector(64, f32),
+    slice_pos: SlicePos,
+    num_blocks: u32,
+    comptime source_log2_blocks_per_macroblock: u32,
+    comptime bytes_per_sample: u32,
+    comptime log2_scale: u5,
+) void {
+    const K: u32 = 8 >> log2_scale; // 4, 2 or 1
+    const ElementType = if (bytes_per_sample == 1) u8 else u16;
+    const cast_frame_data = std.mem.bytesAsSlice(ElementType, frame_data);
+    const dequant: [64]f32 = dequant_vec;
+    const dc_bias = task.decoder.dc_offset;
+    const max_value_f: f32 = @floatFromInt((@as(u32, 1) << @as(u5, @intCast(task.frame.bit_depth))) - 1);
+    const cos_tab = comptime if (K == 4) cos_table_4 else if (K == 2) cos_table_2 else cos_table_1;
+
+    if (source_log2_blocks_per_macroblock == 2) {
+        // 4 blocks per macroblock. Luma order is TL, TR, BL, BR; 4:4:4 chroma order is TL, BL, TR, BR. We detect
+        // chroma by the plane width (chroma planes are emitted with the chroma stride).
+        const out_stride = task.frame.coded_width; // luma and 4:4:4 chroma share the full coded width
+        const is_chroma = frame_data.ptr != task.frame.frame_data.ptr; // luma plane starts at offset 0
+        var j: u32 = 0;
+        while (j < num_blocks) : (j += 4) {
+            const ox = (slice_pos.x + ((j >> 2) << 4)) >> log2_scale;
+            const oy = slice_pos.y >> log2_scale;
+            // Pass the blocks in canonical TL, TR, BL, BR order so the kernel can coalesce each output row across the
+            // two horizontally-adjacent blocks. Luma is stored TL, TR, BL, BR; 4:4:4 chroma is TL, BL, TR, BR.
+            const blocks: [4]*const [64]f32 = if (is_chroma) .{
+                slice_data[(j << 6)..][0..64],       slice_data[((j + 2) << 6)..][0..64],
+                slice_data[((j + 1) << 6)..][0..64], slice_data[((j + 3) << 6)..][0..64],
+            } else .{
+                slice_data[(j << 6)..][0..64],       slice_data[((j + 1) << 6)..][0..64],
+                slice_data[((j + 2) << 6)..][0..64], slice_data[((j + 3) << 6)..][0..64],
+            };
+            idctMacroblockLowres(4, ElementType, cast_frame_data, out_stride, blocks, ox, oy, &dequant, dc_bias, max_value_f, K, cos_tab);
+        }
+    } else {
+        // 4:2:2 chroma: 2 blocks per macroblock stacked vertically (top, bottom). Chroma is half the luma width.
+        const out_stride = task.frame.coded_width >> 1;
+        var j: u32 = 0;
+        while (j < num_blocks) : (j += 2) {
+            const ox = ((slice_pos.x >> 1) + ((j >> 1) << 3)) >> log2_scale;
+            const oy = slice_pos.y >> log2_scale;
+            const blocks = [2]*const [64]f32{ slice_data[(j << 6)..][0..64], slice_data[((j + 1) << 6)..][0..64] };
+            idctMacroblockLowres(2, ElementType, cast_frame_data, out_stride, blocks, ox, oy, &dequant, dc_bias, max_value_f, K, cos_tab);
+        }
+    }
+}
+
+// Clamp f32 samples to [0, max] and narrow to the integer element type, matching the full-res IDCT: f32→u32 saturates
+// negatives to 0 (WASM has no neat f32→u16), then we cap at the max value and narrow. A direct f32→u16 @intFromFloat
+// scalarizes on wasm. Done at the widest possible W so the narrow instructions run at full SIMD width.
+inline fn clampNarrow(comptime W: usize, comptime ElementType: type, v: @Vector(W, f32), max_value_f: f32) @Vector(W, ElementType) {
+    @setRuntimeSafety(false);
+    const max_u32: @Vector(W, u32) = @splat(@intFromFloat(max_value_f));
+    const as_u32: @Vector(W, u32) = @intFromFloat(v); // truncating f32->u32 (saturates negatives to 0), matching idct_8x8
+    return @intCast(@min(max_u32, as_u32));
+}
+
+inline fn idctMacroblockLowres(
+    comptime N: usize,
+    comptime ElementType: type,
+    frame_data: []ElementType,
+    out_stride: usize,
+    blocks: [N]*const [64]f32,
+    ox: usize,
+    oy: usize,
+    dequant: *const [64]f32,
+    dc_bias: f32,
+    max_value_f: f32,
+    comptime K: usize,
+    comptime cos_tab: anytype,
+) void {
+    @setEvalBranchQuota(1000000);
+    // Separable inverse transform over each block's top-left K×K coefficients, computed as out = M·C·Mᵀ where C is the
+    // dequantized coefficient block and M is the K-point IDCT basis (M[p][f] = cos_tab[p][f]). The coefficient at
+    // slice_data index 8*a+b has `a` (the high index) as the horizontal frequency and `b` (the low index) as the
+    // vertical frequency — matching the full-resolution path, which reads the quantization matrix transposed.
+    //
+    // We process all N blocks of a macroblock together, in stages: load every block first, then transform, then store
+    // every block last. Keeping all loads (from slice_data) ahead of all stores (to frame_data) prevents the compiler
+    // from serializing the blocks on a false store→load aliasing hazard, so the N independent transforms pipeline —
+    // which is what makes the reduced IDCT win over the full 8×8 path. Each pass multiplies a *compile-time* cosine
+    // scalar by a whole K-wide vector (folds to constants) and a single explicit transpose avoids cross-lane shuffles.
+
+    // Block (col, row) within the macroblock: N==4 is a 2×2 grid (TL, TR, BL, BR), N==2 a vertical pair.
+    const blockCol = struct {
+        inline fn f(comptime i: usize) usize {
+            return if (N == 4) (i & 1) * K else 0;
+        }
+    }.f;
+    const blockRow = struct {
+        inline fn f(comptime i: usize) usize {
+            return if (N == 4) (i >> 1) * K else i * K;
+        }
+    }.f;
+
+    if (K == 1) {
+        // 1/8 scale: only the DC coefficient survives, so each block collapses to its (biased) mean. Truncate (don't
+        // round) to match idct_8x8 and clampNarrow.
+        inline for (0..N) |i| {
+            const value = dc_bias + dequant[0] * blocks[i][0];
+            frame_data[(oy + blockRow(i)) * out_stride + ox + blockCol(i)] = @intFromFloat(@min(max_value_f, @max(0, value)));
+        }
+        return;
+    }
+
+    const Vec = @Vector(K, f32);
+    const bias: Vec = @splat(dc_bias);
+
+    // Transform each block to f32 output rows. Only rows[] persists across blocks; the per-block coefficient/transpose
+    // temporaries (c, p, pt) stay transient, which keeps register pressure low while the independent block transforms
+    // still pipeline. All stores are deferred to stage 5 (after the loop), so no store→load aliasing hazard serializes
+    // the blocks. The clamp+narrow to the element type is also deferred so it can run at full store width.
+    var rows: [N][K]Vec = undefined;
+    inline for (0..N) |i| {
+        // Load + dequantize this block's coefficient rows (c[a] = {C[a][0..K-1]}, lane = vertical frequency b).
+        var c: [K]Vec = undefined;
+        inline for (0..K) |a| {
+            const dequant_row: Vec = dequant[8 * a ..][0..K].*;
+            const coeff_row: Vec = blocks[i][8 * a ..][0..K].*;
+            c[a] = dequant_row * coeff_row;
+        }
+        // Pass 1: transform horizontal frequency a into output column xp. p[xp] = Σ_a cos_tab[xp][a]·c[a].
+        var p: [K]Vec = undefined;
+        inline for (0..K) |xp| {
+            var acc: Vec = @splat(0);
+            inline for (0..K) |a| acc += @as(Vec, @splat(cos_tab[xp][a])) * c[a];
+            p[xp] = acc;
+        }
+        // Transpose so pass 2 can again multiply whole vectors by compile-time scalars.
+        const pt: [K]Vec = if (K == 4)
+            transpose_4x4(p[0], p[1], p[2], p[3])
+        else
+            .{ .{ p[0][0], p[1][0] }, .{ p[0][1], p[1][1] } }; // K == 2
+        // Pass 2: vertical frequency b → output row yp.
+        inline for (0..K) |yp| {
+            var acc: Vec = bias;
+            inline for (0..K) |b| acc += @as(Vec, @splat(cos_tab[yp][b])) * pt[b];
+            rows[i][yp] = acc;
+        }
+    }
+
+    // Stage 5 — clamp, narrow to the element type, and store. The f32→u8/u16 narrow is the dominant cost of the reduced
+    // path: at K-wide (4 lanes) the WASM narrowing instructions waste half their width. For the 2×2 (N==4) arrangement
+    // we join each output row across the two horizontally-adjacent blocks and convert+store it 2K-wide, which both
+    // halves the store count and runs the narrow at full SIMD width — this is what makes 1/2 beat full resolution.
+    if (N == 4) {
+        const concat = comptime blk: {
+            var m: [2 * K]i32 = undefined;
+            for (0..K) |k| {
+                m[k] = @intCast(k); // low K lanes from the left (TL/BL) block
+                m[K + k] = -@as(i32, @intCast(k)) - 1; // high K lanes from the right (TR/BR) block
+            }
+            break :blk m;
+        };
+        inline for (0..K) |yp| {
+            const top = @shuffle(f32, rows[0][yp], rows[1][yp], concat); // TL | TR
+            frame_data[(oy + yp) * out_stride + ox ..][0 .. 2 * K].* = clampNarrow(2 * K, ElementType, top, max_value_f);
+            const bot = @shuffle(f32, rows[2][yp], rows[3][yp], concat); // BL | BR
+            frame_data[(oy + K + yp) * out_stride + ox ..][0 .. 2 * K].* = clampNarrow(2 * K, ElementType, bot, max_value_f);
+        }
+    } else {
+        var out: [N][K]@Vector(K, ElementType) = undefined;
+        inline for (0..N) |i| inline for (0..K) |yp| {
+            out[i][yp] = clampNarrow(K, ElementType, rows[i][yp], max_value_f);
+        };
+        inline for (0..N) |i| {
+            inline for (0..K) |yp| {
+                frame_data[(oy + blockRow(i) + yp) * out_stride + ox + blockCol(i) ..][0..K].* = out[i][yp];
+            }
+        }
     }
 }
 
