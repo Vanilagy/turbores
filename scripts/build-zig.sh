@@ -90,6 +90,12 @@ else
         esac
         # Bundle compiler-rt so consumers' toolchains don't need to provide its symbols
         extra_args="-fcompiler-rt"
+
+        case "$target" in
+            # Zig's self-hosted backend (the Debug default) doesn't emit .note.GNU-stack, making
+            # GNU ld warn and assume an executable stack; the LLVM backend emits it correctly
+            *-linux) extra_args="$extra_args -fllvm" ;;
+        esac
     fi
 
     case "$target" in
