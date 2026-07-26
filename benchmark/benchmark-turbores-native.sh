@@ -37,11 +37,13 @@ fi
 video="$(cd "$(dirname "$video")" && pwd)/$(basename "$video")"
 cd "$(dirname "$0")/.."
 
-./scripts/build-zig.sh aarch64-macos --release
+. ./scripts/detect-native-target.sh
+
+./scripts/build-zig.sh "$native_target" --release
 
 cc -std=c11 -O3 -Wall -Wextra \
     -o build/benchmark-turbores-native \
     benchmark/benchmark-turbores-native.c \
-    build/libturbores.dylib
+    "$native_lib"
 
-DYLD_LIBRARY_PATH=build ./build/benchmark-turbores-native "$video" "$threads"
+./build/benchmark-turbores-native "$video" "$threads"

@@ -10,6 +10,9 @@
 // packets over, which we keep in RAM, then we decode the whole file ten times (after one warmup iteration) with a
 // single decoder and frame. Run via benchmark-turbores-native.sh, which builds the library first.
 
+// Ask glibc for the POSIX APIs (popen, clock_gettime), which it hides in strict -std=c11 mode
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
