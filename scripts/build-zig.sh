@@ -2,10 +2,13 @@
 set -e
 
 release=0
+linkage=""
 target="wasm32-freestanding"
 for arg in "$@"; do
     case "$arg" in
         --release) release=1 ;;
+        --dynamic) linkage="dynamic" ;;
+        --static) linkage="static" ;;
         *) target="$arg" ;;
     esac
 done
@@ -34,6 +37,11 @@ if [ "$target" = "wasm32-freestanding" ]; then
         --export=__wasm_init_tls \
         ./src/index.zig
 else
+    if [ -z "$linkage" ]; then
+        echo "Specify --dynamic or --static for native targets" >&2
+        exit 1
+    fi
+
     mode="Debug"
     [ "$release" = 1 ] && mode="ReleaseFast" # Use fast instead of small, size is still good for fast
 
@@ -43,32 +51,53 @@ else
         x86_64-*) cpu="x86_64_v3" ;;
     esac
 
-    # Artifacts follow each platform's dynamic library naming convention
     case "$target" in
-        aarch64-macos) zig_target="aarch64-macos" out="./build/libturbores-aarch64.dylib" ;;
-        x86_64-macos) zig_target="x86_64-macos" out="./build/libturbores-x86_64.dylib" ;;
-        aarch64-linux) zig_target="aarch64-linux-gnu.2.28" out="./build/libturbores-aarch64.so" ;;
-        x86_64-linux) zig_target="x86_64-linux-gnu.2.28" out="./build/libturbores-x86_64.so" ;;
-        aarch64-windows) zig_target="aarch64-windows-gnu" out="./build/turbores-aarch64.dll" ;;
-        x86_64-windows) zig_target="x86_64-windows-gnu" out="./build/turbores-x86_64.dll" ;;
+        aarch64-macos) zig_target="aarch64-macos" ;;
+        x86_64-macos) zig_target="x86_64-macos" ;;
+        aarch64-linux) zig_target="aarch64-linux-gnu.2.28" ;;
+        x86_64-linux) zig_target="x86_64-linux-gnu.2.28" ;;
+        aarch64-windows) zig_target="aarch64-windows-gnu" ;;
+        x86_64-windows) zig_target="x86_64-windows-gnu" ;;
         *)
             echo "Unsupported target: $target" >&2
             exit 1
             ;;
     esac
 
-    # The internal library name (SONAME/install name) defaults to "libindex", so set it explicitly.
-    # Linux also needs libc, otherwise std.Thread.spawn breaks in shared libraries.
+    arch="${target%%-*}"
+    os="${target#*-}"
+
+    # Artifacts follow each platform's library naming convention
+    case "$os" in
+        windows) name="turbores-$os-$arch" ;;
+        *) name="libturbores-$os-$arch" ;;
+    esac
+
     extra_args=""
+    if [ "$linkage" = "dynamic" ]; then
+        # The internal library name (SONAME/install name) defaults to "libindex", so set it explicitly
+        case "$os" in
+            macos) out="./build/$name.dylib" extra_args="-install_name $name.dylib" ;;
+            linux) out="./build/$name.so" extra_args="-fsoname=$name.so" ;;
+            # "-dynamic"/"-static" suffixes keep the two .lib flavors apart
+            windows) out="./build/$name.dll" extra_args="-femit-implib=./build/$name-dynamic.lib" ;;
+        esac
+        extra_args="$extra_args -dynamic"
+    else
+        case "$os" in
+            windows) out="./build/$name-static.lib" ;;
+            *) out="./build/$name.a" ;;
+        esac
+        # Bundle compiler-rt so consumers' toolchains don't need to provide its symbols
+        extra_args="-fcompiler-rt"
+    fi
+
     case "$target" in
-        *-macos) extra_args="-install_name $(basename "$out")" ;;
-        *-linux) extra_args="-fsoname=$(basename "$out") -lc" ;;
-        # Name the import library after the DLL so the two architectures don't collide
-        *-windows) extra_args="-femit-implib=${out%.dll}.lib" ;;
+        # Linux needs libc, otherwise std.Thread.spawn breaks outside of Zig executables
+        *-linux) extra_args="$extra_args -lc" ;;
     esac
 
     zig build-lib \
-        -dynamic \
         -target "$zig_target" \
         -mcpu="$cpu" \
         -O $mode \

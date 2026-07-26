@@ -39,11 +39,11 @@ cd "$(dirname "$0")/.."
 
 . ./scripts/detect-native-target.sh
 
-./scripts/build-zig.sh "$native_target" --release
+./scripts/build-zig.sh "$native_target" --dynamic --release
 
 cc -std=c11 -O3 -Wall -Wextra \
     -o build/benchmark-turbores-native \
     benchmark/benchmark-turbores-native.c \
-    "$native_lib"
+    "$native_dynamic_lib"
 
 ./build/benchmark-turbores-native "$video" "$threads"
