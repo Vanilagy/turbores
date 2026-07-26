@@ -234,16 +234,18 @@ As the name suggests, TurboRes is extremely performant and can decode ProRes at 
 
 | | ProRes 422 HQ @ 4K | ProRes 4444 @ 1080p | ProRes 422 HQ @ 1080p | ProRes 422 Proxy @ 1080p |
 | - | - | - | - | - |
-| **TurboRes, multithreaded** | **250 FPS** | **763 FPS** | **920 FPS** | **2310 FPS** |
+| **TurboRes native, multithreaded** | **312 FPS** | **910 FPS** | **1145 FPS** | **2942 FPS** |
+| **TurboRes (Chrome), multithreaded** | **250 FPS** | **763 FPS** | **920 FPS** | **2310 FPS** |
 | FFmpeg native, hardware-accelerated | 160 FPS | 256 FPS | 464 FPS | 466 FPS |
 | FFmpeg native, multithreaded | 107 FPS | 342 FPS | 375 FPS | 948 FPS |
-| ffmpeg.wasm, multithreaded | 84 FPS | 288 FPS | 295 FPS | 706 FPS |
+| ffmpeg.wasm (Chrome), multithreaded | 84 FPS | 288 FPS | 295 FPS | 706 FPS |
 |  |  |  |  |  |
-| **TurboRes, singlethreaded** | **42 FPS** | **128 FPS** | **158 FPS** | **450 FPS** |
+| **TurboRes native, singlethreaded** | **49 FPS** | **149 FPS** | **186 FPS** | **514 FPS** |
+| **TurboRes (Chrome), singlethreaded** | **42 FPS** | **128 FPS** | **158 FPS** | **450 FPS** |
 | FFmpeg native, singlethreaded | 15 FPS | 55 FPS | 57 FPS | 161 FPS |
-| ffmpeg.wasm, singlethreaded | 13 FPS | 50 FPS | 48 FPS | 131 FPS |
+| ffmpeg.wasm (Chrome), singlethreaded | 13 FPS | 50 FPS | 48 FPS | 131 FPS |
 
-> Averaged over 10 runs. Higher is better. Measured on an M4 (4P+6E) MacBook Air with TurboRes 1.2.0 and FFmpeg 7.1.1. \
+> Averaged over 10 runs. Higher is better. Measured on an M4 (4P+6E) MacBook Air with TurboRes 1.3.0 and FFmpeg 7.1.1. \
 > To reproduce these benchmarks, check out [`benchmark/README.md`](./benchmark/README.md).
 
 ## Under the hood
