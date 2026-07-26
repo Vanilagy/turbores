@@ -11,14 +11,14 @@ const io = misc.io;
 const DecodeTask = @import("./decoder.zig").DecodeTask;
 const executeDecodeTask = @import("./decoder.zig").executeDecodeTask;
 
-export fn allocateWorkerStack() ?[*]u8 {
+pub fn allocateWorkerStack() callconv(.c) ?[*]u8 {
     // 512 KiB per worker should be plenty
     const stack = gpa.alloc(u8, 512 * 1024) catch return null;
     // The WASM stack grows downward, so the stack pointer must start at the TOP of the buffer
     return stack.ptr + stack.len;
 }
 
-export fn allocateThreadLocalState(size: usize, alignment: u8) ?[*]u8 {
+pub fn allocateThreadLocalState(size: usize, alignment: u8) callconv(.c) ?[*]u8 {
     // Use wasm_allocator instead of gpa here because gpa requires thread-local state
     return misc.wasm_allocator.rawAlloc(size, .fromByteUnits(alignment), @returnAddress());
 }
@@ -35,12 +35,35 @@ pub const WorkerError = struct {
 pub var worker_task_queue = std.Deque(WorkerTask).empty;
 pub var worker_task_queue_mutex = std.Io.Mutex.init;
 
+pub inline fn taskQueueLenFutexPtr() *const u32 {
+    return @ptrCast(&worker_task_queue.len);
+}
+
+var pool_mutex = std.Io.Mutex.init;
+var pool_thread_count: u32 = 0;
+
+// Natively, the library manages its own thread pool. It is shared across all decoders and grows to the largest
+// concurrency requested so far.
+pub fn ensureThreads(count: u32) !void {
+    misc.lockMutex(&pool_mutex);
+    defer pool_mutex.unlock(io);
+
+    while (pool_thread_count < count) : (pool_thread_count += 1) {
+        const thread = try std.Thread.spawn(.{}, workerLoop, .{});
+        thread.detach();
+    }
+}
+
 // Preallocated on the stack so that allocation of it can't fail
 threadlocal var worker_error: WorkerError = undefined;
 
-export fn startWorker() noreturn {
+pub fn startWorker() callconv(.c) noreturn {
+    workerLoop();
+}
+
+fn workerLoop() noreturn {
     while (true) {
-        io.futexWait(u32, &worker_task_queue.len, 0) catch unreachable; // Can't cancel in WASM
+        io.futexWait(u32, taskQueueLenFutexPtr(), 0) catch unreachable; // Won't be canceled
 
         var task: WorkerTask = undefined;
         {

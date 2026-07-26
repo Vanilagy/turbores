@@ -45,8 +45,8 @@ pub const Decoder = struct {
 
     // Two packet slots so the JS side can copy the next packet in while the current one is still being decoded
     packet_slots: [2][]u8,
-    // The slot currently being decoded
-    packet: []u8,
+    // The packet currently being decoded
+    packet: []const u8,
 
     // Need two for interlaced
     pictures: [2]Picture,
@@ -118,9 +118,14 @@ pub const DecodeTask = struct {
     error_message: ?[]const u8,
 };
 
-export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats: u32) ?*Decoder {
+pub fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats: u32) callconv(.c) ?*Decoder {
     std.debug.assert(bit_depth == 10 or bit_depth == 12);
     std.debug.assert(allowed_output_formats != 0); // Ensured by the caller
+
+    if (!misc.is_wasm and concurrency > 0) {
+        // Natively, the library takes care of its own thread pool; in WASM, the JS side spins up the workers
+        worker.ensureThreads(concurrency) catch return null;
+    }
 
     const result = gpa.create(Decoder) catch return null;
 
@@ -152,23 +157,15 @@ export fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats
     return result;
 }
 
-export fn getOriginalPixelFormat(decoder: *Decoder) u32 {
-    return @intFromEnum(getYuvPixelFormat(
-        decoder.log2_chroma_blocks_per_mb,
-        decoder.bit_depth,
-        decoder.alpha_bit_depth != 0,
-    ));
-}
-
-export fn getErrorMessagePtr(decoder: *Decoder) ?[*]const u8 {
+pub fn getErrorMessagePtr(decoder: *Decoder) callconv(.c) ?[*]const u8 {
     return if (decoder.error_message) |msg| msg.ptr else null;
 }
 
-export fn getErrorMessageSize(decoder: *Decoder) usize {
+pub fn getErrorMessageSize(decoder: *Decoder) callconv(.c) usize {
     return if (decoder.error_message) |msg| msg.len else 0;
 }
 
-export fn closeDecoder(decoder: *Decoder) void {
+pub fn closeDecoder(decoder: *Decoder) callconv(.c) void {
     for (decoder.packet_slots) |slot| {
         gpa.free(slot);
     }
@@ -181,18 +178,34 @@ export fn closeDecoder(decoder: *Decoder) void {
     gpa.destroy(decoder);
 }
 
-export fn allocatePacket(decoder: *Decoder, size: usize, slot: u32) ?[*]u8 {
+pub fn allocatePacket(decoder: *Decoder, size: usize, slot: u32) callconv(.c) ?[*]u8 {
     decoder.packet_slots[slot] = gpa.realloc(decoder.packet_slots[slot], size) catch return null;
     return decoder.packet_slots[slot].ptr;
 }
 
-export fn getTaskStateAddress(decoder: *Decoder) *u32 {
+pub fn getTaskStateAddress(decoder: *Decoder) callconv(.c) *u32 {
     return @ptrCast(&decoder.task_state.raw);
 }
 
-export fn decodePacket(decoder: *Decoder, frame: *Frame, slot: u32) i32 {
+pub fn decodePacketWasm(decoder: *Decoder, frame: *Frame, slot: u32) callconv(.c) i32 {
     decoder.packet = decoder.packet_slots[slot];
     decodePacketInternal(decoder, frame) catch |err| return misc.toErrorCode(err);
+    return 0;
+}
+
+pub fn decodePacketNative(decoder: *Decoder, frame: *Frame, packet_ptr: [*]const u8, packet_len: usize) callconv(.c) i32 {
+    decoder.packet = packet_ptr[0..packet_len];
+    decodePacketInternal(decoder, frame) catch |err| return misc.toErrorCode(err);
+
+    if (decoder.concurrency > 0) {
+        // Block until the worker threads have fully decoded the frame. Loop to correctly handle "spurious wakeups".
+        while (decoder.task_state.load(.seq_cst) == .working) {
+            io.futexWait(DecodeTaskState, &decoder.task_state.raw, .working) catch unreachable;
+        }
+
+        return finalizePacketDecoding(decoder);
+    }
+
     return 0;
 }
 
@@ -204,7 +217,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
 
     var reader = misc.ByteReader.init(decoder.packet);
 
-    const frame_size = try reader.takeInt(u32);
+    const frame_size: usize = try reader.takeInt(u32);
     if (reader.data.len < frame_size) {
         @branchHint(.unlikely);
         decoder.error_message = "Packet is smaller than the frame size indicated in the frame header.";
@@ -220,7 +233,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         return error.InvalidData;
     }
 
-    const header_size: u32 = try reader.takeInt(u16);
+    const header_size: usize = try reader.takeInt(u16);
 
     const version = try reader.takeInt(u16);
     if (version > 1) {
@@ -317,6 +330,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     );
 
     frame.log2_chroma_blocks_per_mb = log2_chroma_blocks_per_mb;
+    frame.original_pixel_format = actual_pixel_format;
     frame.bit_depth = decoder.bit_depth;
     frame.alpha_bit_depth = alpha_bit_depth;
 
@@ -519,7 +533,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     }
 
     decoder.task_state.store(.working, .seq_cst);
-    io.futexWake(u32, &worker.worker_task_queue.len, total_task_count);
+    io.futexWake(u32, worker.taskQueueLenFutexPtr(), total_task_count);
 
     decoder.running_task_count.store(total_task_count, .seq_cst);
 }
@@ -536,11 +550,11 @@ fn parsePicture(
     var reader = outside_reader.*;
 
     const pic_header_start_pos = reader.pos;
-    const pic_header_size: u32 = try reader.takeInt(u8) >> 3;
-    const pic_data_size = try reader.takeInt(u32);
+    const pic_header_size: usize = try reader.takeInt(u8) >> 3;
+    const pic_data_size: usize = try reader.takeInt(u32);
 
     // Protect against overflow
-    const pic_data_end = try std.math.add(u32, pic_header_start_pos, pic_data_size);
+    const pic_data_end = try std.math.add(usize, pic_header_start_pos, pic_data_size);
 
     if (reader.data.len < pic_data_end) {
         @branchHint(.unlikely);
@@ -649,7 +663,7 @@ fn parsePicture(
     outside_reader.pos = pic_data_end;
 }
 
-export fn finalizePacketDecoding(decoder: *Decoder) i32 {
+pub fn finalizePacketDecoding(decoder: *Decoder) callconv(.c) i32 {
     if (decoder.running_task_count.load(.seq_cst) > 0) {
         @branchHint(.unlikely);
         // Shouldn't be possible to get into this state; bad bad!
@@ -794,7 +808,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                 task,
                 luma_data,
                 luma_frame_data,
-                luma_vec,
+                &luma_vec,
                 pos,
                 num_luma_blocks,
                 2,
@@ -810,7 +824,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                 task,
                 u_data,
                 u_frame_data,
-                chroma_vec,
+                &chroma_vec,
                 pos,
                 num_chroma_blocks,
                 decoder.log2_chroma_blocks_per_mb,
@@ -826,7 +840,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                 task,
                 v_data,
                 v_frame_data,
-                chroma_vec,
+                &chroma_vec,
                 pos,
                 num_chroma_blocks,
                 decoder.log2_chroma_blocks_per_mb,
@@ -916,7 +930,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             task,
             slice_1_luma_data,
             luma_frame_data,
-            luma_vec_1,
+            &luma_vec_1,
             pos_1,
             num_luma_blocks_1,
             2,
@@ -929,7 +943,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             task,
             slice_2_luma_data,
             luma_frame_data,
-            luma_vec_2,
+            &luma_vec_2,
             pos_2,
             num_luma_blocks_2,
             2,
@@ -954,7 +968,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             task,
             slice_1_u_data,
             u_frame_data,
-            chroma_vec_1,
+            &chroma_vec_1,
             pos_1,
             num_chroma_blocks_1,
             decoder.log2_chroma_blocks_per_mb,
@@ -967,7 +981,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             task,
             slice_2_u_data,
             u_frame_data,
-            chroma_vec_2,
+            &chroma_vec_2,
             pos_2,
             num_chroma_blocks_2,
             decoder.log2_chroma_blocks_per_mb,
@@ -992,7 +1006,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             task,
             slice_1_v_data,
             v_frame_data,
-            chroma_vec_1,
+            &chroma_vec_1,
             pos_1,
             num_chroma_blocks_1,
             decoder.log2_chroma_blocks_per_mb,
@@ -1005,7 +1019,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             task,
             slice_2_v_data,
             v_frame_data,
-            chroma_vec_2,
+            &chroma_vec_2,
             pos_2,
             num_chroma_blocks_2,
             decoder.log2_chroma_blocks_per_mb,
@@ -1059,30 +1073,30 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
 
 const SliceHeader = struct {
     scale_factor: u32,
-    luma_data: []u8,
-    u_data: []u8,
-    v_data: []u8,
-    alpha_data: []u8,
+    luma_data: []const u8,
+    u_data: []const u8,
+    v_data: []const u8,
+    alpha_data: []const u8,
     width_mb: u32,
     pos_x_mb: u32,
     pos_y_mb: u32,
 };
 
-inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize) !SliceHeader {
+inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: u32) !SliceHeader {
     // We can do unchecked reads here because we have already verified that the slice data fits
 
     const picture = task.picture;
     const start_pos = reader.pos;
     const slice_size = picture.slice_sizes[i];
-    const slice_header_size: u32 = try reader.takeInt(u8) >> 3;
+    const slice_header_size: usize = try reader.takeInt(u8) >> 3;
 
     var scale_factor: u32 = std.math.clamp(try reader.takeInt(u8), 1, 224);
     if (scale_factor > 128) {
         scale_factor = (scale_factor - 96) << 2;
     }
 
-    const luma_data_size: u32 = try reader.takeInt(u16);
-    const u_data_size: u32 = try reader.takeInt(u16);
+    const luma_data_size: usize = try reader.takeInt(u16);
+    const u_data_size: usize = try reader.takeInt(u16);
 
     const size_until_v = slice_header_size + luma_data_size + u_data_size;
     if (size_until_v > slice_size) {
@@ -1091,7 +1105,7 @@ inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize
         return error.InvalidData;
     }
 
-    const v_data_size: u32 = if (slice_header_size >= 8)
+    const v_data_size: usize = if (slice_header_size >= 8)
         try reader.takeInt(u16) // There's a special field for V data size
     else
         slice_size - size_until_v;
@@ -1118,8 +1132,9 @@ inline fn parseSliceHeader(task: *DecodeTask, reader: *misc.ByteReader, i: usize
     const v_data = reader.takeUnchecked(v_data_size);
     const alpha_data = reader.takeUnchecked(alpha_data_size);
 
-    const y_index = i / picture.slice_info_in_row.len;
-    const x_index = i - y_index * picture.slice_info_in_row.len; // No % so we don't need two int divisions
+    const slices_per_row: u32 = @intCast(picture.slice_info_in_row.len);
+    const y_index = i / slices_per_row;
+    const x_index = i - y_index * slices_per_row; // No % so we don't need two int divisions
 
     return .{
         .scale_factor = scale_factor,
@@ -1246,8 +1261,8 @@ const run_luts = buildCodeLutPointers(&run_params);
 const level_luts = buildCodeLutPointers(&level_params);
 
 fn parseDcAndAcPair(
-    data_1: []u8,
-    data_2: []u8,
+    data_1: []const u8,
+    data_2: []const u8,
     slice_1_data: []f32,
     slice_2_data: []f32,
     num_blocks_1: u32,
@@ -1272,7 +1287,7 @@ fn parseDcAndAcPair(
     var dc_state_1 = try DcState.init(data_1, slice_1_data);
     var dc_state_2 = try DcState.init(data_2, slice_2_data);
 
-    var j: u32 = 2;
+    var j: usize = 2;
     const min_num_blocks = @min(num_blocks_1, num_blocks_2);
     while (j < min_num_blocks) : (j += 2) {
         try dc_state_1.step(j);
@@ -1321,7 +1336,7 @@ fn parseDcAndAcPair(
     task.error_message = null;
 }
 
-fn parseDcAndAcSingle(data: []u8, slice_data: []f32, num_blocks: u32, task: *DecodeTask, scan_table: *const [64]u8) !void {
+fn parseDcAndAcSingle(data: []const u8, slice_data: []f32, num_blocks: u32, task: *DecodeTask, scan_table: *const [64]u8) !void {
     // An empty scan carries no coefficients; the slice data is already zeroed, so there's nothing to do.
     if (data.len == 0) {
         @branchHint(.unlikely);
@@ -1333,7 +1348,7 @@ fn parseDcAndAcSingle(data: []u8, slice_data: []f32, num_blocks: u32, task: *Dec
 
     var dc_state = try DcState.init(data, slice_data);
 
-    var j: u32 = 2;
+    var j: usize = 2;
     while (j < num_blocks) : (j += 2) {
         try dc_state.step(j);
     }
@@ -1367,7 +1382,7 @@ const DcState = struct {
     sign: i32,
     prev_dc: i32,
 
-    inline fn init(data: []u8, slice_data: []f32) !DcState {
+    inline fn init(data: []const u8, slice_data: []f32) !DcState {
         var s = DcState{
             .bit_reader = misc.BitReader.fromData(data),
             .slice_data = slice_data,
@@ -1481,13 +1496,13 @@ const AcState = struct {
 };
 
 fn parseAndStoreAlpha(
-    data: []u8,
+    data: []const u8,
     frame_data: []align(2) u8,
-    x: usize,
-    y: usize,
-    slice_width: usize,
-    num_values: usize,
-    coded_width: usize,
+    x: u32,
+    y: u32,
+    slice_width: u32,
+    num_values: u32,
+    coded_width: u32,
     comptime source_bit_depth: u64,
     comptime target_bit_depth: u64,
 ) void {
@@ -1512,17 +1527,17 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
     return struct {
         bit_reader: misc.BitReader,
         frame_data: []ElementType,
-        x: usize,
-        y_offset: usize,
-        slice_width: usize,
-        num_values: usize,
-        coded_width: usize,
+        x: u32,
+        y_offset: u32,
+        slice_width: u32,
+        num_values: u32,
+        coded_width: u32,
         pos: u32,
         alpha_val: i64,
-        x_mask: usize,
+        x_mask: u32,
         log2_slice_width: u5,
 
-        inline fn init(data: []u8, frame_data: []align(2) u8, x: usize, y: usize, slice_width: usize, num_values: usize, coded_width: usize) @This() {
+        inline fn init(data: []const u8, frame_data: []align(2) u8, x: u32, y: u32, slice_width: u32, num_values: u32, coded_width: u32) @This() {
             return .{
                 .bit_reader = misc.BitReader.fromData(data),
                 .frame_data = std.mem.bytesAsSlice(ElementType, frame_data),
@@ -1534,7 +1549,7 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
                 .pos = 0,
                 .alpha_val = mask,
                 .x_mask = slice_width - 1,
-                .log2_slice_width = std.math.log2_int(usize, slice_width),
+                .log2_slice_width = std.math.log2_int(u32, slice_width),
             };
         }
 
@@ -1584,8 +1599,8 @@ fn AlphaState(source_bit_depth: comptime_int, target_bit_depth: comptime_int) ty
 
                 const capped_run = @min(@as(u32, @intCast(run)), self.num_values - self.pos - 1);
 
-                var pos: usize = self.pos + 1; // +1 because of the previous write
-                const run_end: usize = pos + capped_run;
+                var pos: u32 = self.pos + 1; // +1 because of the previous write
+                const run_end: u32 = pos + capped_run;
                 while (pos < run_end) {
                     const col = pos & self.x_mask;
                     const count = @min(self.slice_width - col, run_end - pos);
@@ -1642,7 +1657,8 @@ inline fn transformAndStoreSliceData(
     task: *DecodeTask,
     slice_data: []const f32,
     frame_data: []align(2) u8,
-    scaling_matrix_vec: @Vector(64, f32),
+    // By pointer so that the 256-byte vector isn't copied through the noinline call below
+    scaling_matrix_vec: *const @Vector(64, f32),
     slice_pos: SlicePos,
     num_blocks: u32,
     source_log2_blocks_per_macroblock: u32,
@@ -1686,7 +1702,7 @@ noinline fn transformAndStoreSliceDataBaked(
     task: *DecodeTask,
     slice_data: []const f32,
     frame_data: []align(2) u8,
-    scaling_matrix_vec: @Vector(64, f32),
+    noalias scaling_matrix_vec: *const @Vector(64, f32),
     slice_pos: SlicePos,
     num_blocks: u32,
     comptime source_log2_blocks_per_macroblock: u32,
@@ -1712,35 +1728,6 @@ noinline fn transformAndStoreSliceDataBaked(
 
         var j: u32 = 0;
         while (j < num_blocks) : (j += 4) {
-            const result_1 = idct_8x8(
-                slice_data[(j << 6)..][0..64].*,
-                scaling_matrix_vec,
-                dc_offset,
-                max_value,
-                ElementType,
-            );
-            const result_2 = idct_8x8(
-                slice_data[(j << 6) + 64 ..][0..64].*,
-                scaling_matrix_vec,
-                dc_offset,
-                max_value,
-                ElementType,
-            );
-            const result_3 = idct_8x8(
-                slice_data[(j << 6) + 128 ..][0..64].*,
-                scaling_matrix_vec,
-                dc_offset,
-                max_value,
-                ElementType,
-            );
-            const result_4 = idct_8x8(
-                slice_data[(j << 6) + 192 ..][0..64].*,
-                scaling_matrix_vec,
-                dc_offset,
-                max_value,
-                ElementType,
-            );
-
             switch (target_log2_block_per_macroblock) {
                 0 => {
                     // 444->420, drop every even column and even row
@@ -1749,6 +1736,20 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y >> 1;
 
                     // Top half
+                    const result_1 = idct_8x8(
+                        slice_data[(j << 6)..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
+                    const result_3 = idct_8x8(
+                        slice_data[(j << 6) + 128 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlockOddColumns(
                         ElementType,
                         cast_frame_data,
@@ -1759,7 +1760,22 @@ noinline fn transformAndStoreSliceDataBaked(
                         block_y,
                         true,
                     );
+
                     // Bottom half
+                    const result_2 = idct_8x8(
+                        slice_data[(j << 6) + 64 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
+                    const result_4 = idct_8x8(
+                        slice_data[(j << 6) + 192 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlockOddColumns(
                         ElementType,
                         cast_frame_data,
@@ -1778,6 +1794,20 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y;
 
                     // Top
+                    const result_1 = idct_8x8(
+                        slice_data[(j << 6)..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
+                    const result_3 = idct_8x8(
+                        slice_data[(j << 6) + 128 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlockOddColumns(
                         ElementType,
                         cast_frame_data,
@@ -1788,7 +1818,22 @@ noinline fn transformAndStoreSliceDataBaked(
                         block_y,
                         false,
                     );
+
                     // Bottom
+                    const result_2 = idct_8x8(
+                        slice_data[(j << 6) + 64 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
+                    const result_4 = idct_8x8(
+                        slice_data[(j << 6) + 192 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlockOddColumns(
                         ElementType,
                         cast_frame_data,
@@ -1802,11 +1847,18 @@ noinline fn transformAndStoreSliceDataBaked(
                 },
                 2 => {
                     // 444->444, keep as-is
+                    // Block ordering depends if it's luma or not
                     const block_x = slice_pos.x + ((j >> 2) << 4);
                     const block_y = slice_pos.y;
 
-                    // Order is different here than for luma!!
                     // Top-left
+                    const result_1 = idct_8x8(
+                        slice_data[(j << 6)..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlock(
                         ElementType,
                         cast_frame_data,
@@ -1815,7 +1867,15 @@ noinline fn transformAndStoreSliceDataBaked(
                         block_x,
                         block_y,
                     );
+
                     // Top-right or bottom-left
+                    const result_2 = idct_8x8(
+                        slice_data[(j << 6) + 64 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlock(
                         ElementType,
                         cast_frame_data,
@@ -1824,7 +1884,15 @@ noinline fn transformAndStoreSliceDataBaked(
                         if (is_chroma) block_x else block_x + 8,
                         if (is_chroma) block_y + 8 else block_y,
                     );
+
                     // Bottom-left or top-right
+                    const result_3 = idct_8x8(
+                        slice_data[(j << 6) + 128 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlock(
                         ElementType,
                         cast_frame_data,
@@ -1833,7 +1901,15 @@ noinline fn transformAndStoreSliceDataBaked(
                         if (is_chroma) block_x + 8 else block_x,
                         if (is_chroma) block_y else block_y + 8,
                     );
+
                     // Bottom-right
+                    const result_4 = idct_8x8(
+                        slice_data[(j << 6) + 192 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlock(
                         ElementType,
                         cast_frame_data,
@@ -1850,21 +1926,6 @@ noinline fn transformAndStoreSliceDataBaked(
     } else {
         var j: u32 = 0;
         while (j < num_blocks) : (j += 2) {
-            const result_t = idct_8x8(
-                slice_data[(j << 6)..][0..64].*,
-                scaling_matrix_vec,
-                dc_offset,
-                max_value,
-                ElementType,
-            );
-            const result_b = idct_8x8(
-                slice_data[(j << 6) + 64 ..][0..64].*,
-                scaling_matrix_vec,
-                dc_offset,
-                max_value,
-                ElementType,
-            );
-
             switch (target_log2_block_per_macroblock) {
                 0 => {
                     // 422->420, drop every even row
@@ -1873,6 +1934,13 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y >> 1;
 
                     // Top half
+                    const result_t = idct_8x8(
+                        slice_data[(j << 6)..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlockOddRows(
                         ElementType,
                         cast_frame_data,
@@ -1881,7 +1949,15 @@ noinline fn transformAndStoreSliceDataBaked(
                         block_x,
                         block_y,
                     );
+
                     // Bottom half
+                    const result_b = idct_8x8(
+                        slice_data[(j << 6) + 64 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlockOddRows(
                         ElementType,
                         cast_frame_data,
@@ -1898,6 +1974,13 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y;
 
                     // Top
+                    const result_t = idct_8x8(
+                        slice_data[(j << 6)..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlock(
                         ElementType,
                         cast_frame_data,
@@ -1906,7 +1989,15 @@ noinline fn transformAndStoreSliceDataBaked(
                         block_x,
                         block_y,
                     );
+
                     // Bottom
+                    const result_b = idct_8x8(
+                        slice_data[(j << 6) + 64 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeBlock(
                         ElementType,
                         cast_frame_data,
@@ -1923,6 +2014,13 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y;
 
                     // Top
+                    const result_t = idct_8x8(
+                        slice_data[(j << 6)..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeUpsampledBlock(
                         ElementType,
                         cast_frame_data,
@@ -1931,7 +2029,15 @@ noinline fn transformAndStoreSliceDataBaked(
                         block_x,
                         block_y,
                     );
+
                     // Bottom
+                    const result_b = idct_8x8(
+                        slice_data[(j << 6) + 64 ..][0..64].*,
+                        scaling_matrix_vec.*,
+                        dc_offset,
+                        max_value,
+                        ElementType,
+                    );
                     storeUpsampledBlock(
                         ElementType,
                         cast_frame_data,
