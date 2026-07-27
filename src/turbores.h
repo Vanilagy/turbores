@@ -66,20 +66,21 @@ typedef enum TurboresError {
 /*
  * Creates a new decoder. Returns NULL on allocation failure.
  *
- * concurrency: The number of threads used for packet decoding. The library manages a single internal thread pool
- * shared across all decoders, spun up on decoder creation. Pass 0 to decode synchronously on the calling thread.
+ * `concurrency`: The number of threads used for packet decoding. The library manages a single internal thread pool
+ * shared across all decoders, spun up on decoder creation. Pass 0 to automatically pick a concurrency based on the
+ * number of logical CPU cores.
  *
- * bit_depth: 10 or 12. You can derive this from the ProRes FourCC: 12 for 'ap4x' and 'ap4h', 10 otherwise.
+ * `bit_depth`: 10 or 12. You can derive this from the ProRes FourCC: 12 for 'ap4x' and 'ap4h', 10 otherwise.
  *
- * allowed_output_formats: A non-zero bit field of allowed output formats, where each TurboresPixelFormat value
- * contributes the bit (1u << format). Pass TURBORES_ALL_PIXEL_FORMATS to allow all formats. When a frame's native
+ * `allowed_output_formats`: A non-zero bit field of allowed output formats, where each `TurboresPixelFormat` value
+ * contributes the bit `(1u << format)`. Pass `TURBORES_ALL_PIXEL_FORMATS` to allow all formats. When a frame's native
  * format is not allowed, the decoder picks the best allowed alternative, preferring lossless conversions.
  */
 TurboresDecoder *turbores_decoder_create(uint32_t concurrency, uint32_t bit_depth, uint32_t allowed_output_formats);
 
 /*
  * Decodes one ProRes packet into the given frame, blocking until the frame is fully decoded. The packet data is
- * is not copied and must stay alive for the duration of this call. Returns 0 on success or a negative TurboresError
+ * is not copied and must stay alive for the duration of this call. Returns 0 on success or a negative `TurboresError`
  * value on failure; in the failure case, turbores_decoder_error_message_ptr may provide details.
  *
  * A decoder must not be used from multiple threads at once.
@@ -112,19 +113,19 @@ void turbores_frame_destroy(TurboresFrame *frame);
 /*
  * Returns a pointer to the decoded planar YUV(A) data, tightly packed plane after plane at the frame's coded
  * dimensions. Samples are uint8_t for 8-bit formats and native-endian uint16_t for 10/12-bit formats. Valid until
- * the next decode into this frame or until turbores_frame_destroy.
+ * the next decode into this frame or until `turbores_frame_destroy`.
  */
 uint8_t *turbores_frame_data_ptr(TurboresFrame *frame);
 
 /* Returns the byte length of the frame data. */
 size_t turbores_frame_data_size(TurboresFrame *frame);
 
-/* The frame's pixel format as a TurboresPixelFormat value. */
+/* The frame's pixel format as a `TurboresPixelFormat` value. */
 uint32_t turbores_frame_pixel_format(TurboresFrame *frame);
 
 /*
- * The pixel format the frame's packet natively was in, as a TurboresPixelFormat value. Can differ from the frame's
- * pixel format when allowed_output_formats forced a conversion.
+ * The pixel format the frame's packet natively was in, as a `TurboresPixelFormat` value. Can differ from the frame's
+ * pixel format when `allowed_output_formats` forced a conversion.
  */
 uint32_t turbores_frame_original_pixel_format(TurboresFrame *frame);
 
@@ -179,7 +180,7 @@ uint32_t turbores_frame_color_transfer(TurboresFrame *frame);
  */
 uint32_t turbores_frame_color_matrix(TurboresFrame *frame);
 
-/* The frame's scan type as a TurboresScanType value */
+/* The frame's scan type as a `TurboresScanType` value */
 uint32_t turbores_frame_scan_type(TurboresFrame *frame);
 
 #ifdef __cplusplus

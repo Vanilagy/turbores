@@ -5,6 +5,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const misc = @import("./misc.zig");
 const gpa = misc.gpa;
 const io = misc.io;
@@ -122,7 +123,7 @@ pub fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats: u
     std.debug.assert(bit_depth == 10 or bit_depth == 12);
     std.debug.assert(allowed_output_formats != 0); // Ensured by the caller
 
-    if (!misc.is_wasm and concurrency > 0) {
+    if (!misc.is_wasm and concurrency > 1) {
         // Natively, the library takes care of its own thread pool; in WASM, the JS side spins up the workers
         worker.ensureThreads(concurrency) catch return null;
     }
@@ -130,7 +131,10 @@ pub fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats: u
     const result = gpa.create(Decoder) catch return null;
 
     result.* = .{
-        .concurrency = concurrency,
+        .concurrency = if (!misc.is_wasm and concurrency == 1)
+            0 // On native, concurrency 1 means synchronous decode (the decode blocks anyway)
+        else
+            concurrency,
         .allowed_output_formats = allowed_output_formats,
 
         .packet_slots = .{ &.{}, &.{} },
@@ -155,6 +159,16 @@ pub fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats: u
     };
 
     return result;
+}
+
+pub fn createDecoderNative(concurrency: u32, bit_depth: u32, allowed_output_formats: u32) callconv(.c) ?*Decoder {
+    // 0 means "pick the concurrency automatically"
+    const resolved: u32 = if (concurrency == 0)
+        @intCast(std.Thread.getCpuCount() catch 1)
+    else
+        concurrency;
+
+    return createDecoder(resolved, bit_depth, allowed_output_formats);
 }
 
 pub fn getErrorMessagePtr(decoder: *Decoder) callconv(.c) ?[*]const u8 {
@@ -533,7 +547,8 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     }
 
     decoder.task_state.store(.working, .seq_cst);
-    io.futexWake(u32, worker.taskQueueLenFutexPtr(), total_task_count);
+    worker.worker_task_queue_len.store(@intCast(worker.worker_task_queue.len), .monotonic);
+    io.futexWake(u32, &worker.worker_task_queue_len.raw, total_task_count);
 
     decoder.running_task_count.store(total_task_count, .seq_cst);
 }
@@ -772,12 +787,16 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
 
     // Grab slice pairs from the picture's shared cursor until it's drained
     while (true) {
-        const base = picture.next_slice_index.fetchAdd(2, .monotonic);
+        // x64 processors typically have SMT, so doing two slices per thread at once is actually quite bad for the
+        // L1 cache. Therefore, simply do one slice at once - this was measured to be faster.
+        const step_size = if (builtin.cpu.arch == .x86_64) 1 else 2;
+
+        const base = picture.next_slice_index.fetchAdd(step_size, .monotonic);
         if (base >= slice_count) {
             break;
         }
 
-        if (base + 1 == slice_count) {
+        if (step_size == 1 or base + 1 == slice_count) {
             // Only a single slice left; decode it on its own
             reader.pos = picture.slice_offsets[base];
             const header = try parseSliceHeader(task, &reader, base);
@@ -874,7 +893,11 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
                 }
             }
 
-            break;
+            if (step_size == 1) {
+                continue;
+            } else {
+                break;
+            }
         }
 
         reader.pos = picture.slice_offsets[base];
@@ -1736,14 +1759,14 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y >> 1;
 
                     // Top half
-                    const result_1 = idct_8x8(
+                    const result_1 = idct8x8(
                         slice_data[(j << 6)..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
                         max_value,
                         ElementType,
                     );
-                    const result_3 = idct_8x8(
+                    const result_3 = idct8x8(
                         slice_data[(j << 6) + 128 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1762,14 +1785,14 @@ noinline fn transformAndStoreSliceDataBaked(
                     );
 
                     // Bottom half
-                    const result_2 = idct_8x8(
+                    const result_2 = idct8x8(
                         slice_data[(j << 6) + 64 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
                         max_value,
                         ElementType,
                     );
-                    const result_4 = idct_8x8(
+                    const result_4 = idct8x8(
                         slice_data[(j << 6) + 192 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1794,14 +1817,14 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y;
 
                     // Top
-                    const result_1 = idct_8x8(
+                    const result_1 = idct8x8(
                         slice_data[(j << 6)..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
                         max_value,
                         ElementType,
                     );
-                    const result_3 = idct_8x8(
+                    const result_3 = idct8x8(
                         slice_data[(j << 6) + 128 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1820,14 +1843,14 @@ noinline fn transformAndStoreSliceDataBaked(
                     );
 
                     // Bottom
-                    const result_2 = idct_8x8(
+                    const result_2 = idct8x8(
                         slice_data[(j << 6) + 64 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
                         max_value,
                         ElementType,
                     );
-                    const result_4 = idct_8x8(
+                    const result_4 = idct8x8(
                         slice_data[(j << 6) + 192 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1852,7 +1875,7 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y;
 
                     // Top-left
-                    const result_1 = idct_8x8(
+                    const result_1 = idct8x8(
                         slice_data[(j << 6)..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1869,7 +1892,7 @@ noinline fn transformAndStoreSliceDataBaked(
                     );
 
                     // Top-right or bottom-left
-                    const result_2 = idct_8x8(
+                    const result_2 = idct8x8(
                         slice_data[(j << 6) + 64 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1886,7 +1909,7 @@ noinline fn transformAndStoreSliceDataBaked(
                     );
 
                     // Bottom-left or top-right
-                    const result_3 = idct_8x8(
+                    const result_3 = idct8x8(
                         slice_data[(j << 6) + 128 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1903,7 +1926,7 @@ noinline fn transformAndStoreSliceDataBaked(
                     );
 
                     // Bottom-right
-                    const result_4 = idct_8x8(
+                    const result_4 = idct8x8(
                         slice_data[(j << 6) + 192 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1934,7 +1957,7 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y >> 1;
 
                     // Top half
-                    const result_t = idct_8x8(
+                    const result_t = idct8x8(
                         slice_data[(j << 6)..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1951,7 +1974,7 @@ noinline fn transformAndStoreSliceDataBaked(
                     );
 
                     // Bottom half
-                    const result_b = idct_8x8(
+                    const result_b = idct8x8(
                         slice_data[(j << 6) + 64 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1974,7 +1997,7 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y;
 
                     // Top
-                    const result_t = idct_8x8(
+                    const result_t = idct8x8(
                         slice_data[(j << 6)..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -1991,7 +2014,7 @@ noinline fn transformAndStoreSliceDataBaked(
                     );
 
                     // Bottom
-                    const result_b = idct_8x8(
+                    const result_b = idct8x8(
                         slice_data[(j << 6) + 64 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -2014,7 +2037,7 @@ noinline fn transformAndStoreSliceDataBaked(
                     const block_y = slice_pos.y;
 
                     // Top
-                    const result_t = idct_8x8(
+                    const result_t = idct8x8(
                         slice_data[(j << 6)..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -2031,7 +2054,7 @@ noinline fn transformAndStoreSliceDataBaked(
                     );
 
                     // Bottom
-                    const result_b = idct_8x8(
+                    const result_b = idct8x8(
                         slice_data[(j << 6) + 64 ..][0..64].*,
                         scaling_matrix_vec.*,
                         dc_offset,
@@ -2189,7 +2212,7 @@ fn IdctReturnValue(ElementType: type) type {
     return if (ElementType == u8) [4]@Vector(16, u8) else [8]@Vector(8, u16);
 }
 
-inline fn idct_8x8(
+inline fn idct8x8(
     block: [64]f32,
     scaling_matrix: @Vector(64, f32),
     dc_offset: f32,
@@ -2204,12 +2227,13 @@ inline fn idct_8x8(
     float_vec[0] += dc_offset; // Add the DC dequant offset (already pre-scaled)
 
     var rows: [8]V8 = @bitCast(float_vec);
-    rows = idct_columns(rows);
-    rows = transpose_rows(rows);
-    rows = idct_columns(rows);
+    rows = idctColumns(rows);
+    rows = transposeRows(rows);
+    rows = idctColumns(rows);
 
-    // WASM doesn't have a neat f32->u16 instruction, so we first do f32->u32, followed by u32->u16!
-    // f32->u32 already clamps the bottom at 0, so we only need to clamp the top.
+    // In WASM, f32->u32 saturates on both ends, so it clamps the bottom at 0 for us and we only clamp the top manually.
+    // Natively there's no such guarantee (out-of-range @intFromFloat is illegal behavior), so there we clamp both ends
+    // in the float domain before converting. NaNs can't occur anyway
 
     if (ElementType == u8) {
         const row_pairs: [4]@Vector(16, f32) = @bitCast(rows);
@@ -2217,22 +2241,33 @@ inline fn idct_8x8(
 
         // Iterate row pairs because 16 elements -> i8x16 vector type in WASM!
         inline for (0..4) |r| {
-            @setRuntimeSafety(false); // Since the f32->u32 clamp is actually intended here
+            if (misc.is_wasm) {
+                @setRuntimeSafety(false); // Since the f32->u32 clamp is actually intended here
 
-            var as_u32: @Vector(16, u32) = @intFromFloat(row_pairs[r]);
-            as_u32 = @min(as_u32, @as(@Vector(16, u32), @splat(max_value)));
+                // WASM doesn't have a neat f32->u16 instruction, so we first do f32->u32,
+                // followed by u32->u16!
+                var as_u32: @Vector(16, u32) = @intFromFloat(row_pairs[r]);
+                as_u32 = @min(as_u32, @as(@Vector(16, u32), @splat(max_value)));
 
-            const as_u16: @Vector(16, u16) = @intCast(as_u32);
-            const as_u16_arr: [16]u16 = as_u16;
-            const low_u16: @Vector(16, u8) = @bitCast(as_u16_arr[0..8].*);
-            const high_u16: @Vector(16, u8) = @bitCast(as_u16_arr[8..16].*);
+                const as_u16: @Vector(16, u16) = @intCast(as_u32);
+                const as_u16_arr: [16]u16 = as_u16;
+                const low_u16: @Vector(16, u8) = @bitCast(as_u16_arr[0..8].*);
+                const high_u16: @Vector(16, u8) = @bitCast(as_u16_arr[8..16].*);
 
-            const shuffled = @shuffle(u8, low_u16, high_u16, [_]i32{
-                0,  2,  4,  6,  8,  10,  12,  14,
-                -1, -3, -5, -7, -9, -11, -13, -15,
-            });
+                const shuffled = @shuffle(u8, low_u16, high_u16, [_]i32{
+                    0,  2,  4,  6,  8,  10,  12,  14,
+                    -1, -3, -5, -7, -9, -11, -13, -15,
+                });
 
-            result[r] = shuffled;
+                result[r] = shuffled;
+            } else {
+                const clamped = @min(
+                    @max(row_pairs[r], @as(@Vector(16, f32), @splat(0.0))),
+                    @as(@Vector(16, f32), @splat(@as(f32, @floatFromInt(max_value)))),
+                );
+
+                result[r] = @intFromFloat(clamped);
+            }
         }
 
         return result;
@@ -2241,12 +2276,21 @@ inline fn idct_8x8(
         var result: [8]@Vector(8, u16) = undefined;
 
         inline for (0..8) |r| {
-            @setRuntimeSafety(false); // Since the f32->u32 clamp is actually intended here
+            if (misc.is_wasm) {
+                @setRuntimeSafety(false); // Since the f32->u32 clamp is actually intended here
 
-            var as_u32: @Vector(8, u32) = @intFromFloat(rows[r]);
-            as_u32 = @min(as_u32, @as(@Vector(8, u32), @splat(max_value)));
+                var as_u32: @Vector(8, u32) = @intFromFloat(rows[r]);
+                as_u32 = @min(as_u32, @as(@Vector(8, u32), @splat(max_value)));
 
-            result[r] = @as(@Vector(8, u16), @intCast(as_u32));
+                result[r] = @as(@Vector(8, u16), @intCast(as_u32));
+            } else {
+                const clamped = @min(
+                    @max(rows[r], @as(V8, @splat(0.0))),
+                    @as(V8, @splat(@as(f32, @floatFromInt(max_value)))),
+                );
+
+                result[r] = @intFromFloat(clamped);
+            }
         }
 
         return result;
@@ -2254,7 +2298,7 @@ inline fn idct_8x8(
 }
 
 // Based on https://www.nayuki.io/res/fast-discrete-cosine-transform-algorithms/fast-dct-8.c
-inline fn idct_columns(rows: [8]V8) [8]V8 {
+inline fn idctColumns(rows: [8]V8) [8]V8 {
     const V = V8;
 
     const v15: V = rows[0];
@@ -2314,7 +2358,7 @@ const V4 = @Vector(4, f32);
 const V8 = @Vector(8, f32);
 
 // Transpose the 8 row-vectors of an 8x8 block via the 4x4-quadrant shuffle method
-inline fn transpose_rows(rows: [8]V8) [8]V8 {
+inline fn transposeRows(rows: [8]V8) [8]V8 {
     var lo: [8]V4 = undefined;
     var hi: [8]V4 = undefined;
     inline for (0..8) |r| {
@@ -2322,10 +2366,10 @@ inline fn transpose_rows(rows: [8]V8) [8]V8 {
         hi[r] = @shuffle(f32, rows[r], undefined, [4]i32{ 4, 5, 6, 7 });
     }
 
-    const a = transpose_4x4(lo[0], lo[1], lo[2], lo[3]); // out rows 0..3, cols 0..3
-    const b = transpose_4x4(hi[0], hi[1], hi[2], hi[3]); // out rows 4..7, cols 0..3
-    const c = transpose_4x4(lo[4], lo[5], lo[6], lo[7]); // out rows 0..3, cols 4..7
-    const d = transpose_4x4(hi[4], hi[5], hi[6], hi[7]); // out rows 4..7, cols 4..7
+    const a = transpose4x4(lo[0], lo[1], lo[2], lo[3]); // out rows 0..3, cols 0..3
+    const b = transpose4x4(hi[0], hi[1], hi[2], hi[3]); // out rows 4..7, cols 0..3
+    const c = transpose4x4(lo[4], lo[5], lo[6], lo[7]); // out rows 0..3, cols 4..7
+    const d = transpose4x4(hi[4], hi[5], hi[6], hi[7]); // out rows 4..7, cols 4..7
 
     var result: [8]V8 = undefined;
     inline for (0..4) |i| {
@@ -2336,7 +2380,7 @@ inline fn transpose_rows(rows: [8]V8) [8]V8 {
     return result;
 }
 
-inline fn transpose_4x4(v0: V4, v1: V4, v2: V4, v3: V4) [4]V4 {
+inline fn transpose4x4(v0: V4, v1: V4, v2: V4, v3: V4) [4]V4 {
     const lo01 = @shuffle(f32, v0, v1, [4]i32{ 0, -1, 1, -2 });
     const hi01 = @shuffle(f32, v0, v1, [4]i32{ 2, -3, 3, -4 });
     const lo23 = @shuffle(f32, v2, v3, [4]i32{ 0, -1, 1, -2 });

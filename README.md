@@ -248,6 +248,23 @@ As the name suggests, TurboRes is extremely performant and can decode ProRes at 
 > Averaged over 10 runs. Higher is better. Measured on an M4 (4P+6E) MacBook Air with TurboRes 1.3.0 and FFmpeg 7.1.1. \
 > To reproduce these benchmarks, check out [`benchmark/README.md`](./benchmark/README.md).
 
+### x64 benchmarks:
+
+| | ProRes 422 HQ @ 4K | ProRes 4444 @ 1080p | ProRes 422 HQ @ 1080p | ProRes 422 Proxy @ 1080p |
+| - | - | - | - | - |
+| **TurboRes native, multithreaded** | **290 FPS** | **718 FPS** | **1004 FPS** | **2189 FPS** |
+| **TurboRes, multithreaded** | **177 FPS** | **565 FPS** | **660 FPS** | **1605 FPS** |
+| FFmpeg native, multithreaded | 192 FPS | 339 FPS | 639 FPS | 1594 FPS |
+| ffmpeg.wasm, multithreaded | 70 FPS | 232 FPS | 253 FPS | 706 FPS |
+|  |  |  |  |  |
+| **TurboRes native, singlethreaded** | **37 FPS** | **121 FPS** | **141 FPS** | **400 FPS** |
+| **TurboRes, singlethreaded** | **28 FPS** | **89 FPS** | **103 FPS** | **264 FPS** |
+| FFmpeg native, singlethreaded | 24 FPS | 53 FPS | 84 FPS | 274 FPS |
+| ffmpeg.wasm, singlethreaded | 11 FPS | 37 FPS | 39 FPS | 88 FPS |
+
+> Averaged over 10 runs. Higher is better. Measured on a Ryzen 7600X with TurboRes 1.3.0 and FFmpeg 4.4.2. \
+> To reproduce these benchmarks, check out [`benchmark/README.md`](./benchmark/README.md).
+
 ## Under the hood
 
 TurboRes easily beats native FFmpeg in performance, which is the result of relentless optimization to make the most out of every CPU cycle. Here's a quick summary of the techniques used:

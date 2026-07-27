@@ -34,10 +34,8 @@ pub const WorkerError = struct {
 
 pub var worker_task_queue = std.Deque(WorkerTask).empty;
 pub var worker_task_queue_mutex = std.Io.Mutex.init;
-
-pub inline fn taskQueueLenFutexPtr() *const u32 {
-    return @ptrCast(&worker_task_queue.len);
-}
+// Atomic mirror of worker_task_queue.len, updated under the mutex
+pub var worker_task_queue_len = std.atomic.Value(u32).init(0);
 
 var pool_mutex = std.Io.Mutex.init;
 var pool_thread_count: u32 = 0;
@@ -63,7 +61,7 @@ pub fn startWorker() callconv(.c) noreturn {
 
 fn workerLoop() noreturn {
     while (true) {
-        io.futexWait(u32, taskQueueLenFutexPtr(), 0) catch unreachable; // Won't be canceled
+        io.futexWait(u32, &worker_task_queue_len.raw, 0) catch unreachable; // Won't be canceled
 
         var task: WorkerTask = undefined;
         {
@@ -75,6 +73,7 @@ fn workerLoop() noreturn {
             }
 
             task = worker_task_queue.popFront().?;
+            worker_task_queue_len.store(@intCast(worker_task_queue.len), .monotonic);
         }
 
         switch (task) {

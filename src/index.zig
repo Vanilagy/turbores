@@ -43,7 +43,7 @@ comptime {
         @export(&frame.getColorMatrix, .{ .name = "getColorMatrix" });
         @export(&frame.getScanType, .{ .name = "getScanType" });
     } else {
-        @export(&decoder.createDecoder, .{ .name = "turbores_decoder_create" });
+        @export(&decoder.createDecoderNative, .{ .name = "turbores_decoder_create" });
         @export(&decoder.closeDecoder, .{ .name = "turbores_decoder_destroy" });
         @export(&decoder.decodePacketNative, .{ .name = "turbores_decode" });
         @export(&decoder.getErrorMessagePtr, .{ .name = "turbores_decoder_error_message_ptr" });
