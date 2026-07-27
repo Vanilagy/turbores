@@ -8,22 +8,28 @@ const std = @import("std");
 const builtin = @import("builtin");
 const BrkAllocator = @import("./BrkAllocator.zig");
 
+pub const is_wasm = builtin.cpu.arch.isWasm();
+
 extern fn externPrint(offset: usize, length: usize) void;
 
-pub threadlocal var is_browser_main_thread: bool = undefined;
+pub threadlocal var is_browser_main_thread: bool = if (is_wasm) undefined else false;
 
-export fn setIsBrowserMainThread(value: u32) void {
+pub fn setIsBrowserMainThread(value: u32) callconv(.c) void {
     is_browser_main_thread = value != 0;
 }
 
 pub fn print(comptime string: []const u8, arguments: anytype) void {
-    var print_buffer: [1 << 16]u8 = undefined;
+    if (is_wasm) {
+        var print_buffer: [1 << 16]u8 = undefined;
 
-    const message = std.fmt.bufPrint(&print_buffer, string, arguments) catch |err| switch (err) {
-        error.NoSpaceLeft => &print_buffer, // Just print the entire buffer
-    };
+        const message = std.fmt.bufPrint(&print_buffer, string, arguments) catch |err| switch (err) {
+            error.NoSpaceLeft => &print_buffer, // Just print the entire buffer
+        };
 
-    externPrint(@intFromPtr(message.ptr), message.len);
+        externPrint(@intFromPtr(message.ptr), message.len);
+    } else {
+        std.debug.print(string ++ "\n", arguments);
+    }
 }
 
 pub fn printValues(arguments: anytype) void {
@@ -32,7 +38,9 @@ pub fn printValues(arguments: anytype) void {
     }
 }
 
-pub const io = blk: {
+var native_threaded: std.Io.Threaded = .init_single_threaded;
+
+pub const io = if (is_wasm) blk: {
     var vtable = std.Io.failing.vtable.*;
     vtable.futexWait = &futexWait;
     vtable.futexWake = &futexWake;
@@ -42,14 +50,14 @@ pub const io = blk: {
         .userdata = null,
         .vtable = &vtable_const,
     };
-};
+} else native_threaded.io();
 
 var gpa_mutex = std.Io.Mutex.init;
 pub const wasm_allocator: std.mem.Allocator = .{
     .ptr = undefined,
     .vtable = &BrkAllocator.vtable,
 };
-pub const gpa: std.mem.Allocator = .{
+pub const gpa: std.mem.Allocator = if (is_wasm) .{
     .ptr = undefined,
     .vtable = &.{
         .alloc = &alloc,
@@ -57,7 +65,7 @@ pub const gpa: std.mem.Allocator = .{
         .remap = &remap,
         .free = &free,
     },
-};
+} else std.heap.smp_allocator;
 
 fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
     lockMutex(&gpa_mutex);
@@ -168,10 +176,10 @@ pub inline fn toErrorCode(err: ConvertibleError) i32 {
 }
 
 pub const ByteReader = struct {
-    data: []u8,
+    data: []const u8,
     pos: usize,
 
-    pub fn init(data: []u8) ByteReader {
+    pub fn init(data: []const u8) ByteReader {
         return .{
             .data = data,
             .pos = 0,
@@ -206,7 +214,7 @@ pub const ByteReader = struct {
         return value;
     }
 
-    pub inline fn takeArray(self: *ByteReader, comptime n: usize) !*[n]u8 {
+    pub inline fn takeArray(self: *ByteReader, comptime n: usize) !*const [n]u8 {
         if (n > self.remaining()) {
             return error.UnexpectedEof;
         }
@@ -216,7 +224,7 @@ pub const ByteReader = struct {
         return arr;
     }
 
-    pub inline fn take(self: *ByteReader, n: usize) ![]u8 {
+    pub inline fn take(self: *ByteReader, n: usize) ![]const u8 {
         if (n > self.remaining()) {
             return error.UnexpectedEof;
         }
@@ -224,7 +232,7 @@ pub const ByteReader = struct {
         return self.takeUnchecked(n);
     }
 
-    pub inline fn takeUnchecked(self: *ByteReader, n: usize) []u8 {
+    pub inline fn takeUnchecked(self: *ByteReader, n: usize) []const u8 {
         std.debug.assert(n <= self.remaining());
 
         const slice = self.data[self.pos..][0..n];
@@ -247,7 +255,7 @@ pub const BitReader = struct {
     next: u64,
     bit_health: u64,
 
-    pub inline fn fromData(data: []u8) BitReader {
+    pub inline fn fromData(data: []const u8) BitReader {
         return .{
             .reader = ByteReader.init(data),
             .current = 0,
@@ -331,6 +339,21 @@ pub inline fn wasmShuffle(
     b: @Vector(16, u8),
     comptime mask: [16]u8,
 ) @Vector(16, u8) {
+    if (!is_wasm) {
+        // Outside of WASM, LLVM is well-er behaved, so just use a regular shuffle
+        const shuffle_mask = comptime blk: {
+            @setEvalBranchQuota(1000000);
+            var result: [16]i32 = undefined;
+            for (mask, 0..) |idx, i| {
+                std.debug.assert(idx < 32);
+                result[i] = if (idx < 16) idx else ~@as(i32, idx - 16);
+            }
+            break :blk result;
+        };
+
+        return @shuffle(u8, a, b, shuffle_mask);
+    }
+
     @setEvalBranchQuota(1000000);
 
     const lanes = comptime blk: {

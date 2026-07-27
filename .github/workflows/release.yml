@@ -59,6 +59,13 @@ jobs:
       - name: Run build
         run: npm run build
 
+      - name: Build native libraries
+        run: |
+          for target in aarch64-macos x86_64-macos aarch64-linux x86_64-linux aarch64-windows x86_64-windows; do
+            ./scripts/build-zig.sh "$target" --dynamic --release
+            ./scripts/build-zig.sh "$target" --static --release
+          done
+
       - name: Upload build artifacts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -67,6 +74,21 @@ jobs:
           dist/turbores.js
           dist/turbores.umd.cjs
           dist/turbores.d.ts
+          src/turbores.h
+          build/libturbores-macos-aarch64.dylib
+          build/libturbores-macos-x86_64.dylib
+          build/libturbores-linux-aarch64.so
+          build/libturbores-linux-x86_64.so
+          build/turbores-windows-aarch64.dll
+          build/turbores-windows-x86_64.dll
+          build/turbores-windows-aarch64-dynamic.lib
+          build/turbores-windows-x86_64-dynamic.lib
+          build/libturbores-macos-aarch64.a
+          build/libturbores-macos-x86_64.a
+          build/libturbores-linux-aarch64.a
+          build/libturbores-linux-x86_64.a
+          build/turbores-windows-aarch64-static.lib
+          build/turbores-windows-x86_64-static.lib
 
       - name: Publish to npm
         run: npm publish --access public ${{ github.event.release.prerelease && '--tag beta' || '' }}
