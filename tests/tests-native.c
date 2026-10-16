@@ -249,15 +249,86 @@ static int runCase(const TestCase *test_case, uint32_t threads) {
     return 0;
 }
 
+static int runMalformedHeaders(uint32_t threads) {
+    static const struct {
+        const char *name;
+        size_t offset;
+        size_t size;
+        uint32_t value;
+    } cases[] = {
+        { "Zero frame size", 0, 4, 0 },
+        { "Frame size before reader position", 0, 4, 2 },
+        { "Short frame size", 0, 4, 27 },
+        { "Frame size past packet", 0, 4, 37 },
+        { "Short frame header", 8, 2, 19 },
+        { "Frame header past packet", 8, 2, 65535 },
+        { "Zero frame width", 16, 2, 0 },
+        { "Zero frame height", 18, 2, 0 },
+        { "Zero picture header", 28, 1, 0 },
+        { "Short picture header", 28, 1, 7 << 3 },
+        { "Picture header past picture", 28, 1, 9 << 3 },
+        { "Zero picture size", 29, 4, 0 },
+        { "Short picture size", 29, 4, 7 },
+        { "Picture size past packet", 29, 4, 9 },
+    };
+    static const uint8_t header[36] = {
+        [3] = 36,
+        [4] = 'i', [5] = 'c', [6] = 'p', [7] = 'f',
+        [9] = 20,
+        [17] = 16, [19] = 16,
+        [20] = 0x80,
+        [28] = 8 << 3,
+        [32] = 8,
+    };
+    TurboresDecoder *decoder = turbores_decoder_create(threads, 10, TURBORES_ALL_PIXEL_FORMATS);
+    TurboresFrame *frame = turbores_frame_create();
+    if (!decoder || !frame) {
+        if (frame) turbores_frame_destroy(frame);
+        if (decoder) turbores_decoder_destroy(decoder);
+        return 1;
+    }
+
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t packet[sizeof(header)];
+        memcpy(packet, header, sizeof(packet));
+        for (size_t byte = 0; byte < cases[i].size; byte++) {
+            packet[cases[i].offset + byte] = (uint8_t) (cases[i].value >> (8 * (cases[i].size - byte - 1)));
+        }
+        int32_t result = turbores_decode(decoder, frame, packet, sizeof(packet));
+        if (result != TURBORES_ERROR_INVALID_DATA && result != TURBORES_ERROR_NOT_SUPPORTED) {
+            fprintf(stderr, "FAILED: %s (threads %u): returned %d\n", cases[i].name, threads, result);
+            failures++;
+        }
+    }
+
+    for (size_t size = 0; size < 28; size++) {
+        if (turbores_decode(decoder, frame, header, size) >= 0) {
+            fprintf(stderr, "FAILED: Truncated header of %zu bytes (threads %u)\n", size, threads);
+            failures++;
+        }
+    }
+
+    turbores_frame_destroy(frame);
+    turbores_decoder_destroy(decoder);
+    if (failures == 0) {
+        printf("ok - Malformed and truncated headers (threads %u)\n", threads);
+    }
+    return failures;
+}
+
 int main(void) {
     const uint32_t thread_configs[] = { 0, 4 };
     int failures = 0;
 
     for (size_t t = 0; t < sizeof(thread_configs) / sizeof(thread_configs[0]); t++) {
+        failures += runMalformedHeaders(thread_configs[t]);
         for (size_t i = 0; i < sizeof(test_cases) / sizeof(test_cases[0]); i++) {
             failures += runCase(&test_cases[i], thread_configs[t]);
         }
     }
+
+    failures += runMalformedHeaders(1);
 
     if (failures > 0) {
         fprintf(stderr, "%d test(s) failed\n", failures);

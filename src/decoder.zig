@@ -232,7 +232,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     var reader = misc.ByteReader.init(decoder.packet);
 
     const frame_size: usize = try reader.takeInt(u32);
-    if (reader.data.len < frame_size) {
+    if (frame_size < 28 or reader.data.len < frame_size) {
         @branchHint(.unlikely);
         decoder.error_message = "Packet is smaller than the frame size indicated in the frame header.";
         return error.InvalidData;
@@ -248,6 +248,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     }
 
     const header_size: usize = try reader.takeInt(u16);
+    if (header_size < 20 or header_size > frame_size - 8) return error.InvalidData;
 
     const version = try reader.takeInt(u16);
     if (version > 1) {
@@ -260,7 +261,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
 
     const frame_width = try reader.takeInt(u16);
     const frame_height = try reader.takeInt(u16);
-    if (frame_width > 16384 or frame_height > 16384) {
+    if (frame_width == 0 or frame_height == 0 or frame_width > 16384 or frame_height > 16384) {
         @branchHint(.unlikely);
         decoder.error_message = std.fmt.bufPrint(
             &error_print_buffer,
@@ -571,7 +572,7 @@ fn parsePicture(
     // Protect against overflow
     const pic_data_end = try std.math.add(usize, pic_header_start_pos, pic_data_size);
 
-    if (reader.data.len < pic_data_end) {
+    if (pic_data_size < 8 or pic_header_size < 8 or pic_header_size > pic_data_size or reader.data.len < pic_data_end) {
         @branchHint(.unlikely);
         decoder.error_message = "Packet is smaller than the picture data size indicated in the picture header.";
         return error.InvalidData;

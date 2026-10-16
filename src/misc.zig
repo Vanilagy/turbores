@@ -215,7 +215,7 @@ pub const ByteReader = struct {
     }
 
     pub inline fn takeArray(self: *ByteReader, comptime n: usize) !*const [n]u8 {
-        if (n > self.remaining()) {
+        if (self.pos > self.data.len or n > self.remaining()) {
             return error.UnexpectedEof;
         }
 
@@ -225,7 +225,7 @@ pub const ByteReader = struct {
     }
 
     pub inline fn take(self: *ByteReader, n: usize) ![]const u8 {
-        if (n > self.remaining()) {
+        if (self.pos > self.data.len or n > self.remaining()) {
             return error.UnexpectedEof;
         }
 
@@ -245,7 +245,7 @@ pub const ByteReader = struct {
     }
 
     pub inline fn remaining(self: *const ByteReader) usize {
-        return self.data.len - self.pos;
+        return self.data.len -| self.pos;
     }
 };
 
