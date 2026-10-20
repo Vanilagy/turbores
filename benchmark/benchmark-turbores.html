@@ -35,6 +35,7 @@ document.querySelector('button').addEventListener('click', () => {
             const decoder = await Decoder.create({
                 proresFourCc: 'apch',
                 useSharedMemory: true,
+                concurrency: undefined, // Use navigator.hardwareConcurrency
             });
 
             const framePool = [];

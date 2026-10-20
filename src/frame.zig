@@ -14,6 +14,7 @@ pub const Frame = struct {
     visible_width: u32,
     visible_height: u32,
     log2_chroma_blocks_per_mb: u32,
+    original_pixel_format: PixelFormat,
     /// 0 => no alpha \
     /// 8, 16 => source alpha bit depth \
     /// -1 => no alpha present in source, but must emit alpha channel anyway
@@ -33,7 +34,7 @@ pub const ScanType = enum(u8) {
     interlaced_bottom_field_first,
 };
 
-export fn createFrame() ?*Frame {
+pub fn createFrame() callconv(.c) ?*Frame {
     const result = gpa.create(Frame) catch return null;
 
     result.* = .{
@@ -43,6 +44,7 @@ export fn createFrame() ?*Frame {
         .visible_width = undefined,
         .visible_height = undefined,
         .log2_chroma_blocks_per_mb = undefined,
+        .original_pixel_format = undefined,
         .alpha_bit_depth = undefined,
         .bit_depth = undefined,
         .aspect_ratio_num = undefined,
@@ -56,36 +58,40 @@ export fn createFrame() ?*Frame {
     return result;
 }
 
-export fn closeFrame(frame: *Frame) void {
+pub fn closeFrame(frame: *Frame) callconv(.c) void {
     gpa.free(frame.frame_data);
     gpa.destroy(frame);
 }
 
-export fn getVisibleWidth(frame: *Frame) u32 {
+pub fn getVisibleWidth(frame: *Frame) callconv(.c) u32 {
     return frame.visible_width;
 }
 
-export fn getVisibleHeight(frame: *Frame) u32 {
+pub fn getVisibleHeight(frame: *Frame) callconv(.c) u32 {
     return frame.visible_height;
 }
 
-export fn getCodedWidth(frame: *Frame) u32 {
+pub fn getCodedWidth(frame: *Frame) callconv(.c) u32 {
     return frame.coded_width;
 }
 
-export fn getCodedHeight(frame: *Frame) u32 {
+pub fn getCodedHeight(frame: *Frame) callconv(.c) u32 {
     return frame.coded_height;
 }
 
-export fn getFrameDataPtr(frame: *Frame) [*]u8 {
+pub fn getFrameDataPtr(frame: *Frame) callconv(.c) [*]u8 {
     return frame.frame_data.ptr;
 }
 
-export fn getFrameDataSize(frame: *Frame) usize {
+pub fn getFrameDataSize(frame: *Frame) callconv(.c) usize {
     return frame.frame_data.len;
 }
 
-export fn getFramePixelFormat(frame: *Frame) u32 {
+pub fn getOriginalPixelFormat(frame: *Frame) callconv(.c) u32 {
+    return @intFromEnum(frame.original_pixel_format);
+}
+
+pub fn getFramePixelFormat(frame: *Frame) callconv(.c) u32 {
     return @intFromEnum(getYuvPixelFormat(
         frame.log2_chroma_blocks_per_mb,
         frame.bit_depth,
@@ -93,27 +99,27 @@ export fn getFramePixelFormat(frame: *Frame) u32 {
     ));
 }
 
-export fn getAspectRatioNum(frame: *Frame) u32 {
+pub fn getAspectRatioNum(frame: *Frame) callconv(.c) u32 {
     return frame.aspect_ratio_num;
 }
 
-export fn getAspectRatioDen(frame: *Frame) u32 {
+pub fn getAspectRatioDen(frame: *Frame) callconv(.c) u32 {
     return frame.aspect_ratio_den;
 }
 
-export fn getColorPrimaries(frame: *Frame) u32 {
+pub fn getColorPrimaries(frame: *Frame) callconv(.c) u32 {
     return frame.color_primaries;
 }
 
-export fn getColorTransfer(frame: *Frame) u32 {
+pub fn getColorTransfer(frame: *Frame) callconv(.c) u32 {
     return frame.color_transfer;
 }
 
-export fn getColorMatrix(frame: *Frame) u32 {
+pub fn getColorMatrix(frame: *Frame) callconv(.c) u32 {
     return frame.color_matrix;
 }
 
-export fn getScanType(frame: *Frame) u32 {
+pub fn getScanType(frame: *Frame) callconv(.c) u32 {
     return @intFromEnum(frame.scan_type);
 }
 

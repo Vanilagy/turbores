@@ -39,6 +39,7 @@
     "check-docblocks": "tsx scripts/check-docblocks.ts dist/turbores.d.ts",
     "lint": "zig fmt --check src/index.zig && eslint .",
     "test": "./scripts/build-zig.sh && vitest run",
+    "test-native": "./scripts/test-native.sh",
     "demo:dev": "vite --config demo.vite.config.ts",
     "demo:build": "vite build --config demo.vite.config.ts"
   },

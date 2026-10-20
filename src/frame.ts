@@ -364,7 +364,6 @@ export const readFrameContents = (
     exports: WasmExports,
     memory: WebAssembly.Memory,
     framePtr: number,
-    decoderPtr: number,
 ): FrameContents => {
     const frameDataPtr = exports.getFrameDataPtr(framePtr);
     const frameDataSize = exports.getFrameDataSize(framePtr);
@@ -373,7 +372,7 @@ export const readFrameContents = (
     const pixelFormat = PIXEL_FORMATS[exports.getFramePixelFormat(framePtr)];
     assert(pixelFormat !== undefined);
 
-    const originalPixelFormat = PIXEL_FORMATS[exports.getOriginalPixelFormat(decoderPtr)];
+    const originalPixelFormat = PIXEL_FORMATS[exports.getOriginalPixelFormat(framePtr)];
     assert(originalPixelFormat !== undefined);
 
     const scanType = ([
