@@ -238,6 +238,12 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         return error.InvalidData;
     }
 
+    if (frame_size < reader.pos) {
+        @branchHint(.unlikely);
+        decoder.error_message = "Frame size too small.";
+        return error.InvalidData;
+    }
+
     reader.data = decoder.packet[0..frame_size];
 
     const frame_type_outer = try reader.takeInt(u32);
@@ -323,7 +329,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     const alpha_bit_depth = alpha_info << 3;
     decoder.alpha_bit_depth = alpha_bit_depth;
 
-    reader.toss(1);
+    try reader.toss(1);
     const q_mat_flags = try reader.takeInt(u8);
 
     const q_mat_luma: [64]u8 = if (q_mat_flags & 0b10 != 0)
@@ -476,6 +482,12 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         return error.InvalidData;
     }
 
+    if (8 + header_size > reader.data.len) {
+        @branchHint(.unlikely);
+        decoder.error_message = "Frame header extends past the frame data.";
+        return error.InvalidData;
+    }
+
     reader.pos = 8 + header_size;
 
     const field_coded_height = frame.coded_height >> row_stride_shift;
@@ -577,8 +589,6 @@ fn parsePicture(
         return error.InvalidData;
     }
 
-    reader.data = reader.data[0..pic_data_end];
-
     const total_slices: u32 = try reader.takeInt(u16);
     const slice_dimensions = try reader.takeInt(u8);
 
@@ -588,6 +598,13 @@ fn parsePicture(
         return error.InvalidData;
     }
 
+    if (pic_header_start_pos + pic_header_size > pic_data_end) {
+        @branchHint(.unlikely);
+        decoder.error_message = "Picture header extends past the picture data.";
+        return error.InvalidData;
+    }
+
+    reader.data = reader.data[0..pic_data_end];
     reader.pos = pic_header_start_pos + pic_header_size;
 
     const log2_slice_width = slice_dimensions >> 4;

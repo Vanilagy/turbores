@@ -240,7 +240,11 @@ pub const ByteReader = struct {
         return slice;
     }
 
-    pub inline fn toss(self: *ByteReader, n: usize) void {
+    pub inline fn toss(self: *ByteReader, n: usize) !void {
+        if (n > self.remaining()) {
+            return error.UnexpectedEof;
+        }
+
         self.pos += n;
     }
 
