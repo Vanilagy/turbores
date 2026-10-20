@@ -252,10 +252,11 @@ export class MessagePassingRuntime extends Runtime {
     registeredDecoders = new Map<number, {
         bitDepth: number;
         allowedOutputFormats: number;
+        log2Scale: number;
     }>();
 
-    registerDecoder(decoderId: number, bitDepth: number, allowedOutputFormats: number) {
-        this.registeredDecoders.set(decoderId, { bitDepth, allowedOutputFormats });
+    registerDecoder(decoderId: number, bitDepth: number, allowedOutputFormats: number, log2Scale: number) {
+        this.registeredDecoders.set(decoderId, { bitDepth, allowedOutputFormats, log2Scale });
 
         for (const worker of this.workers) {
             worker.postMessage({
@@ -263,6 +264,7 @@ export class MessagePassingRuntime extends Runtime {
                 decoderId,
                 bitDepth,
                 allowedOutputFormats,
+                log2Scale,
             } satisfies WorkerMessage);
         }
     }
@@ -321,12 +323,13 @@ export class MessagePassingRuntime extends Runtime {
             this.workerLoad.push(0);
 
             // Bring the fresh worker up to speed with every decoder that already exists
-            for (const [decoderId, { bitDepth, allowedOutputFormats }] of this.registeredDecoders) {
+            for (const [decoderId, { bitDepth, allowedOutputFormats, log2Scale }] of this.registeredDecoders) {
                 worker.postMessage({
                     type: MessageType.CreateDecoder,
                     decoderId,
                     bitDepth,
                     allowedOutputFormats,
+                    log2Scale,
                 } satisfies WorkerMessage);
             }
         }

@@ -38,6 +38,7 @@ export type WorkerMessage =
         decoderId: number;
         bitDepth: number;
         allowedOutputFormats: number;
+        log2Scale: number;
     }
     | {
         type: MessageType.CloseDecoder;
