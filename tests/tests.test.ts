@@ -207,6 +207,26 @@ describe('Decoding', () => {
 
         await decoder.close();
     });
+
+    test('Image aspect ratio', async () => {
+        const decoder = await Decoder.create({ proresFourCc: 'apch', useSharedMemory: true, concurrency: 0 });
+        if (decoder instanceof Error) {
+            throw decoder;
+        }
+        using frame = new Frame();
+        const packet = new Uint8Array(readFileSync(new URL('./public/buck-bunny.prores', import.meta.url)));
+
+        packet[21] = (packet[21]! & 0x0f) | 0x30; // 16:9
+        expect(await decoder.decode(packet, frame)).toBe(frame);
+        expect(frame.pixelAspectRatio).toEqual({ num: 1, den: 1 });
+        frame.clear();
+
+        packet[21] = (packet[21] & 0x0f) | 0x20; // 4:3
+        expect(await decoder.decode(packet, frame)).toBe(frame);
+        expect(frame.pixelAspectRatio).toEqual({ num: 3, den: 4 });
+
+        await decoder.close();
+    });
 });
 
 describe('Invalid packets', () => {

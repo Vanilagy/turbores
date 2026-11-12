@@ -266,24 +266,27 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     decoder.log2_chroma_blocks_per_mb = log2_chroma_blocks_per_mb;
 
     const aspect_ratio_information = (try reader.takeInt(u8)) >> 4;
-    switch (aspect_ratio_information) {
-        0, 1 => {
-            frame.aspect_ratio_num = 1;
-            frame.aspect_ratio_den = 1;
-        },
-        2 => {
-            frame.aspect_ratio_num = 4;
-            frame.aspect_ratio_den = 3;
-        },
-        3 => {
-            frame.aspect_ratio_num = 16;
-            frame.aspect_ratio_den = 9;
-        },
-        else => {
-            @branchHint(.unlikely);
-            decoder.error_message = "Invalid aspect ratio information header field.";
-            return error.InvalidData;
-        },
+    if (aspect_ratio_information > 3) {
+        @branchHint(.unlikely);
+        decoder.error_message = "Invalid aspect ratio information header field.";
+        return error.InvalidData;
+    }
+
+    if (aspect_ratio_information <= 1 or frame_width == 0 or frame_height == 0) {
+        frame.aspect_ratio_num = 1;
+        frame.aspect_ratio_den = 1;
+    } else {
+        // 2 and 3 describe the IMAGE aspect ratio, not the pixel aspect ratio. So weird! Use it to compute the pixel
+        // aspect ratio.
+        const image_aspect_num: u32, const image_aspect_den: u32 =
+            if (aspect_ratio_information == 2) .{ 4, 3 } else .{ 16, 9 };
+        const num = image_aspect_num * frame_height;
+        const den = image_aspect_den * frame_width;
+
+        // Simplify the fraction
+        const divisor = std.math.gcd(num, den);
+        frame.aspect_ratio_num = num / divisor;
+        frame.aspect_ratio_den = den / divisor;
     }
 
     frame.color_primaries = try reader.takeInt(u8);
