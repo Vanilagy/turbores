@@ -13,7 +13,7 @@ TurboRes is an extremely fast Apple ProRes video decoder library for browsers an
 
 TurboRes is:
 - **Fast.** With both impressive single- and multi-core performance, TurboRes can decode even high-quality 4K videos at hundreds of frames per second and can be [more than twice as fast as native FFmpeg](#performance).
-- **Feature-rich.** TurboRes supports all ProRes variants: 422/444 High Quality, Standard Definition, LT & Proxy, as well as transparent ProRes 4444, with both 10-bit and 12-bit color depths, progressive or interlaced, at all resolutions up to 16K. Additional features include explicit concurrency control and zero-overhead pixel format conversions.
+- **Feature-rich.** TurboRes supports all ProRes variants: 422/444 High Quality, Standard Definition, LT & Proxy, as well as transparent ProRes 4444, with both 10-bit and 12-bit color depths, progressive or interlaced, at all resolutions up to 16K. Additional features include explicit concurrency control, zero-overhead pixel format conversions, and fast downscaled decoding (1/2, 1/4 or 1/8 resolution).
 - **Correct.** TurboRes provides bit-exact decode results and does not approximate.
 - **Robust.** TurboRes fully validates all input and rejects any invalid, corrupted, or malicious data.
 - **Portable.** TurboRes runs everywhere out of the box: Chromium, Firefox, Safari, Node, Deno, Bun.
@@ -201,6 +201,20 @@ These pixel formats are supported by TurboRes: \
 `I420`, `I420P10`, `I420P12`, `I420A`, `I420AP10`, `I420AP12` \
 `I422`, `I422P10`, `I422P12`, `I422A`, `I422AP10`, `I422AP12` \
 `I444`, `I444P10`, `I444P12`, `I444A`, `I444AP10`, `I444AP12`
+
+### Downscaled decoding
+
+For faster decoding, you can decode at a reduced resolution using the `scale` option:
+```ts
+const decoder = await Decoder.create({
+    // Decode at 1/4 resolution (1/2 in each axis). Must be 1, 2, 4 or 8.
+    scale: 2,
+});
+```
+
+This is not a post-decode resize. TurboRes runs a smaller inverse DCT over just the low-frequency coefficients of each block, directly producing a `1/scale`-sized frame. There's no separate resampling step, and decoding does less work overall — at `scale: 8`, the high-frequency coefficient stream is skipped entirely. The result is a clean, correctly-aligned downscale, perfect for fast previews, scrubbing, and thumbnails.
+
+When `scale` is greater than `1`, frames are emitted in their native pixel format; `allowedOutputFormats` is not applied, since downscaling does not combine with pixel format conversion. Downscaled decoding is not supported for interlaced content.
 
 ### Packet queueing
 
