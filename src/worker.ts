@@ -145,7 +145,7 @@ const onMessage = async (message: WorkerMessage) => {
                 return;
             }
 
-            const contents = readFrameContents(exports, memory, frame, decoder);
+            const contents = readFrameContents(exports, memory, frame);
 
             // Copy the frame data out of the WASM memory, reusing the buffer that was sent along if it has the right
             // size. Frames of constant size therefore cause no allocations: their buffer just ping-pongs between this

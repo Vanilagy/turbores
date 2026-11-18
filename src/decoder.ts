@@ -444,7 +444,7 @@ class SharedMemoryDecoder extends Decoder {
                 }
 
                 // The frame data is not copied; it's a direct view into the WASM memory
-                frame._populate(readFrameContents(exports, memory, framePtr, this._decoderPtr));
+                frame._populate(readFrameContents(exports, memory, framePtr));
             } finally {
                 releaseDecode();
             }
