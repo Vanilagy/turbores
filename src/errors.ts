@@ -93,6 +93,17 @@ export class FrameLockedError extends Error {
     }
 }
 
+/**
+ * An error caused by a worker failing to start.
+ * @public
+ */
+export class WorkerStartError extends Error {
+    constructor(message = 'A worker failed to start.') {
+        super(message);
+        this.name = 'WorkerStartError';
+    }
+}
+
 export const createErrorFromCodeAndMessage = (code: number, message?: string) => {
     switch (code) {
         case ErrorCode.OutOfMemory: return new OutOfMemoryError(message);

@@ -4,55 +4,72 @@ import { defineConfig, build, type Plugin, type Rollup } from 'vite';
 
 const inlineWorkerRE = /\?inline-worker$/;
 
-// Resolves "?inline-worker" imports to the imported file's bundled source code as a string
-export const inlinedWorker = (): Plugin => ({
-    name: 'inlined-worker',
-    enforce: 'pre',
+// Resolves "?inline-worker" imports to the imported file's bundled source code as a string. In builds, the source is
+// additionally emitted as a standalone file, for environments that can't run blob: workers.
+export const inlinedWorker = (): Plugin => {
+    let isBuild: boolean;
 
-    async resolveId(id, importer) {
-        if (!inlineWorkerRE.test(id)) {
-            return;
-        }
+    return {
+        name: 'inlined-worker',
+        enforce: 'pre',
 
-        const resolved = await this.resolve(id.replace(inlineWorkerRE, ''), importer, { skipSelf: true });
-        return resolved && resolved.id + '?inline-worker';
-    },
+        configResolved(config) {
+            isBuild = config.command === 'build';
+        },
 
-    async load(id) {
-        if (!inlineWorkerRE.test(id)) {
-            return;
-        }
-
-        const results = await build({
-            configFile: false,
-            logLevel: 'warn',
-            assetsInclude: ['**/*.wasm'],
-            build: {
-                write: false,
-                // Lib mode keeps vite's preload helper out of the bundle and we use CommonJS so that
-                // node:worker_threads works
-                lib: {
-                    entry: id.replace(inlineWorkerRE, ''),
-                    formats: ['cjs'],
-                },
-                rollupOptions: {
-                    external: [/^node:/],
-                },
-            },
-        }) as Rollup.RollupOutput[];
-
-        const chunk = results[0]!.output[0];
-
-        // Rebundle when any file involved in the worker changes
-        for (const moduleId of chunk.moduleIds) {
-            if (!moduleId.startsWith('\0')) {
-                this.addWatchFile(moduleId.split('?')[0]!);
+        async resolveId(id, importer) {
+            if (!inlineWorkerRE.test(id)) {
+                return;
             }
-        }
 
-        return `export default ${JSON.stringify(chunk.code)};`;
-    },
-});
+            const resolved = await this.resolve(id.replace(inlineWorkerRE, ''), importer, { skipSelf: true });
+            return resolved && resolved.id + '?inline-worker';
+        },
+
+        async load(id) {
+            if (!inlineWorkerRE.test(id)) {
+                return;
+            }
+
+            const results = await build({
+                configFile: false,
+                logLevel: 'warn',
+                assetsInclude: ['**/*.wasm'],
+                build: {
+                    write: false,
+                    // Lib mode keeps vite's preload helper out of the bundle and we use CommonJS so that
+                    // node:worker_threads works
+                    lib: {
+                        entry: id.replace(inlineWorkerRE, ''),
+                        formats: ['cjs'],
+                    },
+                    rollupOptions: {
+                        external: [/^node:/],
+                    },
+                },
+            }) as Rollup.RollupOutput[];
+
+            const chunk = results[0]!.output[0];
+
+            // Rebundle when any file involved in the worker changes
+            for (const moduleId of chunk.moduleIds) {
+                if (!moduleId.startsWith('\0')) {
+                    this.addWatchFile(moduleId.split('?')[0]!);
+                }
+            }
+
+            if (isBuild) {
+                this.emitFile({
+                    type: 'asset',
+                    fileName: 'turbores.worker.js',
+                    source: chunk.code,
+                });
+            }
+
+            return `export default ${JSON.stringify(chunk.code)};`;
+        },
+    };
+};
 
 const inlineBinaryRE = /\?inline-binary$/;
 

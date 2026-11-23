@@ -8,9 +8,9 @@
 
 import type { Transferable as NodeTransferable, Worker as NodeWorker } from 'node:worker_threads';
 import wasmBinaryString from '../build/lib.wasm?inline-binary';
-import { OutOfMemoryError } from './errors.js';
+import { OutOfMemoryError, WorkerStartError } from './errors.js';
 import { MessageType, type WorkerMessage, type WorkerReply } from './messages.js';
-import { AsyncMutex, identity } from './misc.js';
+import { assert, AsyncMutex, identity } from './misc.js';
 import { initWasmModule, type WasmExports } from './wasm.js';
 import workerSource from './worker?inline-worker';
 
@@ -30,21 +30,43 @@ export const getWasmBinary = () => {
 };
 
 export const createWorker = async () => {
+    const workerUrl = (globalThis as Record<symbol, unknown>)[Symbol.for('turbores:workerUrl')];
+    if (workerUrl !== undefined && typeof workerUrl !== 'string' && !(workerUrl instanceof URL)) {
+        throw new TypeError('globalThis[Symbol.for(\'turbores:workerUrl\')], when provided, must be a string or URL.');
+    }
+
     // Bun's web Worker is flaky, so don't use Worker for it
     if (typeof Worker !== 'undefined' && !('Bun' in globalThis)) {
         // Browsers and Deno: spin up a module worker straight from the inlined source
-        const blob = new Blob([workerSource], { type: 'text/javascript' });
-        const url = URL.createObjectURL(blob);
-        const worker = new Worker(url, { type: 'module' });
+        let url = workerUrl;
+        if (url === undefined) {
+            const blob = new Blob([workerSource], { type: 'text/javascript' });
+            url = URL.createObjectURL(blob);
+        }
 
-        return new WorkerWrapper(worker, null);
+        // The constructor itself throws for some bad URLs, like cross-origin ones
+        try {
+            return new WorkerWrapper(new Worker(url, { type: 'module' }), null);
+        } catch (error) {
+            return new WorkerStartError(`A worker failed to start: ${String(error)}`);
+        }
     }
 
     // Node and Bun: there is no (usable) web Worker, so use worker_threads
     // Weird dynamic import so that bundlers don't mess with it
     const worker_threads = await import(/* @vite-ignore */ 'node:' + identity('worker_threads')) as
         typeof import('node:worker_threads');
-    return new WorkerWrapper(null, new worker_threads.Worker(workerSource, { eval: true }));
+
+    try {
+        return new WorkerWrapper(
+            null,
+            workerUrl !== undefined
+                ? new worker_threads.Worker(workerUrl)
+                : new worker_threads.Worker(workerSource, { eval: true }),
+        );
+    } catch (error) {
+        return new WorkerStartError(`A worker failed to start: ${String(error)}`);
+    }
 };
 
 // Provides a single worker interface over both web workers and node:worker_threads workers
@@ -76,6 +98,14 @@ export class WorkerWrapper {
             } else {
                 this.nodeWorker!.on(type, wrapped);
             }
+        }
+    }
+
+    onError(listener: (message: string) => void) {
+        if (this.webWorker) {
+            this.webWorker.addEventListener('error', event => listener(event.message));
+        } else {
+            this.nodeWorker!.on('error', (error: Error) => listener(error.message));
         }
     }
 
@@ -212,8 +242,10 @@ export class SharedMemoryRuntime extends Runtime {
     }
 
     async ensureWorkers(count: number) {
-        // Add however many workers are missing
-        while (this.workers.length < count) {
+        // Start however many workers are missing
+        const startedWorkers: { worker: WorkerWrapper; reply: Promise<WorkerReply | WorkerStartError> }[] = [];
+        let failure: WorkerStartError | null = null;
+        while (this.workers.length + startedWorkers.length < count) {
             const stackPointer = this.exports.allocateWorkerStack();
             const tlsPointer = this.exports.allocateThreadLocalState(
                 this.exports.__tls_size.value,
@@ -224,6 +256,11 @@ export class SharedMemoryRuntime extends Runtime {
             }
 
             const worker = await createWorker();
+            if (worker instanceof WorkerStartError) {
+                failure = worker;
+                break;
+            }
+
             worker.postMessage({
                 type: MessageType.SharedMemoryInit,
                 wasmBinary: getWasmBinary(),
@@ -232,8 +269,22 @@ export class SharedMemoryRuntime extends Runtime {
                 tlsPointer,
             } satisfies WorkerMessage);
 
-            this.workers.push(worker);
+            startedWorkers.push({ worker, reply: waitForInitReply(worker) });
         }
+
+        // Wait for all of them to come up. The ones that did are kept, since they're already part of the thread pool.
+        for (const { worker, reply } of startedWorkers) {
+            const result = await reply;
+            if (result instanceof WorkerStartError) {
+                worker.terminate();
+                failure = result;
+            } else {
+                assert(result.type === MessageType.Ready);
+                this.workers.push(worker);
+            }
+        }
+
+        return failure;
     }
 
     protected override destroy() {
@@ -287,15 +338,20 @@ export class MessagePassingRuntime extends Runtime {
         const results = await Promise.all(
             Array.from({ length: missing }, async () => {
                 const worker = await createWorker();
+                if (worker instanceof WorkerStartError) {
+                    return worker;
+                }
 
-                const reply = await new Promise<WorkerReply>((resolve) => {
-                    worker.postMessage({
-                        type: MessageType.MessagePassingInit,
-                        wasmBinary: getWasmBinary(),
-                    } satisfies WorkerMessage);
-                    worker.addEventListener('message', event => resolve(event.data as WorkerReply), { once: true });
-                });
+                worker.postMessage({
+                    type: MessageType.MessagePassingInit,
+                    wasmBinary: getWasmBinary(),
+                } satisfies WorkerMessage);
 
+                const reply = await waitForInitReply(worker);
+                if (reply instanceof WorkerStartError) {
+                    worker.terminate();
+                    return reply;
+                }
                 if (reply.type === MessageType.InitOutOfMemoryError) {
                     worker.terminate();
                     return new OutOfMemoryError(reply.message);
@@ -305,7 +361,9 @@ export class MessagePassingRuntime extends Runtime {
             }),
         );
 
-        const failure = results.find((result): result is OutOfMemoryError => result instanceof Error);
+        const failure = results.find(
+            (result): result is OutOfMemoryError | WorkerStartError => result instanceof Error,
+        );
         if (failure) {
             for (const result of results) {
                 if (!(result instanceof Error)) {
@@ -339,3 +397,19 @@ export class MessagePassingRuntime extends Runtime {
         messagePassingRuntimeRef = null;
     }
 }
+
+// Waits for the worker's reply to its init message, or for the worker to fail to start
+const waitForInitReply = (worker: WorkerWrapper) => new Promise<WorkerReply | WorkerStartError>((resolve) => {
+    worker.addEventListener('message', (event) => {
+        const reply = event.data as WorkerReply;
+        if (reply.type === MessageType.InitError) {
+            resolve(new WorkerStartError(`A worker failed to start: ${reply.message}`));
+        } else {
+            resolve(reply);
+        }
+    }, { once: true });
+
+    worker.onError((message) => {
+        resolve(new WorkerStartError(message ? `A worker failed to start: ${message}` : undefined));
+    });
+});

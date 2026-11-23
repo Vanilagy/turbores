@@ -16,6 +16,7 @@ export enum MessageType {
     Decode,
     Ready,
     InitOutOfMemoryError,
+    InitError,
     Decoded,
     DecodeError,
 }
@@ -58,6 +59,10 @@ export type WorkerReply =
     }
     | {
         type: MessageType.InitOutOfMemoryError;
+        message: string;
+    }
+    | {
+        type: MessageType.InitError;
         message: string;
     }
     | {
