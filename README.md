@@ -53,6 +53,14 @@ You can also download `turbores.umd.cjs` from the [releases page](https://github
 ```
 This will expose a global `TurboRes` namespace. Types for this global are also provided by `turbores.d.ts`.
 
+### Content Security Policy
+
+TurboRes runs its worker threads as Web Workers, which by default are created from a `blob:` URL. If your Content Security Policy doesn't allow that, host `turbores.worker.js` yourself and point TurboRes to it before creating a decoder:
+```js
+globalThis[Symbol.for('turbores:workerUrl')] = '/path/to/turbores.worker.js';
+```
+The value must be a string or `URL`. You can download the worker file from the [releases page](https://github.com/Vanilagy/turbores/releases); it's also included in the npm package under `dist/`. Since TurboRes uses WebAssembly, your policy must also allow `'wasm-unsafe-eval'` in `script-src`.
+
 ## Usage
 
 ```ts
@@ -123,6 +131,7 @@ TurboRes uses _errors as values_, meaning functions return either the result or 
 - `InvalidStateError`: The decoder is in an invalid internal state. This should never happen and should be reported.
 - `DecoderClosedError`: An operation was attempted on a decoder that has already been closed.
 - `FrameLockedError`: A frame was used while it is locked by an in-flight decoding operation.
+- `WorkerStartError`: A worker failed to start.
 
 Since errors are returned plainly, you can check for them using a simple `instanceof` check.
 

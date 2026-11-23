@@ -26,4 +26,5 @@ export {
     InvalidStateError,
     DecoderClosedError,
     FrameLockedError,
+    WorkerStartError,
 } from './errors.js';

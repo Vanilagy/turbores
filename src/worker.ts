@@ -24,10 +24,16 @@ let messagePassingState: {
 const onMessage = async (message: WorkerMessage) => {
     switch (message.type) {
         case MessageType.SharedMemoryInit: {
-            const exports = await initWasmModule(message.wasmBinary, message.memory);
+            const exports = await initWasmModuleOrReportFailure(message.wasmBinary, message.memory);
+            if (!exports) {
+                return;
+            }
+
             exports.__stack_pointer.value = message.stackPointer;
             exports.__wasm_init_tls(message.tlsPointer);
             exports.setIsBrowserMainThread(Number(false));
+
+            sendMessage({ type: MessageType.Ready });
 
             // Start the worker. This function will run forever.
             exports.startWorker();
@@ -38,7 +44,10 @@ const onMessage = async (message: WorkerMessage) => {
         case MessageType.MessagePassingInit: {
             // We only keep one frame around, so 512 MiBs of memory is plenty
             const memory = new WebAssembly.Memory({ initial: 32, maximum: 8192, shared: true });
-            const exports = await initWasmModule(message.wasmBinary, memory);
+            const exports = await initWasmModuleOrReportFailure(message.wasmBinary, memory);
+            if (!exports) {
+                return;
+            }
 
             const tlsPointer = exports.allocateThreadLocalState(exports.__tls_size.value, exports.__tls_align.value);
             if (tlsPointer === 0) {
@@ -168,6 +177,19 @@ const onMessage = async (message: WorkerMessage) => {
     }
 };
 
+const initWasmModuleOrReportFailure = async (wasmBinary: Uint8Array<ArrayBuffer>, memory: WebAssembly.Memory) => {
+    try {
+        return await initWasmModule(wasmBinary, memory);
+    } catch (error) {
+        sendMessage({
+            type: MessageType.InitError,
+            message: String(error),
+        });
+
+        return null;
+    }
+};
+
 const sendMessage = (message: WorkerReply, transferables?: Transferable[]) => {
     if (parentPort) {
         parentPort.postMessage(message, transferables ?? []);
@@ -189,7 +211,11 @@ try {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-member-access
     parentPort = require('node:worker_threads').parentPort;
 } catch {
-    // Web worker (browser, Deno), no require available
+    // No require available: either we're a web worker (browser, Deno), or Node.js is running the standalone worker file
+    // as an ES module
+    if (!('WorkerGlobalScope' in globalThis)) {
+        parentPort = process.getBuiltinModule('node:worker_threads').parentPort as typeof parentPort;
+    }
 }
 
 if (parentPort) {

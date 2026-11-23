@@ -217,7 +217,11 @@ export abstract class Decoder implements Disposable, AsyncDisposable {
             const runtime = await getSharedMemoryRuntime();
             runtime.ref();
 
-            await runtime.ensureWorkers(concurrency);
+            const failure = await runtime.ensureWorkers(concurrency);
+            if (failure) {
+                runtime.unref();
+                return failure;
+            }
 
             const decoderPtr = runtime.exports.createDecoder(concurrency, bitDepth, allowedOutputFormatsBitfield);
             if (decoderPtr === 0) {
